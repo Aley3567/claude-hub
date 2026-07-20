@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -22,10 +23,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+VERSION = "0.1.0"
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -82,6 +87,14 @@ BACKEND_ALIASES = {
     "direct": "direct",
     "hub": "hub",
 }
+RESERVED_SELECTOR_WORDS = set(BACKEND_ALIASES) | {
+    "config",
+    "doctor",
+    "help",
+    "list",
+    "use",
+    "version",
+}
 
 # claude-hub: 本地多渠道路由网关（会话内 /model 别名,模型 热切换渠道）。
 HUB_SCRIPT = _env_path(
@@ -96,9 +109,8 @@ HUB_LOG = _env_path(
 )
 _hub_processes: list[subprocess.Popen] = []
 
-# Local protocol-translation gateway (cliproxyapi). Providers whose base URL
-# points here (e.g. AIHub, which only speaks the OpenAI protocol upstream)
-# need the gateway alive before Claude Code starts.
+# Optional local protocol-translation gateway (cliproxyapi). Providers whose
+# configured base URL points here need the gateway alive before Claude starts.
 GATEWAY_URL = os.environ.get("CLAUDE1_GATEWAY_URL", "http://127.0.0.1:18317")
 GATEWAY_BIN = _env_path(
     "CLAUDE1_GATEWAY_BIN", Path("/opt/homebrew/bin/cliproxyapi")
@@ -129,28 +141,6 @@ def resolve_claude_bin() -> Path:
     if found:
         return Path(found)
     return DEFAULT_CLAUDE_BIN
-
-
-# Which providers show in the menu is no longer hardcoded — it lives in
-# CONFIG_PATH and is edited with `claude1 config`. This list is only the
-# FIRST-RUN seed: providers enabled by default when no config file exists yet.
-# New CC Switch providers discovered later are added disabled (opt-in via
-# `claude1 config`). Baibei / 火山Agentplan are kept even though currently
-# absent from the DB — they light up automatically if they return.
-SEED_ENABLED = [
-    "Any router",
-    "N1nEAPI",
-    "Baibei",
-    "Codex",
-    "Unity2.Ai",
-    "Xiaomi MiMo api",
-    "火山Agentplan",
-    "火山-key2-备用",
-    "Bailian",
-    "AIHub",
-    "My Claude",
-    "supertoken",
-]
 
 
 def load_mru() -> dict[str, float]:
@@ -189,20 +179,21 @@ def save_config(cfg: dict) -> bool:
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+        os.chmod(CONFIG_PATH, 0o600)
         return True
     except OSError:
         return False
 
 
 def sync_config(cfg: dict, db_names: list[str]) -> bool:
-    """首跑播种，之后自动发现新 provider（默认可见，不想要就在 TUI 里 x 隐藏）。
+    """Seed from CC Switch order, then append newly discovered providers.
 
     Returns True if cfg was modified (caller decides whether to persist).
     """
     providers = cfg.setdefault("providers", {})
     changed = False
     if not providers:
-        for name in SEED_ENABLED:
+        for name in db_names:
             providers[name] = {"hidden": False}
         changed = True
     for name in db_names:
@@ -281,7 +272,8 @@ def claude_child_env(settings: dict | None = None) -> dict[str, str]:
 def db_claude_rows() -> list[sqlite3.Row]:
     if not DB_PATH.exists():
         raise RuntimeError(f"CC Switch DB 不存在: {DB_PATH}")
-    conn = sqlite3.connect(str(DB_PATH))
+    db_uri = DB_PATH.resolve(strict=False).as_uri() + "?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
         return conn.execute(
@@ -315,9 +307,6 @@ def list_providers() -> list[dict]:
     if not ordered:
         # 全被隐藏(或配置为空) —— 别把人困住，回退到全部。
         ordered = list(by_name.values())
-    # 使用率最高的靠前；其余按配置顺序（不分页，一次列全部）。
-    mru = load_mru()
-    ordered.sort(key=lambda p: -mru.get(p["name"], 0.0))
     return ordered
 
 
@@ -327,8 +316,8 @@ def build_settings(provider: dict) -> dict:
     env = {k: str(v) for k, v in (cfg.get("env") or {}).items()}
 
     if not any(k.startswith("ANTHROPIC_AUTH") or k.startswith("ANTHROPIC_API") for k in env):
-        # e.g. "My Claude": no dedicated credentials in the DB — Claude Code
-        # falls back to the currently stored login for this one session.
+        # A credential-less entry falls back to the currently stored Claude
+        # login for this one session.
         print(
             f"[claude1] 注意: provider {provider['name']} 没有独立凭证，将使用当前已登录的凭证",
             file=sys.stderr,
@@ -488,6 +477,17 @@ def _hub_start_env(port: int) -> dict[str, str]:
     return child
 
 
+def _hub_start_timeout() -> float:
+    raw = os.environ.get("CLAUDE1_HUB_START_TIMEOUT", "20")
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise RuntimeError(f"CLAUDE1_HUB_START_TIMEOUT 无效: {raw!r}") from None
+    if not math.isfinite(timeout) or not 1 <= timeout <= 120:
+        raise RuntimeError("CLAUDE1_HUB_START_TIMEOUT 应在 1–120 秒之间")
+    return timeout
+
+
 def ensure_hub(port: int) -> None:
     """Start the isolated claude-hub process unless its strict health check passes."""
     if hub_healthy(port):
@@ -509,22 +509,63 @@ def ensure_hub(port: int) -> None:
     # ResourceWarning; a later start prunes processes that have already exited.
     _hub_processes[:] = [child for child in _hub_processes if child.poll() is None]
     _hub_processes.append(process)
-    for _ in range(20):
-        time.sleep(0.25)
+    deadline = time.monotonic() + _hub_start_timeout()
+    while time.monotonic() < deadline:
         if hub_healthy(port):
             return
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                f"claude-hub 启动进程提前退出（状态 {return_code}），"
+                f"查看日志: {HUB_LOG}"
+            )
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
     raise RuntimeError(f"claude-hub 启动失败，查看日志: {HUB_LOG}")
+
+
+def _provider_terms(provider: dict) -> list[str]:
+    terms = [str(provider.get("name", ""))]
+    alias = provider.get("alias")
+    if isinstance(alias, str) and alias.strip():
+        terms.append(alias.strip())
+    return terms
+
+
+def match_providers(providers: list[dict], hint: str) -> tuple[list[dict], bool]:
+    """Return de-duplicated matches and whether they are exact.
+
+    Exact provider names and aliases win over substring matches.  `casefold`
+    keeps matching predictable for non-ASCII names as well as English aliases.
+    """
+    needle = hint.strip().casefold()
+    if not needle:
+        return ([], False)
+    exact: list[dict] = []
+    fuzzy: list[dict] = []
+    for provider in providers:
+        terms = [term.casefold() for term in _provider_terms(provider)]
+        if any(term == needle for term in terms):
+            exact.append(provider)
+        elif any(needle in term for term in terms):
+            fuzzy.append(provider)
+    return (exact, True) if exact else (fuzzy, False)
 
 
 def choose(providers: list[dict], hint: str | None) -> dict:
     if hint:
-        matches = [p for p in providers if hint.lower() in p["name"].lower()]
+        matches, exact = match_providers(providers, hint)
         if len(matches) == 1:
             return matches[0]
+        if len(matches) > 1 and exact:
+            names = "、".join(str(p["name"]) for p in matches)
+            raise RuntimeError(
+                f"名称或别名 '{hint}' 存在冲突: {names}；请修改其中一个别名"
+            )
         if len(matches) > 1:
-            print(f"匹配到多个 provider，请选择:")
+            print("匹配到多个 provider，请选择:")
             for i, p in enumerate(matches, 1):
-                print(f"{i}. {p['name']}")
+                alias = f" ({p['alias']})" if p.get("alias") else ""
+                print(f"{i}. {p['name']}{alias}")
             choice = input("> ").strip()
             if choice.isdigit():
                 idx = int(choice) - 1
@@ -541,9 +582,12 @@ def choose(providers: list[dict], hint: str | None) -> dict:
         idx = int(choice) - 1
         if 0 <= idx < len(providers):
             return providers[idx]
-    for p in providers:
-        if choice.lower() == p["name"].lower():
-            return p
+    matches, exact = match_providers(providers, choice)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 and exact:
+        names = "、".join(str(p["name"]) for p in matches)
+        raise RuntimeError(f"名称或别名 '{choice}' 存在冲突: {names}")
     raise RuntimeError("无效选择，已取消")
 
 
@@ -564,17 +608,20 @@ LOGO = [
     "  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝ ╚═╝",
 ]
 
-_HEADER_H = len(LOGO) + 6  # welcome + blank + logo + blank + heading + hint
-_LOGO_TOP = 2              # 欢迎语占 row0，空一行后从 row2 起画 logo
+_HEADER_H = len(LOGO) + 6
+_LOGO_TOP = 2
+_LOGO_MIN_LIST = 5
+_MIN_TUI_ROWS = 8
+_MIN_TUI_COLS = 32
+INTRO_DURATION_SECONDS = 0.24
+INTRO_FRAME_SECONDS = 0.016
 C: dict = {}
 
-# 流动的七彩色带（256 色全光谱）：红→橙→黄→绿→青→蓝→紫→品红→回到红，首尾相接无缝循环。
-LOGO_GRAD = [196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46, 48, 50, 51, 45, 39, 33, 63, 99, 135, 171, 207, 201, 199]
+# Logo is the one branded visual variable. The provider list stays restrained.
+LOGO_GRAD = [
+    51, 45, 39, 63, 99, 135, 171, 207, 201, 199, 205, 141, 99, 75, 45, 51
+]
 _logo_pairs: list[int] = []
-
-# 列表用的七彩色带（256 色）：红→橙→金→黄绿→绿→青→蓝→紫→品红，逐行轮转。
-RAINBOW = [203, 208, 214, 220, 148, 46, 42, 51, 45, 75, 99, 141, 207, 205]
-_row_pairs: list[int] = []
 
 
 def _addstr(win, y, x, text, attr=0) -> None:
@@ -582,126 +629,159 @@ def _addstr(win, y, x, text, attr=0) -> None:
     if y < 0 or y >= h or x >= w:
         return
     if x < 0:
-        text = text[-x:]
+        text = _drop_display_prefix(text, -x)
         x = 0
-    text = text[: max(0, w - x - 1)]
+    text = _truncate_display(text, max(0, w - x - 1))
     try:
         win.addstr(y, x, text, attr)
     except curses.error:
         pass
 
 
+def _char_width(char: str) -> int:
+    if unicodedata.combining(char) or unicodedata.category(char) in {"Cf", "Cc"}:
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
 def _dwidth(text: str) -> int:
     """终端显示宽度：CJK 全角字符按 2 列计。"""
-    width = 0
-    for ch in text:
-        o = ord(ch)
-        wide = (
-            0x1100 <= o <= 0x115f
-            or 0x2e80 <= o <= 0xa4cf
-            or 0xac00 <= o <= 0xd7a3
-            or 0xf900 <= o <= 0xfaff
-            or 0xfe30 <= o <= 0xfe4f
-            or 0xff00 <= o <= 0xff60
-            or 0xffe0 <= o <= 0xffe6
-        )
-        width += 2 if wide else 1
-    return width
+    return sum(_char_width(char) for char in text)
+
+
+def _truncate_display(text: str, max_width: int) -> str:
+    """Clip text without placing half of a wide character outside the window."""
+    if max_width <= 0:
+        return ""
+    used = 0
+    result: list[str] = []
+    for char in text:
+        char_width = _char_width(char)
+        if used + char_width > max_width:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result)
+
+
+def _drop_display_prefix(text: str, width: int) -> str:
+    if width <= 0:
+        return text
+    used = 0
+    for index, char in enumerate(text):
+        used += _char_width(char)
+        if used >= width:
+            return text[index + 1 :]
+    return ""
+
+
+def _pad_display(text: str, width: int) -> str:
+    clipped = _truncate_display(text, width)
+    return clipped + (" " * max(0, width - _dwidth(clipped)))
+
+
+def _compose_row(left: str, right: str, width: int) -> str:
+    """Fit one provider row, keeping its short status aligned when possible."""
+    if width <= 0:
+        return ""
+    if not right:
+        return _truncate_display(left, width)
+    right = _truncate_display(right, width)
+    right_width = _dwidth(right)
+    if right_width + 2 >= width:
+        return _truncate_display(left, width)
+    left = _truncate_display(left, width - right_width - 2)
+    gap = max(2, width - _dwidth(left) - right_width)
+    return _truncate_display(left + (" " * gap) + right, width)
+
+
+def _safe_curs_set(visibility: int) -> None:
+    try:
+        curses.curs_set(visibility)
+    except (AttributeError, curses.error):
+        pass
 
 
 def _init_colors() -> dict:
     d = {
-        "dim": 0, "green": 0, "cyan": 0, "blue": 0, "mag": 0, "yellow": 0, "sel": 0,
-        "orange": 0, "pink": 0, "lime": 0, "gold": 0, "teal": 0, "violet": 0,
+        "dim": 0,
+        "base": 0,
+        "accent": 0,
+        "warning": 0,
+        "brand": 0,
+        "sel": curses.A_REVERSE,
     }
-    if not curses.has_colors():
-        d["sel"] = curses.A_REVERSE
-        _row_pairs.clear()
-        return d
-    curses.start_color()
+    _logo_pairs.clear()
     try:
+        has_colors = curses.has_colors()
+    except curses.error:
+        has_colors = False
+    if not has_colors:
+        _logo_pairs.append(0)
+        return d
+    try:
+        curses.start_color()
         curses.use_default_colors()
         bg = -1
     except curses.error:
         bg = 0
-    curses.init_pair(1, curses.COLOR_CYAN, bg)
-    curses.init_pair(2, curses.COLOR_GREEN, bg)
-    curses.init_pair(3, curses.COLOR_MAGENTA, bg)
-    curses.init_pair(4, curses.COLOR_YELLOW, bg)
-    curses.init_pair(5, curses.COLOR_BLUE, bg)
-    d.update(
-        cyan=curses.color_pair(1),
-        green=curses.color_pair(2),
-        mag=curses.color_pair(3),
-        yellow=curses.color_pair(4),
-        blue=curses.color_pair(5),
-        dim=curses.A_DIM,
-        sel=curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD,
-    )
 
-    has256 = getattr(curses, "COLORS", 0) >= 256
-
-    def _named(pid: int, idx: int, fallback: int) -> int:
-        if not has256:
+    def _pair(pid: int, fg: int, fallback: int = 0) -> int:
+        max_pairs = int(getattr(curses, "COLOR_PAIRS", 0) or 0)
+        if max_pairs and pid >= max_pairs:
             return fallback
         try:
-            curses.init_pair(pid, idx, bg)
+            curses.init_pair(pid, fg, bg)
             return curses.color_pair(pid)
         except curses.error:
             return fallback
 
-    # 命名鲜色（橙/粉/青柠/金/水鸭/紫罗兰），非 256 色时回退到基础色。
-    d["orange"] = _named(60, 208, d["yellow"])
-    d["pink"] = _named(61, 205, d["mag"])
-    d["lime"] = _named(62, 118, d["green"])
-    d["gold"] = _named(63, 220, d["yellow"])
-    d["teal"] = _named(64, 44, d["cyan"])
-    d["violet"] = _named(65, 141, d["mag"])
-    # 更醒目的选中条：亮橙底黑字加粗（256 色）。
-    if has256:
-        try:
-            curses.init_pair(66, 16, 208)
-            d["sel"] = curses.color_pair(66) | curses.A_BOLD
-        except curses.error:
-            pass
+    cyan = _pair(1, curses.COLOR_CYAN)
+    green = _pair(2, curses.COLOR_GREEN)
+    yellow = _pair(3, curses.COLOR_YELLOW)
+    magenta = _pair(4, curses.COLOR_MAGENTA)
+    d.update(
+        dim=curses.A_DIM,
+        base=green,
+        accent=cyan | curses.A_BOLD,
+        warning=yellow,
+        brand=magenta | curses.A_BOLD,
+        sel=cyan | curses.A_REVERSE | curses.A_BOLD,
+    )
 
-    # 列表七彩色带：256 色逐行轮转，否则退化成基础多色循环。
-    _row_pairs.clear()
-    if has256:
-        for i, cidx in enumerate(RAINBOW):
-            pid = 40 + i
-            try:
-                curses.init_pair(pid, cidx, bg)
-                _row_pairs.append(curses.color_pair(pid))
-            except curses.error:
-                pass
-    if not _row_pairs:
-        _row_pairs.extend([d["green"], d["cyan"], d["mag"], d["yellow"], d["blue"]])
-
-    # 流动 logo 色带：256 色可用就上平滑渐变，否则退化成三色循环。
-    _logo_pairs.clear()
+    has256 = getattr(curses, "COLORS", 0) >= 256
     if has256:
         for i, cidx in enumerate(LOGO_GRAD):
-            pid = 20 + i
-            try:
-                curses.init_pair(pid, cidx, bg)
-                _logo_pairs.append(curses.color_pair(pid))
-            except curses.error:
-                pass
+            _logo_pairs.append(_pair(10 + i, cidx, d["brand"]))
     if not _logo_pairs:
-        _logo_pairs.extend([d["cyan"], d["blue"], d["mag"]])
+        _logo_pairs.extend([cyan, magenta])
     return d
 
 
 def _wide_enough(win) -> bool:
-    return win.getmaxyx()[1] >= 56
+    logo_width = max((_dwidth(line) for line in LOGO), default=0)
+    return win.getmaxyx()[1] >= logo_width + 4
+
+
+def _large_logo_supported(rows: int, cols: int) -> bool:
+    logo_width = max((_dwidth(line) for line in LOGO), default=0)
+    return cols >= logo_width + 4 and rows > _HEADER_H + _LOGO_MIN_LIST
+
+
+def _tui_size_supported(rows: int, cols: int) -> bool:
+    return rows >= _MIN_TUI_ROWS and cols >= _MIN_TUI_COLS
+
+
+def _animation_enabled() -> bool:
+    disabled = os.environ.get("CLAUDE1_NO_ANIMATION", "").strip().casefold()
+    return disabled not in {"1", "true", "yes", "on"}
 
 
 def _draw_logo(win, phase: int) -> None:
-    """按 (列+行+phase) 取渐变色，逐字上色 → 横向流动。"""
+    """Draw the final static brand logo."""
     n = len(_logo_pairs) or 1
-    h = win.getmaxyx()[0]
-    if _wide_enough(win) and h > _HEADER_H + _LOGO_MIN_LIST:
+    h, w = win.getmaxyx()
+    if _large_logo_supported(h, w):
         for r, line in enumerate(LOGO):
             for x, chx in enumerate(line):
                 if chx == " ":
@@ -712,71 +792,160 @@ def _draw_logo(win, phase: int) -> None:
         _addstr(win, 0, 2, "◤ claude1 ◢", (_logo_pairs[phase % n]) | curses.A_BOLD)
 
 
-def _intro(win) -> None:
-    """开场：欢迎语常驻，logo 自左向右逐列点亮，七彩色带同时横向流动，按任意键跳过。"""
-    if not _wide_enough(win):
-        return
+def _intro(win) -> int | None:
+    """Animate for at most 240ms and return, rather than consume, any key."""
+    rows, cols = win.getmaxyx()
+    if not _animation_enabled() or not _large_logo_supported(rows, cols):
+        return None
     win.nodelay(True)
     n = len(_logo_pairs) or 1
     width = max((len(line) for line in LOGO), default=0)
+    started = time.monotonic()
     try:
-        phase = 0
-        col = 1
-        while col <= width:
-            _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
+        while True:
+            elapsed = time.monotonic() - started
+            if elapsed >= INTRO_DURATION_SECONDS:
+                return None
+            progress = min(1.0, elapsed / INTRO_DURATION_SECONDS)
+            typed = min(
+                len("欢迎回来"),
+                max(1, int((elapsed / 0.12) * len("欢迎回来"))),
+            )
+            _addstr(
+                win,
+                0,
+                2,
+                _pad_display("欢迎回来"[:typed], _dwidth("欢迎回来")),
+                curses.A_BOLD,
+            )
+            col = max(1, int(width * progress))
             for r, line in enumerate(LOGO):
                 for x in range(min(col, len(line))):
                     chx = line[x]
                     if chx == " ":
                         continue
-                    attr = _logo_pairs[(x + r + phase) % n] | curses.A_BOLD
-                    if x >= col - 2:  # 领先扫描列：最新点亮的两列反白，形成一道流动的光
-                        attr |= curses.A_REVERSE
+                    attr = _logo_pairs[(x + r) % n] | curses.A_BOLD
                     _addstr(win, _LOGO_TOP + r, 2 + x, chx, attr)
             win.refresh()
-            if win.getch() != -1:
-                break
-            time.sleep(0.02)
-            col += 4
-            phase += 1
+            key = win.getch()
+            if key != -1:
+                return key
+            remaining = INTRO_DURATION_SECONDS - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(min(INTRO_FRAME_SECONDS, remaining))
     finally:
         win.nodelay(False)
 
 
-# 画大 ASCII logo 所需的列表最小高度（窗口更矮则退化成小 logo）。
-_LOGO_MIN_LIST = 5
-
-
 def _build_view(cfg, db_names, mru, show_hidden):
-    """当前视图的 provider 名列表：只含真实存在于 CC-Switch 的号，按使用率排序。"""
+    """Keep config order stable; MRU only affects the initial cursor."""
     meta = cfg["providers"]
-    names = [
+    return [
         n for n in meta
         if n in db_names and (show_hidden or not meta[n].get("hidden"))
     ]
-    names.sort(key=lambda n: -mru.get(n, 0.0))
-    return names
 
 
-def _edit_alias(win, name, meta) -> None:
-    h, _ = win.getmaxyx()
-    prompt = f"别名 {name} (空=清除): "
-    curses.curs_set(1)
-    curses.echo()
-    _addstr(win, h - 1, 2, prompt, C.get("cyan", 0))
-    win.refresh()
+def _recent_name(view: list[str], mru: dict[str, float]) -> str | None:
+    candidates = [
+        name
+        for name in view
+        if isinstance(mru.get(name), (int, float))
+        and not isinstance(mru.get(name), bool)
+    ]
+    return max(candidates, key=lambda name: mru[name], default=None)
+
+
+def _initial_index(
+    view: list[str],
+    mru: dict[str, float],
+    preferred: str | None = None,
+) -> int:
+    if preferred in view:
+        return view.index(preferred)
+    recent = _recent_name(view, mru)
+    return view.index(recent) if recent in view else 0
+
+
+def _visible_window(total: int, selected: int, capacity: int) -> tuple[int, int]:
+    if total <= 0 or capacity <= 0:
+        return (0, 0)
+    capacity = min(total, capacity)
+    start = max(0, min(selected - (capacity // 2), total - capacity))
+    return (start, start + capacity)
+
+
+def _digit_index(key: int) -> int | None:
+    if ord("1") <= key <= ord("9"):
+        return key - ord("1")
+    if key == ord("0"):
+        return 9
+    return None
+
+
+def _alias_conflict(
+    meta: dict,
+    current_name: str,
+    candidate: str,
+) -> str | None:
+    folded = candidate.strip().casefold()
+    if not folded:
+        return None
+    for name, provider_meta in meta.items():
+        if name == current_name:
+            continue
+        terms = [name]
+        alias = provider_meta.get("alias") if isinstance(provider_meta, dict) else None
+        if isinstance(alias, str) and alias.strip():
+            terms.append(alias.strip())
+        if any(term.casefold() == folded for term in terms):
+            return name
+    return None
+
+
+def _set_alias(meta: dict, name: str, candidate: str) -> tuple[bool, str]:
+    candidate = candidate.strip()
+    if not candidate:
+        changed = bool(meta[name].pop("alias", None))
+        return (changed, "别名已清除" if changed else "未设置别名")
+    if candidate.startswith("-"):
+        return (False, "别名不能以 “-” 开头，否则会与命令参数冲突")
+    if candidate.casefold() in RESERVED_SELECTOR_WORDS:
+        return (False, f"“{candidate}”是 claude1 保留命令，请换一个别名")
+    conflict = _alias_conflict(meta, name, candidate)
+    if conflict:
+        return (False, f"别名“{candidate}”已被 {conflict} 使用")
+    if meta[name].get("alias") == candidate:
+        return (False, f"别名仍为 {candidate}")
+    meta[name]["alias"] = candidate
+    return (True, f"别名已设为 {candidate}")
+
+
+def _edit_alias(win, name, meta) -> tuple[bool, str]:
+    h, w = win.getmaxyx()
+    prompt = "别名（留空清除）: "
+    _safe_curs_set(1)
     try:
-        raw = win.getstr(h - 1, 2 + len(prompt), 40)
+        curses.echo()
+    except curses.error:
+        pass
+    _addstr(win, h - 1, 0, " " * max(0, w - 1))
+    _addstr(win, h - 1, 2, prompt, C.get("accent", 0))
+    win.refresh()
+    input_x = min(max(2, 2 + _dwidth(prompt)), max(2, w - 2))
+    input_limit = max(1, min(40, w - input_x - 1))
+    try:
+        raw = win.getstr(h - 1, input_x, input_limit)
         s = raw.decode("utf-8", "ignore").strip()
     except Exception:
-        s = ""
+        return (False, "别名未修改")
     finally:
-        curses.noecho()
-        curses.curs_set(0)
-    if s:
-        meta[name]["alias"] = s
-    else:
-        meta[name].pop("alias", None)
+        try:
+            curses.noecho()
+        except curses.error:
+            pass
+        _safe_curs_set(0)
+    return _set_alias(meta, name, s)
 
 
 def _confirm(win, msg) -> bool:
@@ -785,8 +954,8 @@ def _confirm(win, msg) -> bool:
     choice = False
     while True:
         _addstr(win, h - 1, 0, " " * (win.getmaxyx()[1] - 1))
-        _addstr(win, h - 1, 2, msg + "  ", C.get("yellow", 0) | curses.A_BOLD)
-        base = 2 + len(msg) + 2
+        _addstr(win, h - 1, 2, msg + "  ", C.get("warning", 0) | curses.A_BOLD)
+        base = 2 + _dwidth(msg) + 2
         _addstr(win, h - 1, base, " y ", C.get("sel", curses.A_REVERSE) if choice else C.get("dim", 0))
         _addstr(win, h - 1, base + 4, " n ", C.get("sel", curses.A_REVERSE) if not choice else C.get("dim", 0))
         win.refresh()
@@ -803,77 +972,98 @@ def _confirm(win, msg) -> bool:
             return False
 
 
-def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
+def _draw_launcher(
+    win,
+    cfg,
+    view,
+    idx,
+    show_hidden,
+    mru,
+    *,
+    show_brand: bool = True,
+    help_open: bool = False,
+    notice: str | None = None,
+) -> None:
     meta = cfg["providers"]
     win.erase()
     h, w = win.getmaxyx()
-    big = _wide_enough(win) and h > _HEADER_H + _LOGO_MIN_LIST
+    big = _large_logo_supported(h, w)
 
     if big:
-        greet = "欢迎回来"
-        _addstr(win, 0, 2, greet, C.get("pink", 0) | curses.A_BOLD)
-        _addstr(win, 0, 3 + _dwidth(greet), "· 选择一个渠道开始使用 Claude 1", C.get("dim", 0))
-        _draw_logo(win, phase)
+        if show_brand:
+            _addstr(win, 0, 2, "欢迎回来", curses.A_BOLD)
+            _draw_logo(win, 0)
         head = _LOGO_TOP + len(LOGO)
     else:
-        _draw_logo(win, phase)
+        if show_brand:
+            _draw_logo(win, 0)
         head = 1
 
-    hx = 2
-    _addstr(win, head + 1, hx, "选择渠道", C.get("lime", 0) | curses.A_BOLD)
-    hx += _dwidth("选择渠道") + 1
-    if view:
-        cur = view[idx]
-        _addstr(win, head + 1, hx, "· 当前", C.get("dim", 0))
-        hx += _dwidth("· 当前") + 1
-        badge = f"› {cur}"
-        _addstr(win, head + 1, hx, badge, C.get("orange", 0) | curses.A_BOLD)
-        hx += _dwidth(badge) + 1
+    heading = "选择本次渠道"
+    _addstr(win, head + 1, 2, heading, C.get("accent", 0))
     if show_hidden:
-        _addstr(win, head + 1, hx, "· 含隐藏项", C.get("dim", 0))
-    _addstr(win, head + 2, 2, "↑↓ 选择 · Enter 启动", C.get("dim", 0))
+        _addstr(
+            win,
+            head + 1,
+            3 + _dwidth(heading),
+            "· 含隐藏项",
+            C.get("dim", 0),
+        )
+    guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
+    guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
+    _addstr(win, head + 2, 2, guide, guide_attr)
     list_top = head + 4
+    footer_row = max(0, h - 1)
+    capacity = max(0, footer_row - list_top)
+    start, end = _visible_window(len(view), idx, capacity)
+    recent = _recent_name(view, mru)
 
     if not view:
-        _addstr(win, list_top, 2, "（没有可用渠道）", C.get("yellow", 0))
-    for i in range(len(view)):
+        _addstr(win, list_top, 2, "没有可用渠道", C.get("warning", 0))
+    row_width = max(0, w - 4)
+    for row_offset, i in enumerate(range(start, end)):
         name = view[i]
         m = meta[name]
         hidden = m.get("hidden")
         rank = i + 1
         selected = i == idx
         marker = "▸" if selected else " "
-        row_col = _row_pairs[i % len(_row_pairs)] | curses.A_BOLD if _row_pairs else C.get("green", 0) | curses.A_BOLD
-        if hidden:
-            dot, dot_attr = "·", C.get("dim", 0)
-        elif mru.get(name):
-            dot, dot_attr = "★", row_col
-        else:
-            dot, dot_attr = "◆", row_col
-        label = name
+        label = f"{marker} {rank:>2}  {name}"
+        status: list[str] = []
         if m.get("alias"):
-            label += f"  «{m['alias']}»"
+            status.append(str(m["alias"]))
+        if name == recent:
+            status.append("最近")
         if hidden:
-            label += "  (已隐藏)"
-        row = list_top + i
+            status.append("已隐藏")
+        line = _compose_row(label, " · ".join(status), row_width)
+        row = list_top + row_offset
         if selected:
-            line = f"{marker} {rank:>2}. {dot} {label}"
-            _addstr(win, row, 2, line.ljust(w - 4), C.get("sel", curses.A_REVERSE))
+            _addstr(
+                win,
+                row,
+                2,
+                _pad_display(line, row_width),
+                C.get("sel", curses.A_REVERSE),
+            )
         else:
-            name_attr = C.get("dim", 0) if hidden else row_col
-            _addstr(win, row, 2, marker, C.get("dim", 0))
-            _addstr(win, row, 4, f"{rank:>2}.", C.get("dim", 0))
-            _addstr(win, row, 8, dot, dot_attr)
-            _addstr(win, row, 10, label, name_attr)
+            attr = C.get("dim", 0) if hidden else C.get("base", 0)
+            _addstr(win, row, 2, line, attr)
 
-    foot = f"共 {len(view)} 个   ·   a 别名 · x 隐藏 · h 隐藏项 · q 退出"
-    _addstr(win, list_top + len(view) + 1, 2, foot, C.get("dim", 0))
+    if help_open:
+        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+    else:
+        visible_range = ""
+        if start > 0 or end < len(view):
+            visible_range = f" · {start + 1}–{end}/{len(view)}"
+        foot = f"共 {len(view)} 个{visible_range} · ? 更多操作 · q 退出"
+    _addstr(win, footer_row, 2, foot, C.get("dim", 0))
     win.refresh()
 
 
 def _launcher_main(win, cfg, db_names):
     """返回要启动的 provider 名，或 None(退出不启动)。hide/alias 即时落盘。"""
-    curses.curs_set(0)
+    _safe_curs_set(0)
     win.keypad(True)
     try:
         curses.set_escdelay(25)
@@ -881,23 +1071,36 @@ def _launcher_main(win, cfg, db_names):
         pass
     global C
     C = _init_colors()
-    _intro(win)
     mru = load_mru()
     meta = cfg["providers"]
     show_hidden = False
     view = _build_view(cfg, db_names, mru, show_hidden)
-    idx = 0
-    phase = 0
-    anim = len(_logo_pairs) > 1  # 有多色才动画
-    win.timeout(110 if anim else -1)  # 110ms 无输入即返回 -1 → 推进流动
-    _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase)
+    idx = _initial_index(view, mru)
+    help_open = False
+    notice: str | None = None
+    rows, cols = win.getmaxyx()
+    animate = _animation_enabled() and _large_logo_supported(rows, cols)
+    _draw_launcher(
+        win,
+        cfg,
+        view,
+        idx,
+        show_hidden,
+        mru,
+        show_brand=not animate,
+    )
+    pending_key = _intro(win) if animate else None
+    win.timeout(-1)
+    _draw_launcher(win, cfg, view, idx, show_hidden, mru)
     while True:
-        ch = win.getch()
-        if ch == -1:  # 动画节拍：只重画 logo，避免整屏闪
-            phase += 1
-            _draw_logo(win, phase)
-            win.refresh()
-            continue
+        ch = pending_key if pending_key is not None else win.getch()
+        pending_key = None
+        notice = None
+        direct_index = _digit_index(ch)
+        if direct_index is not None:
+            if direct_index < len(view):
+                return view[direct_index]
+            notice = f"没有第 {direct_index + 1} 个渠道"
         if ch in (curses.KEY_UP, ord("k")):
             if view:
                 idx = (idx - 1) % len(view)
@@ -906,33 +1109,44 @@ def _launcher_main(win, cfg, db_names):
                 idx = (idx + 1) % len(view)
         elif ch == ord("a"):
             if view:
-                win.timeout(-1)
-                _edit_alias(win, view[idx], meta)
-                win.timeout(110 if anim else -1)
-                save_config(cfg)
+                changed, notice = _edit_alias(win, view[idx], meta)
+                if changed:
+                    save_config(cfg)
         elif ch == ord("x"):
             if view:
                 name = view[idx]
                 nowh = meta[name].get("hidden")
                 verb = "恢复显示" if nowh else "隐藏"
-                win.timeout(-1)
                 ok = _confirm(win, f"{verb} {name}?")
-                win.timeout(110 if anim else -1)
                 if ok:
                     meta[name]["hidden"] = not nowh
                     save_config(cfg)
+                    preferred = name
                     view = _build_view(cfg, db_names, mru, show_hidden)
+                    idx = _initial_index(view, mru, preferred)
         elif ch == ord("h"):  # 切换「显示隐藏项」
+            preferred = view[idx] if view else None
             show_hidden = not show_hidden
             view = _build_view(cfg, db_names, mru, show_hidden)
-            idx = 0
+            idx = _initial_index(view, mru, preferred)
+        elif ch == ord("?"):
+            help_open = not help_open
         elif ch in (10, 13, curses.KEY_ENTER):
             if view:
                 return view[idx]
         elif ch in (27, ord("q")):
             return None
         idx = 0 if not view else max(0, min(idx, len(view) - 1))
-        _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase)
+        _draw_launcher(
+            win,
+            cfg,
+            view,
+            idx,
+            show_hidden,
+            mru,
+            help_open=help_open,
+            notice=notice,
+        )
 
 
 def run_tui_launcher():
@@ -945,6 +1159,9 @@ def run_tui_launcher():
     if changed:
         save_config(cfg)
     if curses is None or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return ("no-tui", None)
+    terminal = shutil.get_terminal_size(fallback=(80, 24))
+    if not _tui_size_supported(terminal.lines, terminal.columns):
         return ("no-tui", None)
     try:
         name = curses.wrapper(_launcher_main, cfg, db_names)
@@ -1031,8 +1248,10 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
                 first_positional = False
                 if low in BACKEND_ALIASES:
                     backend = BACKEND_ALIASES[low]
-                else:
+                elif backend is None:
                     hint = arg
+                else:
+                    claude_args.append(arg)
                 continue
             claude_args.append(arg)
             continue
@@ -1058,7 +1277,7 @@ def exec_reclaude(claude_args: list[str]) -> int:
     if not RECLAUDE_ISOLATED.exists():
         raise RuntimeError(f"reclaude 未安装: {RECLAUDE_ISOLATED}")
     record_backend("reclaude")
-    print("[claude1] 后端: reclaude (yufeng 中转，隔离 CC-Switch)")
+    print("[claude1] 后端: reclaude（独立入口，不改 CC Switch）")
     return int(subprocess.run([str(RECLAUDE_ISOLATED), *claude_args]).returncode)
 
 
@@ -1115,8 +1334,48 @@ def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
             pass
 
 
+def _extract_hub_model(claude_args: list[str]) -> tuple[str | None, list[str]]:
+    """Consume claude1's Hub-only --model option without touching other args."""
+    requested: str | None = None
+    forwarded: list[str] = []
+    index = 0
+    while index < len(claude_args):
+        arg = claude_args[index]
+        if arg == "--model":
+            if index + 1 >= len(claude_args):
+                raise RuntimeError("hub --model 后需要 <渠道,模型>")
+            value = claude_args[index + 1]
+            index += 2
+        elif arg.startswith("--model="):
+            value = arg.split("=", 1)[1]
+            index += 1
+        else:
+            forwarded.append(arg)
+            index += 1
+            continue
+        if requested is not None:
+            raise RuntimeError("hub --model 只能指定一次")
+        requested = value
+    return requested, forwarded
+
+
+def _normalize_hub_model(value: str, channels: dict) -> str:
+    raw = value.strip()
+    if raw.startswith("anthropic/"):
+        raw = raw[len("anthropic/") :]
+    alias, separator, model = raw.partition(",")
+    alias, model = alias.strip().casefold(), model.strip()
+    if not separator or not alias or not model:
+        raise RuntimeError("hub 模型格式应为 <渠道,模型>，例如 fast,sonnet")
+    if alias not in channels:
+        available = "、".join(str(item) for item in channels)
+        raise RuntimeError(f"hub 中没有渠道 '{alias}'；可用渠道: {available}")
+    return f"{alias},{model}"
+
+
 def exec_hub(claude_args: list[str]) -> int:
     """Launch one Claude session through the isolated multi-channel hub."""
+    requested_model, claude_args = _extract_hub_model(claude_args)
     if not HUB_CONFIG.is_file():
         raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
     try:
@@ -1143,8 +1402,12 @@ def exec_hub(claude_args: list[str]) -> int:
     ):
         raise RuntimeError("hub 配置中的 default_channel 或默认模型无效")
 
+    main_model = (
+        _normalize_hub_model(requested_model, channels)
+        if requested_model is not None
+        else f"{default_channel},{models[0]}"
+    )
     ensure_hub(port)
-    main_model = f"{default_channel},{models[0]}"
     settings = {
         "env": {
             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
@@ -1167,7 +1430,142 @@ def exec_hub(claude_args: list[str]) -> int:
     return launch_with_settings(settings, claude_args)
 
 
+CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠道
+
+用法:
+  claude1                              打开渠道选择器
+  claude1 <名称或别名> [Claude 参数]   直接启动一个渠道
+  claude1 hub [--model 渠道,模型]      进入可用 /model 热切换的 Hub
+  claude1 list [--all]                 查看渠道，不启动 Claude
+  claude1 doctor                       做本机只读检查，不连接上游
+  claude1 use <backend>                显式设置普通 claude 的粘性后端
+  claude1 --help                       显示本帮助
+
+快捷键:
+  ↑↓ / jk 移动 · Enter 启动 · 1–9/0 数字直达 · ? 更多操作 · q 退出
+
+默认启动只影响本次会话，不修改普通 claude、CC Switch 当前渠道或 ReClaude。
+"""
+
+
+def cli_list_providers(show_all: bool = False) -> int:
+    rows = db_claude_rows()
+    by_name = {
+        row["name"]: {
+            "name": row["name"],
+            "settings_config": row["settings_config"],
+        }
+        for row in rows
+    }
+    cfg = load_config()
+    changed = sync_config(cfg, list(by_name))
+    changed |= migrate_hidden(cfg)
+    if changed:
+        save_config(cfg)
+    names = [
+        name
+        for name, meta in cfg["providers"].items()
+        if name in by_name and (show_all or not meta.get("hidden"))
+    ]
+    if not names:
+        print("claude1: 没有可显示的 CC Switch Claude 渠道")
+        return 1
+
+    recent = _recent_name(names, load_mru())
+    print("claude1 渠道（顺序与选择器一致）\n")
+    for index, name in enumerate(names, 1):
+        meta = cfg["providers"][name]
+        details: list[str] = []
+        if meta.get("alias"):
+            details.append(f"别名 {meta['alias']}")
+        if name == recent:
+            details.append("最近")
+        if meta.get("hidden"):
+            details.append("已隐藏")
+        suffix = f"  {' · '.join(details)}" if details else ""
+        print(f"  {index:>2}  {name}{suffix}")
+    print(f"\n共 {len(names)} 个；运行 `claude1 <名称或别名>` 可直接启动。")
+    return 0
+
+
+def cli_doctor() -> int:
+    """Run local read-only checks; never start Claude or contact a provider."""
+    failures = 0
+
+    def report(level: str, message: str) -> None:
+        nonlocal failures
+        if level == "FAIL":
+            failures += 1
+        print(f"  {level:<4} {message}")
+
+    print("claude1 doctor（本机只读，不连接上游）\n")
+    if sys.version_info >= (3, 11):
+        report("OK", f"Python {sys.version_info.major}.{sys.version_info.minor}")
+    else:
+        report("FAIL", "需要 Python 3.11 或更高版本")
+
+    claude_bin = resolve_claude_bin()
+    if claude_bin.exists() and os.access(claude_bin, os.X_OK):
+        report("OK", "Claude Code 可执行文件已找到")
+    else:
+        report("FAIL", "未找到 Claude Code；请安装 claude 或设置 CLAUDE1_CLAUDE_BIN")
+
+    try:
+        rows = db_claude_rows()
+    except (RuntimeError, sqlite3.Error, OSError):
+        report("FAIL", "CC Switch 数据库不存在、不可读或结构不兼容")
+    else:
+        report("OK", f"CC Switch 数据库只读打开，发现 {len(rows)} 个 Claude 渠道")
+        if os.name == "posix" and (DB_PATH.stat().st_mode & 0o077):
+            report("FAIL", "CC Switch 数据库含凭证，文件权限应为 0600")
+
+    if CONFIG_PATH.exists():
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            valid = isinstance(raw, dict) and isinstance(raw.get("providers"), dict)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            valid = False
+        report("OK" if valid else "FAIL", "claude1 渠道配置可读" if valid else "claude1 渠道配置无效")
+    else:
+        report("INFO", "首次启动时将按 CC Switch 顺序创建渠道配置")
+
+    if HUB_CONFIG.exists():
+        if not HUB_SCRIPT.is_file():
+            report("FAIL", "Hub 已配置，但 claude-hub.py 不存在")
+        elif shutil.which("uv") is None:
+            report("FAIL", "Hub 已配置，但未找到 uv")
+        else:
+            report("OK", "Hub 脚本与运行器已就绪")
+        if os.name == "posix" and (HUB_CONFIG.stat().st_mode & 0o077):
+            report("FAIL", "Hub 配置可能含本地凭证，文件权限应为 0600")
+    else:
+        report("INFO", "Hub 尚未配置；普通 provider 选择仍可使用")
+
+    print(
+        "\n结果: "
+        + ("可以使用" if failures == 0 else f"需要处理 {failures} 项")
+    )
+    return 0 if failures == 0 else 1
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("help", "-h", "--help"):
+        print(CLAUDE1_USAGE)
+        return 0
+    if argv and argv[0] in ("version", "--version"):
+        print(f"claude1 {VERSION}")
+        return 0
+    if argv and argv[0] == "list":
+        unknown = [arg for arg in argv[1:] if arg != "--all"]
+        if unknown:
+            print(f"[claude1] list 不支持参数: {' '.join(unknown)}", file=sys.stderr)
+            return 2
+        return cli_list_providers(show_all="--all" in argv[1:])
+    if argv and argv[0] == "doctor":
+        if len(argv) != 1:
+            print("[claude1] doctor 不接收额外参数", file=sys.stderr)
+            return 2
+        return cli_doctor()
     if argv and argv[0] == "use":
         if len(argv) < 2:
             print(

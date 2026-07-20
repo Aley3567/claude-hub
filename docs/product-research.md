@@ -59,9 +59,9 @@ claude-hub 让同一个 Claude Code 会话通过 /model 热切换渠道与模型
 
 ↑↓ / jk 移动 · Enter 启动 · 数字直达
 
-▸  1  Bailian                              最近
-   2  Xiaomi MiMo api                      mimo
-   3  Any router
+▸  1  Primary                              最近
+   2  Fast API                             fast
+   3  Backup
 
 共 10 个 · ? 更多操作 · q 退出
 ```
