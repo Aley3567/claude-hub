@@ -14,8 +14,9 @@ import threading
 import unittest
 import uuid
 from contextlib import contextmanager, redirect_stdout
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import ThreadingTCPServer
 from unittest import mock
 
 
@@ -87,11 +88,13 @@ def health_server(status_code: int, payload: bytes):
         def log_message(self, _format: str, *_args) -> None:
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    # HTTPServer performs a reverse-DNS lookup during server_bind, which can
+    # stall for tens of seconds on otherwise healthy macOS CI runners.
+    server = ThreadingTCPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield int(server.server_port)
+        yield int(server.server_address[1])
     finally:
         server.shutdown()
         server.server_close()
@@ -655,6 +658,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 CLAUDE_CODE_WORKFLOWS="must-not-leak",
                 UNRELATED_SECRET="must-not-leak",
                 CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+                CLAUDE1_HUB_START_TIMEOUT="5",
             )
             fake_hub = Path(env["CLAUDE1_HUB_SCRIPT"])
             capture = Path(env["CLAUDE1_HUB_CONFIG"])
@@ -666,8 +670,9 @@ class LauncherSafetyTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
-                from http.server import BaseHTTPRequestHandler, HTTPServer
+                from http.server import BaseHTTPRequestHandler
                 from pathlib import Path
+                from socketserver import TCPServer
 
                 Path(os.environ["CLAUDE_HUB_CONFIG"]).write_text(
                     json.dumps(dict(os.environ)), encoding="utf-8"
@@ -689,7 +694,7 @@ class LauncherSafetyTests(unittest.TestCase):
                     def log_message(self, _format, *_args):
                         return
 
-                server = HTTPServer(
+                server = TCPServer(
                     ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler
                 )
                 server.serve_forever()
