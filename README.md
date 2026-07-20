@@ -104,8 +104,13 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
      python3 -c 'import secrets; print(secrets.token_urlsafe(32))' \
        > ~/.cc-switch/claude-hub-token
    export CLAUDE_HUB_LOCAL_TOKEN="$(< ~/.cc-switch/claude-hub-token)"
+   ~/.claude/scripts/claude-hub.py doctor
    claude1 hub
    ```
+
+`doctor` 只检查本机配置、数据库、渠道映射和文件权限，不会连接 provider，也
+不会显示上游地址或 token。Hub 会要求配置、CC Switch 数据库以及当前存在的
+`-wal`、`-shm` 文件权限不超过 `0600`；检查失败时按输出修正后再启动。
 
 进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Hub
 会在请求发生时从 CC Switch DB 只读获取对应 provider 的凭证，不修改 DB、
