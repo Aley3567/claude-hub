@@ -131,7 +131,17 @@ shell_quote() {
 SOURCE_LINE="export CLAUDE1_SCRIPT=$(shell_quote "$LAUNCHER_TARGET") CLAUDE1_HUB_SCRIPT=$(shell_quote "$HUB_TARGET"); source $(shell_quote "$SHELL_TARGET") $MANAGED_MARKER"
 
 file_mode() {
-  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null || printf '%s' unknown
+  if mode=$(stat -c '%a' "$1" 2>/dev/null); then
+    :
+  elif mode=$(stat -f '%Lp' "$1" 2>/dev/null); then
+    :
+  else
+    mode=unknown
+  fi
+  case "$mode" in
+    ''|*[!0-7]*) printf '%s' unknown ;;
+    *) printf '%s' "$mode" ;;
+  esac
 }
 
 needs_install() {

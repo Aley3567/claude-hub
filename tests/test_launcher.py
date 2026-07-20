@@ -7,6 +7,7 @@ import os
 import socket
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import textwrap
 import threading
@@ -691,17 +692,24 @@ class LauncherSafetyTests(unittest.TestCase):
                 server = HTTPServer(
                     ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler
                 )
-                server.handle_request()
-                server.server_close()
+                server.serve_forever()
                 """,
             )
 
             with loaded_launcher(env) as launcher:
-                launcher.ensure_hub(port)
-                for process in launcher._hub_processes:
-                    process.wait(timeout=2)
+                try:
+                    launcher.ensure_hub(port)
+                    child_env = json.loads(capture.read_text(encoding="utf-8"))
+                finally:
+                    for process in launcher._hub_processes:
+                        if process.poll() is None:
+                            process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
 
-            child_env = json.loads(capture.read_text(encoding="utf-8"))
             for key in (
                 "ANTHROPIC_AUTH_TOKEN",
                 "ANTHROPIC_API_KEY",
