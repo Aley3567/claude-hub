@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import socket
+import stat
+import tempfile
+import textwrap
+import threading
+import unittest
+import uuid
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER = ROOT / "claude-provider-once.py"
+
+
+@contextmanager
+def loaded_launcher(env: dict[str, str]):
+    """Load a fresh launcher module after applying an isolated runtime env."""
+    with mock.patch.dict(os.environ, env, clear=False):
+        name = f"claude1_launcher_{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(name, LAUNCHER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        yield module
+
+
+def write_executable(path: Path, source: str) -> None:
+    path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
+    path.chmod(0o755)
+
+
+def isolated_env(home: Path, **overrides: str) -> dict[str, str]:
+    state = home / "state"
+    env = {
+        "HOME": str(home),
+        "CLAUDE1_HOME": str(home),
+        "CLAUDE1_DB_PATH": str(state / "cc-switch.db"),
+        "CLAUDE1_MRU_PATH": str(state / "mru.json"),
+        "CLAUDE1_CONFIG_PATH": str(state / "config.json"),
+        "CLAUDE1_BACKEND_STATE": str(state / "last-session.json"),
+        "CLAUDE1_BACKEND_STICKY": str(state / "sticky"),
+        "CLAUDE1_ANYROUTER_OBSERVER": str(home / "bin" / "observer"),
+        "CLAUDE1_RECLAUDE_BIN": str(home / "bin" / "reclaude"),
+        "CLAUDE1_ANYROUTER_SETTINGS": str(home / "settings" / "anyrouter.json"),
+        "CLAUDE1_NOTION_MCP": str(home / "settings" / "notion.json"),
+        "CLAUDE1_GATEWAY_BIN": str(home / "bin" / "gateway"),
+        "CLAUDE1_GATEWAY_CONFIG": str(home / "settings" / "gateway.yaml"),
+        "CLAUDE1_GATEWAY_LOG": str(home / "logs" / "gateway.log"),
+        "CLAUDE1_HUB_SCRIPT": str(home / "bin" / "claude-hub"),
+        "CLAUDE1_HUB_CONFIG": str(home / "settings" / "hub.json"),
+        "CLAUDE1_HUB_DB": str(state / "hub.db"),
+        "CLAUDE1_HUB_LOG": str(home / "logs" / "hub.log"),
+        "CLAUDE1_TMP_DIR": str(home / "tmp"),
+        "CLAUDE1_DEFAULT_CLAUDE_BIN": str(home / "bin" / "default-claude"),
+    }
+    env.update(overrides)
+    return env
+
+
+def free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+@contextmanager
+def health_server(status_code: int, payload: bytes):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *_args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+class LauncherSafetyTests(unittest.TestCase):
+    def test_every_runtime_path_can_be_injected_under_a_temporary_home(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(
+                Path(raw_home),
+                CLAUDE1_GATEWAY_URL="http://127.0.0.1:54321",
+            )
+            expected = {
+                "DB_PATH": "CLAUDE1_DB_PATH",
+                "DEFAULT_CLAUDE_BIN": "CLAUDE1_DEFAULT_CLAUDE_BIN",
+                "MRU_PATH": "CLAUDE1_MRU_PATH",
+                "CONFIG_PATH": "CLAUDE1_CONFIG_PATH",
+                "BACKEND_STATE": "CLAUDE1_BACKEND_STATE",
+                "BACKEND_STICKY": "CLAUDE1_BACKEND_STICKY",
+                "ANYROUTER_OBSERVER": "CLAUDE1_ANYROUTER_OBSERVER",
+                "RECLAUDE_ISOLATED": "CLAUDE1_RECLAUDE_BIN",
+                "ANYROUTER_SETTINGS": "CLAUDE1_ANYROUTER_SETTINGS",
+                "NOTION_MCP": "CLAUDE1_NOTION_MCP",
+                "GATEWAY_BIN": "CLAUDE1_GATEWAY_BIN",
+                "GATEWAY_CONFIG": "CLAUDE1_GATEWAY_CONFIG",
+                "GATEWAY_LOG": "CLAUDE1_GATEWAY_LOG",
+                "HUB_SCRIPT": "CLAUDE1_HUB_SCRIPT",
+                "HUB_CONFIG": "CLAUDE1_HUB_CONFIG",
+                "HUB_DB": "CLAUDE1_HUB_DB",
+                "HUB_LOG": "CLAUDE1_HUB_LOG",
+                "TEMP_DIR": "CLAUDE1_TMP_DIR",
+            }
+            with loaded_launcher(env) as launcher:
+                for attr, key in expected.items():
+                    with self.subTest(path=attr):
+                        self.assertEqual(getattr(launcher, attr), Path(env[key]))
+                self.assertEqual(
+                    launcher.GATEWAY_URL, "http://127.0.0.1:54321"
+                )
+
+    def test_regular_launch_records_last_session_without_touching_sticky(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            fake_claude = home / "bin" / "claude"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                raise SystemExit(0)
+                """,
+            )
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+            sticky = Path(env["CLAUDE1_BACKEND_STICKY"])
+            sticky.parent.mkdir(parents=True)
+            sticky.write_text("reclaude\n", encoding="utf-8")
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(launcher.exec_plain_claude("direct", ["-p", "ok"]), 0)
+
+            self.assertEqual(sticky.read_text(encoding="utf-8"), "reclaude\n")
+            last_session = json.loads(
+                Path(env["CLAUDE1_BACKEND_STATE"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(last_session["backend"], "direct")
+            self.assertIsInstance(last_session["at"], float)
+
+    def test_explicit_use_is_the_only_operation_that_changes_sticky(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            sticky = Path(env["CLAUDE1_BACKEND_STICKY"])
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(launcher.set_sticky("hub"), 0)
+                launcher.record_backend("provider", "Fixture")
+
+            self.assertEqual(sticky.read_text(encoding="utf-8"), "hub\n")
+            self.assertEqual(stat.S_IMODE(sticky.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(
+                    Path(env["CLAUDE1_BACKEND_STATE"]).read_text(encoding="utf-8")
+                )["provider"],
+                "Fixture",
+            )
+            leftovers = [
+                path.name
+                for path in sticky.parent.iterdir()
+                if path.name.startswith(f".{sticky.name}.")
+            ]
+            self.assertEqual(leftovers, [])
+
+    def test_temporary_settings_are_0600_and_removed_after_fake_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            fake_claude = home / "bin" / "claude"
+            capture = home / "capture.json"
+            fake_claude.parent.mkdir(parents=True)
+            Path(env["CLAUDE1_TMP_DIR"]).mkdir(parents=True)
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import stat
+                import sys
+                from pathlib import Path
+
+                idx = sys.argv.index("--settings")
+                settings_path = Path(sys.argv[idx + 1])
+                Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(json.dumps({
+                    "argv": sys.argv[1:],
+                    "env": dict(os.environ),
+                    "mode": stat.S_IMODE(settings_path.stat().st_mode),
+                    "settings_path": str(settings_path),
+                    "settings": json.loads(settings_path.read_text(encoding="utf-8")),
+                }), encoding="utf-8")
+                raise SystemExit(0)
+                """,
+            )
+            env.update(
+                CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                FAKE_CLAUDE_CAPTURE=str(capture),
+                ANTHROPIC_BASE_URL="https://reclaude.invalid",
+                ANTHROPIC_AUTH_TOKEN="must-not-leak",
+                HTTP_PROXY="http://must-not-leak.invalid",
+                https_proxy="http://must-not-leak.invalid",
+                CLAUDE_CONFIG_DIR=str(home / "reclaude-config"),
+                CLAUDE_CODE_PARENT_SESSION_ID="must-not-leak",
+                RECLAUDE_SESSION_ID="must-not-leak",
+                CLAUDE_HUB_LOCAL_TOKEN="must-not-leak",
+                CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="1",
+            )
+            settings = {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": "fixture-secret",
+                }
+            }
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.launch_with_settings(settings, ["-p", "hello"]),
+                    0,
+                )
+
+            observed = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(observed["mode"], 0o600)
+            self.assertEqual(observed["settings"], settings)
+            self.assertNotIn("fixture-secret", observed["argv"])
+            self.assertFalse(Path(observed["settings_path"]).exists())
+            child_env = observed["env"]
+            self.assertEqual(
+                child_env["ANTHROPIC_BASE_URL"], "https://fixture.invalid"
+            )
+            self.assertEqual(
+                child_env["ANTHROPIC_AUTH_TOKEN"], "fixture-secret"
+            )
+            for key in (
+                "HTTP_PROXY",
+                "https_proxy",
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDE_CODE_PARENT_SESSION_ID",
+                "RECLAUDE_SESSION_ID",
+                "CLAUDE_HUB_LOCAL_TOKEN",
+            ):
+                self.assertNotIn(key, child_env)
+            self.assertEqual(
+                child_env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"], "1"
+            )
+
+    def test_hub_health_requires_exact_service_and_protocol_contract(self) -> None:
+        valid = {
+            "ok": True,
+            "service": "claude-hub",
+            "protocol": 1,
+            "version": "99.42.7",
+        }
+        cases = [
+            (503, valid, False),
+            (200, {}, False),
+            (200, {**valid, "ok": 1}, False),
+            (200, {**valid, "service": "other-service"}, False),
+            (200, {**valid, "protocol": 2}, False),
+            (200, valid, True),
+        ]
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                for status_code, body, expected in cases:
+                    with self.subTest(status_code=status_code, body=body):
+                        payload = json.dumps(body).encode("utf-8")
+                        with health_server(status_code, payload) as port:
+                            self.assertIs(launcher.hub_healthy(port), expected)
+                with health_server(200, b"not-json") as port:
+                    self.assertFalse(launcher.hub_healthy(port))
+
+    def test_ensure_hub_starts_with_a_scrubbed_whitelist_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            port = free_local_port()
+            env = isolated_env(
+                home,
+                CLAUDE1_HUB_PORT=str(port),
+                ANTHROPIC_AUTH_TOKEN="must-not-leak",
+                ANTHROPIC_API_KEY="must-not-leak",
+                HTTP_PROXY="http://must-not-leak.invalid",
+                HTTPS_PROXY="http://must-not-leak.invalid",
+                ALL_PROXY="socks5://must-not-leak.invalid",
+                TZ="Secret/Timezone",
+                CLAUDE_CODE_CHILD_SESSION="must-not-leak",
+                CLAUDE_CODE_WORKFLOWS="must-not-leak",
+                UNRELATED_SECRET="must-not-leak",
+                CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+            )
+            fake_hub = Path(env["CLAUDE1_HUB_SCRIPT"])
+            capture = Path(env["CLAUDE1_HUB_CONFIG"])
+            fake_hub.parent.mkdir(parents=True)
+            capture.parent.mkdir(parents=True)
+            write_executable(
+                fake_hub,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+                from pathlib import Path
+
+                Path(os.environ["CLAUDE_HUB_CONFIG"]).write_text(
+                    json.dumps(dict(os.environ)), encoding="utf-8"
+                )
+                body = json.dumps({
+                    "ok": True,
+                    "service": "claude-hub",
+                    "protocol": 1,
+                    "version": "0.1.0",
+                }).encode("utf-8")
+
+                class Handler(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    def log_message(self, _format, *_args):
+                        return
+
+                server = HTTPServer(
+                    ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler
+                )
+                server.handle_request()
+                server.server_close()
+                """,
+            )
+
+            with loaded_launcher(env) as launcher:
+                launcher.ensure_hub(port)
+                for process in launcher._hub_processes:
+                    process.wait(timeout=2)
+
+            child_env = json.loads(capture.read_text(encoding="utf-8"))
+            for key in (
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "TZ",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CLAUDE_CODE_WORKFLOWS",
+                "UNRELATED_SECRET",
+            ):
+                self.assertNotIn(key, child_env)
+            self.assertEqual(child_env["CLAUDE_HUB_LOCAL_TOKEN"], "fixture-local-token")
+            self.assertEqual(child_env["CLAUDE_HUB_CONFIG"], str(capture))
+            self.assertEqual(
+                child_env["CLAUDE_HUB_DB"], env["CLAUDE1_HUB_DB"]
+            )
+            self.assertEqual(child_env["CLAUDE_HUB_LOG"], env["CLAUDE1_HUB_LOG"])
+            self.assertEqual(child_env["CLAUDE_HUB_PORT"], str(port))
+
+    def test_hub_supports_environment_backed_local_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            valid_health = json.dumps(
+                {
+                    "ok": True,
+                    "service": "claude-hub",
+                    "protocol": 1,
+                    "version": "0.1.0",
+                }
+            ).encode("utf-8")
+            with health_server(200, valid_health) as port:
+                env = isolated_env(
+                    home,
+                    CLAUDE1_HUB_PORT=str(port),
+                    CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+                )
+                config = Path(env["CLAUDE1_HUB_CONFIG"])
+                config.parent.mkdir(parents=True)
+                config.write_text(
+                    json.dumps(
+                        {
+                            "port": 18787,
+                            "default_channel": "glm",
+                            "channels": {
+                                "glm": {
+                                    "provider": "Fixture",
+                                    "models": ["glm-fixture"],
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                fake_claude = home / "bin" / "claude"
+                capture = home / "capture.json"
+                fake_claude.parent.mkdir(parents=True)
+                write_executable(
+                    fake_claude,
+                    """
+                    #!/usr/bin/env python3
+                    import json
+                    import os
+                    import sys
+                    from pathlib import Path
+
+                    path = Path(sys.argv[sys.argv.index("--settings") + 1])
+                    Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
+                        json.dumps(json.loads(path.read_text(encoding="utf-8"))),
+                        encoding="utf-8",
+                    )
+                    """,
+                )
+                sticky = Path(env["CLAUDE1_BACKEND_STICKY"])
+                sticky.parent.mkdir(parents=True)
+                sticky.write_text("reclaude\n", encoding="utf-8")
+                env.update(
+                    CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                    FAKE_CLAUDE_CAPTURE=str(capture),
+                )
+
+                with loaded_launcher(env) as launcher:
+                    self.assertEqual(launcher.exec_hub(["-p", "hello"]), 0)
+
+                    settings = json.loads(capture.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        settings["env"]["ANTHROPIC_BASE_URL"],
+                        f"http://127.0.0.1:{port}",
+                    )
+                    self.assertEqual(
+                        settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+                        "fixture-local-token",
+                    )
+                    self.assertEqual(
+                        settings["env"]["ANTHROPIC_MODEL"],
+                        "glm,glm-fixture",
+                    )
+
+                    # Legacy live configs with local_token continue to work when
+                    # the safer environment secret is not supplied.
+                    hub_cfg = json.loads(config.read_text(encoding="utf-8"))
+                    hub_cfg["local_token"] = "legacy-config-token"
+                    config.write_text(json.dumps(hub_cfg), encoding="utf-8")
+                    os.environ["CLAUDE_HUB_LOCAL_TOKEN"] = ""
+                    self.assertEqual(launcher.exec_hub([]), 0)
+                    legacy_settings = json.loads(
+                        capture.read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        legacy_settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+                        "legacy-config-token",
+                    )
+                self.assertEqual(sticky.read_text(encoding="utf-8"), "reclaude\n")
+
+    def test_hub_fails_before_start_when_no_local_token_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home, CLAUDE_HUB_LOCAL_TOKEN="")
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "port": 18787,
+                        "default_channel": "glm",
+                        "channels": {
+                            "glm": {
+                                "provider": "Fixture",
+                                "models": ["glm-fixture"],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(RuntimeError, "hub 本地凭证缺失"):
+                    launcher.exec_hub([])
+
+
+if __name__ == "__main__":
+    unittest.main()

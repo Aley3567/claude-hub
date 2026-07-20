@@ -1,23 +1,34 @@
 #!/usr/bin/env zsh
-# claude1 shell functions — add these to ~/.zshrc
+# Safe default shell integration for claude1.
+#
+# Source this file from ~/.zshrc. It defines `claude1` and the explicit
+# `claude1-direct` helper only. In particular, it never aliases or replaces the
+# ordinary `claude` command.
 
-# `claude1` injects a selected provider through a temporary settings file.
-export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1
-
-# Claude skill toggle
-alias sk="bash ~/.claude/scripts/skill-toggle.sh"
-
-# Auto-patch Claude Code Tool Search after updates
-_claude_ensure_toolsearch_patch() {
-  # ... (patch logic, see full script)
-}
-
-# Main claude1 function
 claude1() {
-  _claude_ensure_toolsearch_patch
-  unset CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
-  unset CLAUDE_CODE_WORKFLOWS
-  local args=()
+  local launcher="${CLAUDE1_SCRIPT:-$HOME/.claude/scripts/claude-provider-once.py}"
+  local python="${CLAUDE1_PYTHON:-python3}"
+  local python_path=""
+
+  if [[ ! -f "$launcher" || ! -r "$launcher" ]]; then
+    print -u2 -- "[claude1] launcher script not found or unreadable: $launcher"
+    print -u2 -- "[claude1] install claude-provider-once.py there or set CLAUDE1_SCRIPT."
+    return 127
+  fi
+
+  if [[ "$python" == */* ]]; then
+    python_path="$python"
+  else
+    python_path="$(whence -p "$python" 2>/dev/null)"
+  fi
+  if [[ -z "$python_path" || ! -x "$python_path" ]]; then
+    print -u2 -- "[claude1] Python executable not found: $python"
+    print -u2 -- "[claude1] install Python 3 or set CLAUDE1_PYTHON."
+    return 127
+  fi
+
+  local -a args=()
+  local arg
   for arg in "$@"; do
     if [[ "$arg" == "-dp" ]]; then
       args+=(--dangerously-skip-permissions)
@@ -25,30 +36,26 @@ claude1() {
       args+=("$arg")
     fi
   done
-  python3 "$HOME/.claude/scripts/claude-provider-once.py" "${args[@]}"
+
+  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" \
+    "$python_path" "$launcher" "${args[@]}"
 }
 
-# Default Claude entrypoint follows claude1's sticky backend.
-# 默认(无状态) = reclaude
-claude() {
-  _claude_ensure_toolsearch_patch
-  local _sticky="$HOME/.cc-switch/claude1-backend"
-  local _backend=reclaude
-  [[ -r "$_sticky" ]] && _backend="$(<"$_sticky")"
-  if [[ "$_backend" == reclaude ]]; then
-    "$HOME/.local/bin/reclaude-isolated" "$@"
+# Explicit escape hatch that always invokes the real Claude Code executable.
+claude1-direct() {
+  local configured="${CLAUDE1_CLAUDE_BIN:-claude}"
+  local executable=""
+
+  if [[ "$configured" == */* ]]; then
+    executable="$configured"
   else
-    command claude "$@"
+    executable="$(whence -p "$configured" 2>/dev/null)"
   fi
+  if [[ -z "$executable" || ! -x "$executable" ]]; then
+    print -u2 -- "[claude1] Claude Code executable not found: $configured"
+    print -u2 -- "[claude1] install Claude Code or set CLAUDE1_CLAUDE_BIN."
+    return 127
+  fi
+
+  "$executable" "$@"
 }
-
-# Explicit raw Claude Code CLI entrypoint.
-claude-direct() {
-  command claude "$@"
-}
-
-# AnyRouter 专用 Claude Code 启动命令
-alias claude-any='command claude --settings ~/.claude/settings.anyrouter.json'
-
-# Notion MCP 按需启动
-alias claude-notion='claude --mcp-config ~/.claude/mcp-notion.json'

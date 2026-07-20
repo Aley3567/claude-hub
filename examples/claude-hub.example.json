@@ -1,0 +1,21 @@
+{
+  "port": 18787,
+  "local_token_env": "CLAUDE_HUB_LOCAL_TOKEN",
+  "default_channel": "primary",
+  "channels": {
+    "primary": {
+      "provider": "CC Switch provider name",
+      "models": [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514"
+      ]
+    },
+    "proxy-channel": {
+      "provider": "Another CC Switch provider",
+      "models": [
+        "claude-sonnet-4-20250514"
+      ],
+      "proxy": "http://127.0.0.1:7890"
+    }
+  }
+}

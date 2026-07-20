@@ -28,19 +28,47 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-DB_PATH = Path.home() / ".cc-switch" / "cc-switch.db"
-DEFAULT_CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
-MRU_PATH = Path.home() / ".cc-switch" / "claude1-mru.json"
-CONFIG_PATH = Path.home() / ".cc-switch" / "claude1-config.json"
-BACKEND_STATE = Path.home() / ".cc-switch" / "claude1-backend.json"
-# 纯文本一行的「粘性后端」，供 zsh claude() 秒读（免起 python）。
-BACKEND_STICKY = Path.home() / ".cc-switch" / "claude1-backend"
-ANYROUTER_OBSERVER = Path.home() / "anyrouter-tools" / "observe-claude1.sh"
+def _env_path(name: str, default: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else default
+
+
+HOME = _env_path("CLAUDE1_HOME", Path.home())
+DB_PATH = _env_path("CLAUDE1_DB_PATH", HOME / ".cc-switch" / "cc-switch.db")
+DEFAULT_CLAUDE_BIN = _env_path(
+    "CLAUDE1_DEFAULT_CLAUDE_BIN", HOME / ".local" / "bin" / "claude"
+)
+MRU_PATH = _env_path("CLAUDE1_MRU_PATH", HOME / ".cc-switch" / "claude1-mru.json")
+CONFIG_PATH = _env_path(
+    "CLAUDE1_CONFIG_PATH", HOME / ".cc-switch" / "claude1-config.json"
+)
+# 最近一次实际启动记录；普通启动只能写这里，不能改变粘性入口。
+BACKEND_STATE = _env_path(
+    "CLAUDE1_BACKEND_STATE", HOME / ".cc-switch" / "claude1-backend.json"
+)
+# 纯文本一行的「粘性后端」，只有 `claude1 use` 可以原子写入。
+BACKEND_STICKY = _env_path(
+    "CLAUDE1_BACKEND_STICKY", HOME / ".cc-switch" / "claude1-backend"
+)
+ANYROUTER_OBSERVER = _env_path(
+    "CLAUDE1_ANYROUTER_OBSERVER", HOME / "anyrouter-tools" / "observe-claude1.sh"
+)
 
 # Composable backends & overlays (claude1 [backend] [overlay...] -- <claude args>)
-RECLAUDE_ISOLATED = Path.home() / ".local" / "bin" / "reclaude-isolated"
-ANYROUTER_SETTINGS = Path.home() / ".claude" / "settings.anyrouter.json"
-NOTION_MCP = Path.home() / ".claude" / "mcp-notion.json"
+RECLAUDE_ISOLATED = _env_path(
+    "CLAUDE1_RECLAUDE_BIN", HOME / ".local" / "bin" / "reclaude-isolated"
+)
+ANYROUTER_SETTINGS = _env_path(
+    "CLAUDE1_ANYROUTER_SETTINGS", HOME / ".claude" / "settings.anyrouter.json"
+)
+NOTION_MCP = _env_path(
+    "CLAUDE1_NOTION_MCP", HOME / ".claude" / "mcp-notion.json"
+)
+TEMP_DIR = (
+    _env_path("CLAUDE1_TMP_DIR", HOME / ".cache" / "claude1")
+    if os.environ.get("CLAUDE1_TMP_DIR")
+    else None
+)
 
 # First positional token → a backend instead of a provider-name hint.
 BACKEND_ALIASES = {
@@ -52,15 +80,37 @@ BACKEND_ALIASES = {
     "cc": "current",
     "current": "current",
     "direct": "direct",
+    "hub": "hub",
 }
+
+# claude-hub: 本地多渠道路由网关（会话内 /model 别名,模型 热切换渠道）。
+HUB_SCRIPT = _env_path(
+    "CLAUDE1_HUB_SCRIPT", HOME / ".claude" / "scripts" / "claude-hub.py"
+)
+HUB_CONFIG = _env_path(
+    "CLAUDE1_HUB_CONFIG", HOME / ".cc-switch" / "claude-hub.json"
+)
+HUB_DB = _env_path("CLAUDE1_HUB_DB", DB_PATH)
+HUB_LOG = _env_path(
+    "CLAUDE1_HUB_LOG", HOME / ".cc-switch" / "logs" / "claude-hub.log"
+)
+_hub_processes: list[subprocess.Popen] = []
 
 # Local protocol-translation gateway (cliproxyapi). Providers whose base URL
 # points here (e.g. AIHub, which only speaks the OpenAI protocol upstream)
 # need the gateway alive before Claude Code starts.
-GATEWAY_URL = "http://127.0.0.1:18317"
-GATEWAY_BIN = "/opt/homebrew/bin/cliproxyapi"
-GATEWAY_CONFIG = Path.home() / ".config" / "cliproxyapi-claudex" / "config.yaml"
-GATEWAY_LOG = Path.home() / ".local" / "state" / "cliproxyapi-claudex" / "proxy.log"
+GATEWAY_URL = os.environ.get("CLAUDE1_GATEWAY_URL", "http://127.0.0.1:18317")
+GATEWAY_BIN = _env_path(
+    "CLAUDE1_GATEWAY_BIN", Path("/opt/homebrew/bin/cliproxyapi")
+)
+GATEWAY_CONFIG = _env_path(
+    "CLAUDE1_GATEWAY_CONFIG",
+    HOME / ".config" / "cliproxyapi-claudex" / "config.yaml",
+)
+GATEWAY_LOG = _env_path(
+    "CLAUDE1_GATEWAY_LOG",
+    HOME / ".local" / "state" / "cliproxyapi-claudex" / "proxy.log",
+)
 
 
 def resolve_claude_bin() -> Path:
@@ -115,9 +165,11 @@ def record_use(name: str) -> None:
     mru = load_mru()
     mru[name] = time.time()
     try:
+        MRU_PATH.parent.mkdir(parents=True, exist_ok=True)
         MRU_PATH.write_text(json.dumps(mru, ensure_ascii=False, indent=1))
     except OSError:
         pass  # MRU is best-effort; never block a launch on it
+
 
 def load_config() -> dict:
     try:
@@ -135,6 +187,7 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> bool:
     try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
         return True
     except OSError:
@@ -181,15 +234,48 @@ def provider_by_name(name: str) -> dict | None:
 MANAGED_ENV_PREFIXES = (
     "ANTHROPIC_",
     "CLAUDE_CODE_",
+    "RECLAUDE_",
+)
+MANAGED_ENV_KEYS = {
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
     "NO_PROXY",
-)
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_HUB_LOCAL_TOKEN",
+}
+# This is a presentation preference, not routing or session identity. The
+# default shell integration intentionally sets it and it is safe to retain.
+CLAUDE_CHILD_PASSTHROUGH = {
+    "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN",
+}
 
 
 def managed_key(key: str) -> bool:
-    return any(key.startswith(prefix) for prefix in MANAGED_ENV_PREFIXES)
+    folded = key.upper()
+    return folded in MANAGED_ENV_KEYS or any(
+        folded.startswith(prefix) for prefix in MANAGED_ENV_PREFIXES
+    )
+
+
+def claude_child_env(settings: dict | None = None) -> dict[str, str]:
+    """Build a Claude process environment without inherited routing state."""
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if not managed_key(key)
+    }
+    for key in CLAUDE_CHILD_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value:
+            child[key] = value
+
+    settings_env = settings.get("env") if isinstance(settings, dict) else None
+    if isinstance(settings_env, dict):
+        for key, value in settings_env.items():
+            if isinstance(key, str) and value is not None:
+                child[key] = str(value)
+    return child
 
 
 def db_claude_rows() -> list[sqlite3.Row]:
@@ -325,6 +411,109 @@ def ensure_local_gateway(base_url: str) -> None:
         if gateway_healthy():
             return
     raise RuntimeError(f"本地网关启动失败，查看日志: {GATEWAY_LOG}")
+
+
+def _hub_port(cfg: dict) -> int:
+    raw = os.environ.get("CLAUDE1_HUB_PORT", cfg.get("port"))
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"hub 端口无效: {raw!r}") from None
+    if not 1 <= port <= 65535:
+        raise RuntimeError(f"hub 端口超出范围: {port}")
+    return port
+
+
+def _hub_local_token(cfg: dict) -> str:
+    # Match claude-hub itself: an explicit environment secret safely overrides
+    # a legacy config token, while old live configs remain supported.
+    token = os.environ.get("CLAUDE_HUB_LOCAL_TOKEN") or cfg.get("local_token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError(
+            "hub 本地凭证缺失：请在配置中设置 local_token，"
+            "或设置 CLAUDE_HUB_LOCAL_TOKEN"
+        )
+    return token
+
+
+def hub_healthy(port: int) -> bool:
+    """Only accept the versioned claude-hub health contract on loopback."""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/healthz", method="GET"
+        )
+        # A loopback health probe must never follow the user's proxy settings.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=2) as response:
+            if getattr(response, "status", response.getcode()) != 200:
+                return False
+            payload = json.loads(response.read(65537).decode("utf-8"))
+        protocol = payload.get("protocol") if isinstance(payload, dict) else None
+        return (
+            isinstance(payload, dict)
+            and payload.get("ok") is True
+            and payload.get("service") == "claude-hub"
+            and isinstance(protocol, int)
+            and not isinstance(protocol, bool)
+            and protocol == 1
+        )
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+    ):
+        return False
+
+
+def _hub_start_env(port: int) -> dict[str, str]:
+    """Build a minimal child environment instead of inheriting secrets/proxies."""
+    child: dict[str, str] = {
+        "HOME": str(HOME),
+        "PATH": os.environ.get("PATH", os.defpath),
+        "CLAUDE_HUB_CONFIG": str(HUB_CONFIG),
+        "CLAUDE_HUB_DB": str(HUB_DB),
+        "CLAUDE_HUB_LOG": str(HUB_LOG),
+        "CLAUDE_HUB_PORT": str(port),
+    }
+    for key in ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"):
+        value = os.environ.get(key)
+        if value:
+            child[key] = value
+    local_token = os.environ.get("CLAUDE_HUB_LOCAL_TOKEN")
+    if local_token:
+        child["CLAUDE_HUB_LOCAL_TOKEN"] = local_token
+    return child
+
+
+def ensure_hub(port: int) -> None:
+    """Start the isolated claude-hub process unless its strict health check passes."""
+    if hub_healthy(port):
+        return
+    if not HUB_SCRIPT.is_file():
+        raise RuntimeError(f"hub 脚本不存在: {HUB_SCRIPT}")
+    print("[claude1] claude-hub 未运行，正在启动 ...", file=sys.stderr)
+    HUB_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(HUB_LOG, "ab") as log:
+        process = subprocess.Popen(
+            [str(HUB_SCRIPT), "serve"],
+            stdout=log,
+            stderr=log,
+            env=_hub_start_env(port),
+            close_fds=True,
+            start_new_session=True,
+        )
+    # Keep detached children referenced so Popen can reap them without emitting
+    # ResourceWarning; a later start prunes processes that have already exited.
+    _hub_processes[:] = [child for child in _hub_processes if child.poll() is None]
+    _hub_processes.append(process)
+    for _ in range(20):
+        time.sleep(0.25)
+        if hub_healthy(port):
+            return
+    raise RuntimeError(f"claude-hub 启动失败，查看日志: {HUB_LOG}")
 
 
 def choose(providers: list[dict], hint: str | None) -> dict:
@@ -766,33 +955,59 @@ def run_tui_launcher():
 
 
 def record_backend(kind: str, provider: str | None = None) -> None:
-    """记住上次启动的后端 —— 隐式粘性：zsh 的 claude() 读 BACKEND_STICKY 决定走向。
-    纯 best-effort，失败不影响启动。"""
+    """Record the last actual launch without changing the sticky shell route."""
     try:
         payload: dict = {"backend": kind, "at": time.time()}
         if provider:
             payload["provider"] = provider
+        BACKEND_STATE.parent.mkdir(parents=True, exist_ok=True)
         BACKEND_STATE.write_text(json.dumps(payload, ensure_ascii=False))
     except OSError:
         pass
+
+
+def _atomic_write_sticky(kind: str) -> None:
+    BACKEND_STICKY.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{BACKEND_STICKY.name}.",
+        dir=str(BACKEND_STICKY.parent),
+    )
     try:
-        BACKEND_STICKY.write_text(kind + "\n")  # 侧写：claude() 秒读这一行
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(kind + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, BACKEND_STICKY)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def set_sticky(word: str) -> int:
     """`claude1 use <后端>`：只设置粘性后端、不启动会话。"""
     kind = BACKEND_ALIASES.get(word.lower(), word.lower())
-    if kind not in ("reclaude", "anyrouter", "current", "direct"):
+    if kind not in ("reclaude", "anyrouter", "current", "direct", "hub"):
         print(
-            f"[claude1] 未知后端: {word}（可用: re/reclaude · any · cc/current · direct）",
+            f"[claude1] 未知后端: {word}"
+            "（可用: re/reclaude · any · cc/current · direct · hub）",
             file=sys.stderr,
         )
         return 1
-    record_backend(kind)
+    try:
+        _atomic_write_sticky(kind)
+    except OSError as exc:
+        print(f"[claude1] 无法写入粘性后端: {exc}", file=sys.stderr)
+        return 1
     if kind == "reclaude":
         print("[claude1] 粘性后端 = reclaude —— 之后普通 claude 都走 reclaude，直到再切")
+    elif kind == "hub":
+        print(
+            "[claude1] 粘性后端 = hub —— 之后普通 claude 走多渠道网关，"
+            "直到再次显式切换"
+        )
     else:
         print(f"[claude1] 粘性后端 = {kind} —— 普通 claude 走 CC-Switch（{kind}），直到再切")
     return 0
@@ -801,7 +1016,7 @@ def set_sticky(word: str) -> int:
 def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     """拆成 (backend, provider_hint, claude_args)。
 
-    backend: 'reclaude' | 'anyrouter' | 'current' | 'direct' | None
+    backend: 'reclaude' | 'anyrouter' | 'current' | 'direct' | 'hub' | None
     provider_hint: 匹配 CC-Switch provider 的子串（None => 弹菜单）
     claude_args: 展开后的 overlay + 其余原样透传给 claude
     """
@@ -832,6 +1047,8 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
             backend = "anyrouter"
         elif low in ("--current", "--cc"):
             backend = "current"
+        elif low == "--hub":
+            backend = "hub"
         else:
             claude_args.append(arg)
     return backend, hint, claude_args
@@ -851,7 +1068,12 @@ def exec_settings_backend(settings_path: Path, label: str, claude_args: list[str
     record_backend(label)
     print(f"[claude1] 后端: {label} ({settings_path.name})")
     claude_bin = resolve_claude_bin()
-    return int(subprocess.run([str(claude_bin), "--settings", str(settings_path), *claude_args]).returncode)
+    return int(
+        subprocess.run(
+            [str(claude_bin), "--settings", str(settings_path), *claude_args],
+            env=claude_child_env(),
+        ).returncode
+    )
 
 
 def exec_plain_claude(label: str, claude_args: list[str]) -> int:
@@ -859,13 +1081,99 @@ def exec_plain_claude(label: str, claude_args: list[str]) -> int:
     note = "CC-Switch 当前 provider" if label == "current" else "裸 claude"
     print(f"[claude1] 后端: {label} ({note})")
     claude_bin = resolve_claude_bin()
-    return int(subprocess.run([str(claude_bin), *claude_args]).returncode)
+    return int(
+        subprocess.run(
+            [str(claude_bin), *claude_args],
+            env=claude_child_env(),
+        ).returncode
+    )
+
+
+def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
+    """Launch Claude with a private settings file and always remove it."""
+    if TEMP_DIR is not None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="claude1_",
+        suffix=".json",
+        dir=str(TEMP_DIR) if TEMP_DIR is not None else None,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle)
+        os.chmod(tmp_path, 0o600)
+        claude_bin = resolve_claude_bin()
+        proc = subprocess.run(
+            [str(claude_bin), "--settings", tmp_path, *claude_args],
+            env=claude_child_env(settings),
+        )
+        return int(proc.returncode)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def exec_hub(claude_args: list[str]) -> int:
+    """Launch one Claude session through the isolated multi-channel hub."""
+    if not HUB_CONFIG.is_file():
+        raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
+    try:
+        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"hub 配置无法读取: {HUB_CONFIG}: {exc}") from exc
+    if not isinstance(hub_cfg, dict):
+        raise RuntimeError(f"hub 配置格式无效: {HUB_CONFIG}")
+
+    port = _hub_port(hub_cfg)
+    token = _hub_local_token(hub_cfg)
+    channels = hub_cfg.get("channels")
+    default_channel = hub_cfg.get("default_channel")
+    if not isinstance(channels, dict) or not channels:
+        raise RuntimeError("hub 配置缺少 channels")
+    channel = channels.get(default_channel)
+    models = channel.get("models") if isinstance(channel, dict) else None
+    if (
+        not isinstance(default_channel, str)
+        or not isinstance(models, list)
+        or not models
+        or not isinstance(models[0], str)
+        or not models[0]
+    ):
+        raise RuntimeError("hub 配置中的 default_channel 或默认模型无效")
+
+    ensure_hub(port)
+    main_model = f"{default_channel},{models[0]}"
+    settings = {
+        "env": {
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": main_model,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+        }
+    }
+    record_backend("hub")
+    aliases = ", ".join(str(alias) for alias in channels)
+    print(
+        f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})"
+    )
+    print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
+    return launch_with_settings(settings, claude_args)
 
 
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "use":
         if len(argv) < 2:
-            print("[claude1] 用法: claude1 use <re|cc|any|direct>", file=sys.stderr)
+            print(
+                "[claude1] 用法: claude1 use <re|cc|any|direct|hub>",
+                file=sys.stderr,
+            )
             return 1
         return set_sticky(argv[1])
     # `config`/`--config` 现在就是无参数：直接进 TUI 启动器
@@ -882,6 +1190,8 @@ def main(argv: list[str]) -> int:
         return exec_plain_claude("current", claude_args)
     if backend == "direct":
         return exec_plain_claude("direct", claude_args)
+    if backend == "hub":
+        return exec_hub(claude_args)
 
     # 默认路径：给了名字就直接匹配启动；没给名字就进 TUI 启动器选一个
     if hint is not None:
@@ -912,23 +1222,7 @@ def main(argv: list[str]) -> int:
     record_use(selected["name"])
     record_backend("provider", selected["name"])
     print(f"[claude1] 本次使用 provider: {selected['name']}")
-
-    # Write to a 0600 temp file so tokens never appear in `ps aux`.
-    # --settings (priority 2) overrides cc-switch's settings.json for all fields:
-    # credentials, model, permissions, sandbox, effortLevel, etc.
-    fd, tmp_path = tempfile.mkstemp(prefix="claude1_", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(settings, f)
-        os.chmod(tmp_path, 0o600)
-        claude_bin = resolve_claude_bin()
-        proc = subprocess.run([str(claude_bin), "--settings", tmp_path, *claude_args])
-        return int(proc.returncode)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    return launch_with_settings(settings, claude_args)
 
 
 if __name__ == "__main__":
