@@ -379,9 +379,13 @@ _HEADER_H = len(LOGO) + 6  # welcome + blank + logo + blank + heading + hint
 _LOGO_TOP = 2              # 欢迎语占 row0，空一行后从 row2 起画 logo
 C: dict = {}
 
-# 流动渐变的 256 色序列：青→蓝→紫→品红→再回来，首尾相接可无缝循环。
-LOGO_GRAD = [51, 45, 39, 33, 27, 63, 99, 135, 171, 207, 171, 135, 99, 63]
+# 流动的七彩色带（256 色全光谱）：红→橙→黄→绿→青→蓝→紫→品红→回到红，首尾相接无缝循环。
+LOGO_GRAD = [196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46, 48, 50, 51, 45, 39, 33, 63, 99, 135, 171, 207, 201, 199]
 _logo_pairs: list[int] = []
+
+# 列表用的七彩色带（256 色）：红→橙→金→黄绿→绿→青→蓝→紫→品红，逐行轮转。
+RAINBOW = [203, 208, 214, 220, 148, 46, 42, 51, 45, 75, 99, 141, 207, 205]
+_row_pairs: list[int] = []
 
 
 def _addstr(win, y, x, text, attr=0) -> None:
@@ -417,9 +421,13 @@ def _dwidth(text: str) -> int:
 
 
 def _init_colors() -> dict:
-    d = {"dim": 0, "green": 0, "cyan": 0, "blue": 0, "mag": 0, "yellow": 0, "sel": 0}
+    d = {
+        "dim": 0, "green": 0, "cyan": 0, "blue": 0, "mag": 0, "yellow": 0, "sel": 0,
+        "orange": 0, "pink": 0, "lime": 0, "gold": 0, "teal": 0, "violet": 0,
+    }
     if not curses.has_colors():
         d["sel"] = curses.A_REVERSE
+        _row_pairs.clear()
         return d
     curses.start_color()
     try:
@@ -441,9 +449,49 @@ def _init_colors() -> dict:
         dim=curses.A_DIM,
         sel=curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD,
     )
+
+    has256 = getattr(curses, "COLORS", 0) >= 256
+
+    def _named(pid: int, idx: int, fallback: int) -> int:
+        if not has256:
+            return fallback
+        try:
+            curses.init_pair(pid, idx, bg)
+            return curses.color_pair(pid)
+        except curses.error:
+            return fallback
+
+    # 命名鲜色（橙/粉/青柠/金/水鸭/紫罗兰），非 256 色时回退到基础色。
+    d["orange"] = _named(60, 208, d["yellow"])
+    d["pink"] = _named(61, 205, d["mag"])
+    d["lime"] = _named(62, 118, d["green"])
+    d["gold"] = _named(63, 220, d["yellow"])
+    d["teal"] = _named(64, 44, d["cyan"])
+    d["violet"] = _named(65, 141, d["mag"])
+    # 更醒目的选中条：亮橙底黑字加粗（256 色）。
+    if has256:
+        try:
+            curses.init_pair(66, 16, 208)
+            d["sel"] = curses.color_pair(66) | curses.A_BOLD
+        except curses.error:
+            pass
+
+    # 列表七彩色带：256 色逐行轮转，否则退化成基础多色循环。
+    _row_pairs.clear()
+    if has256:
+        for i, cidx in enumerate(RAINBOW):
+            pid = 40 + i
+            try:
+                curses.init_pair(pid, cidx, bg)
+                _row_pairs.append(curses.color_pair(pid))
+            except curses.error:
+                pass
+    if not _row_pairs:
+        _row_pairs.extend([d["green"], d["cyan"], d["mag"], d["yellow"], d["blue"]])
+
     # 流动 logo 色带：256 色可用就上平滑渐变，否则退化成三色循环。
     _logo_pairs.clear()
-    if getattr(curses, "COLORS", 0) >= 256:
+    if has256:
         for i, cidx in enumerate(LOGO_GRAD):
             pid = 20 + i
             try:
@@ -476,21 +524,32 @@ def _draw_logo(win, phase: int) -> None:
 
 
 def _intro(win) -> None:
-    """飘入：欢迎语常驻，logo 逐行自上而下显现，按任意键跳过。"""
+    """开场：欢迎语常驻，logo 自左向右逐列点亮，七彩色带同时横向流动，按任意键跳过。"""
     if not _wide_enough(win):
         return
     win.nodelay(True)
-    pair = [C.get("cyan", 0), C.get("blue", 0), C.get("mag", 0)]
+    n = len(_logo_pairs) or 1
+    width = max((len(line) for line in LOGO), default=0)
     try:
-        for reveal in range(1, len(LOGO) + 1):
-            win.erase()
-            _addstr(win, 0, 2, "欢迎回来", C.get("mag", 0) | curses.A_BOLD)
-            for i in range(reveal):
-                _addstr(win, _LOGO_TOP + i, 2, LOGO[i], pair[i % 3] | curses.A_BOLD)
+        phase = 0
+        col = 1
+        while col <= width:
+            _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
+            for r, line in enumerate(LOGO):
+                for x in range(min(col, len(line))):
+                    chx = line[x]
+                    if chx == " ":
+                        continue
+                    attr = _logo_pairs[(x + r + phase) % n] | curses.A_BOLD
+                    if x >= col - 2:  # 领先扫描列：最新点亮的两列反白，形成一道流动的光
+                        attr |= curses.A_REVERSE
+                    _addstr(win, _LOGO_TOP + r, 2 + x, chx, attr)
             win.refresh()
             if win.getch() != -1:
                 break
-            time.sleep(0.045)
+            time.sleep(0.02)
+            col += 4
+            phase += 1
     finally:
         win.nodelay(False)
 
@@ -563,7 +622,7 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
 
     if big:
         greet = "欢迎回来"
-        _addstr(win, 0, 2, greet, C.get("mag", 0) | curses.A_BOLD)
+        _addstr(win, 0, 2, greet, C.get("pink", 0) | curses.A_BOLD)
         _addstr(win, 0, 3 + _dwidth(greet), "· 选择一个渠道开始使用 Claude 1", C.get("dim", 0))
         _draw_logo(win, phase)
         head = _LOGO_TOP + len(LOGO)
@@ -571,9 +630,18 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
         _draw_logo(win, phase)
         head = 1
 
-    _addstr(win, head + 1, 2, "选择渠道", C.get("cyan", 0) | curses.A_BOLD)
+    hx = 2
+    _addstr(win, head + 1, hx, "选择渠道", C.get("lime", 0) | curses.A_BOLD)
+    hx += _dwidth("选择渠道") + 1
+    if view:
+        cur = view[idx]
+        _addstr(win, head + 1, hx, "· 当前", C.get("dim", 0))
+        hx += _dwidth("· 当前") + 1
+        badge = f"› {cur}"
+        _addstr(win, head + 1, hx, badge, C.get("orange", 0) | curses.A_BOLD)
+        hx += _dwidth(badge) + 1
     if show_hidden:
-        _addstr(win, head + 1, 3 + _dwidth("选择渠道"), "· 含隐藏项", C.get("dim", 0))
+        _addstr(win, head + 1, hx, "· 含隐藏项", C.get("dim", 0))
     _addstr(win, head + 2, 2, "↑↓ 选择 · Enter 启动", C.get("dim", 0))
     list_top = head + 4
 
@@ -586,12 +654,13 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
         rank = i + 1
         selected = i == idx
         marker = "▸" if selected else " "
+        row_col = _row_pairs[i % len(_row_pairs)] | curses.A_BOLD if _row_pairs else C.get("green", 0) | curses.A_BOLD
         if hidden:
             dot, dot_attr = "·", C.get("dim", 0)
         elif mru.get(name):
-            dot, dot_attr = "★", C.get("yellow", 0) | curses.A_BOLD
+            dot, dot_attr = "★", row_col
         else:
-            dot, dot_attr = "◆", C.get("blue", 0) | curses.A_BOLD
+            dot, dot_attr = "◆", row_col
         label = name
         if m.get("alias"):
             label += f"  «{m['alias']}»"
@@ -602,7 +671,7 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
             line = f"{marker} {rank:>2}. {dot} {label}"
             _addstr(win, row, 2, line.ljust(w - 4), C.get("sel", curses.A_REVERSE))
         else:
-            name_attr = C.get("dim", 0) if hidden else C.get("green", 0) | curses.A_BOLD
+            name_attr = C.get("dim", 0) if hidden else row_col
             _addstr(win, row, 2, marker, C.get("dim", 0))
             _addstr(win, row, 4, f"{rank:>2}.", C.get("dim", 0))
             _addstr(win, row, 8, dot, dot_attr)
