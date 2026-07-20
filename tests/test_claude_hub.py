@@ -217,9 +217,48 @@ class ClaudeHubTests(unittest.TestCase):
         hub.reset_caches()
 
     def tearDown(self):
+        if hub._log_fp is not None:
+            hub._log_fp.close()
+            hub._log_fp = None
         hub.reset_caches()
         self.env_patch.stop()
         self.temp_dir.cleanup()
+
+    def test_log_rotation_keeps_current_and_rotated_files_private(self):
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.write_text("oversized", encoding="utf-8")
+        self.log_file.chmod(0o644)
+
+        with mock.patch.object(hub, "LOG_MAX_BYTES", 1):
+            hub.open_log()
+
+        rotated = self.log_file.with_name(self.log_file.name + ".1")
+        self.assertTrue(rotated.is_file())
+        self.assertEqual(self.log_file.read_text(encoding="utf-8"), "")
+        if os.name == "posix":
+            self.assertEqual(self.log_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(rotated.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file safety")
+    def test_log_open_tightens_existing_file_and_rejects_special_paths(self):
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.write_text("existing", encoding="utf-8")
+        self.log_file.chmod(0o644)
+
+        hub.open_log()
+        self.assertEqual(self.log_file.stat().st_mode & 0o777, 0o600)
+        hub._log_fp.close()
+        hub._log_fp = None
+
+        self.log_file.unlink()
+        self.log_file.symlink_to(self.config_file)
+        with self.assertRaises((OSError, RuntimeError)):
+            hub.open_log()
+
+        self.log_file.unlink()
+        os.mkfifo(self.log_file)
+        with self.assertRaises((OSError, RuntimeError)):
+            hub.open_log()
 
     def _write_config(self, **updates):
         config = {

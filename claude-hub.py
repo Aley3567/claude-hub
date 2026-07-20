@@ -123,9 +123,54 @@ def open_log() -> None:
     global _log_fp
     path = log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
-        path.replace(path.with_name(path.name + ".1"))
-    _log_fp = path.open("a", encoding="utf-8")
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        current = None
+    expected_current = current
+    if current is not None:
+        if not stat.S_ISREG(current.st_mode):
+            raise RuntimeError("log path is not a regular file")
+        if current.st_size > LOG_MAX_BYTES:
+            rotated = path.with_name(path.name + ".1")
+            path.replace(rotated)
+            expected_current = None
+            rotated_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                rotated_flags |= os.O_NOFOLLOW
+            rotated_fd = os.open(rotated, rotated_flags)
+            try:
+                if not stat.S_ISREG(os.fstat(rotated_fd).st_mode):
+                    raise RuntimeError("rotated log path is not a regular file")
+                if os.name == "posix":
+                    os.fchmod(rotated_fd, 0o600)
+            finally:
+                os.close(rotated_fd)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError("log path is not a regular file")
+        if expected_current is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            expected_current.st_dev,
+            expected_current.st_ino,
+        ):
+            raise RuntimeError("log path changed while it was being opened")
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        _log_fp = os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 # ---------------------------------------------------------------- config / DB

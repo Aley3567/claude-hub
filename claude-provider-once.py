@@ -19,6 +19,7 @@ import math
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,12 +152,71 @@ def load_mru() -> dict[str, float]:
         return {}
 
 
+def _atomic_private_write(path: Path, text: str) -> None:
+    """Atomically replace a local state file with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if os.name == "posix":
+                os.fchmod(handle.fileno(), 0o600)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _open_private_append(path: Path):
+    """Open an append-only runtime log without a world-readable creation race."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        expected = path.lstat()
+    except FileNotFoundError:
+        expected = None
+    if expected is not None and not stat.S_ISREG(expected.st_mode):
+        raise OSError("runtime log path is not a regular file")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("runtime log path is not a regular file")
+        if expected is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OSError("runtime log path changed while it was being opened")
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "ab")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def record_use(name: str) -> None:
     mru = load_mru()
     mru[name] = time.time()
     try:
-        MRU_PATH.parent.mkdir(parents=True, exist_ok=True)
-        MRU_PATH.write_text(json.dumps(mru, ensure_ascii=False, indent=1))
+        _atomic_private_write(
+            MRU_PATH,
+            json.dumps(mru, ensure_ascii=False, indent=1),
+        )
     except OSError:
         pass  # MRU is best-effort; never block a launch on it
 
@@ -177,9 +237,10 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> bool:
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-        os.chmod(CONFIG_PATH, 0o600)
+        _atomic_private_write(
+            CONFIG_PATH,
+            json.dumps(cfg, ensure_ascii=False, indent=2),
+        )
         return True
     except OSError:
         return False
@@ -495,8 +556,7 @@ def ensure_hub(port: int) -> None:
     if not HUB_SCRIPT.is_file():
         raise RuntimeError(f"hub 脚本不存在: {HUB_SCRIPT}")
     print("[claude1] claude-hub 未运行，正在启动 ...", file=sys.stderr)
-    HUB_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(HUB_LOG, "ab") as log:
+    with _open_private_append(HUB_LOG) as log:
         process = subprocess.Popen(
             [str(HUB_SCRIPT), "serve"],
             stdout=log,
@@ -1177,30 +1237,16 @@ def record_backend(kind: str, provider: str | None = None) -> None:
         payload: dict = {"backend": kind, "at": time.time()}
         if provider:
             payload["provider"] = provider
-        BACKEND_STATE.parent.mkdir(parents=True, exist_ok=True)
-        BACKEND_STATE.write_text(json.dumps(payload, ensure_ascii=False))
+        _atomic_private_write(
+            BACKEND_STATE,
+            json.dumps(payload, ensure_ascii=False),
+        )
     except OSError:
         pass
 
 
 def _atomic_write_sticky(kind: str) -> None:
-    BACKEND_STICKY.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{BACKEND_STICKY.name}.",
-        dir=str(BACKEND_STICKY.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(kind + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, BACKEND_STICKY)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    _atomic_private_write(BACKEND_STICKY, kind + "\n")
 
 
 def set_sticky(word: str) -> int:
