@@ -118,3 +118,8 @@ ENV/
 .env.local
 config.local.json
 settings.local.json
+claude-hub.json
+claude1-config.json
+claude1-mru.json
+claude1-backend
+claude1-backend.json
