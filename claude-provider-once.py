@@ -52,7 +52,13 @@ BACKEND_ALIASES = {
     "cc": "current",
     "current": "current",
     "direct": "direct",
+    "hub": "hub",
 }
+
+# claude-hub: 本地多渠道路由网关（会话内 /model 别名,模型 热切换渠道）。
+HUB_SCRIPT = Path.home() / ".claude" / "scripts" / "claude-hub.py"
+HUB_CONFIG = Path.home() / ".cc-switch" / "claude-hub.json"
+HUB_LOG = Path.home() / ".cc-switch" / "logs" / "claude-hub.log"
 
 # Local protocol-translation gateway (cliproxyapi). Providers whose base URL
 # points here (e.g. AIHub, which only speaks the OpenAI protocol upstream)
@@ -327,6 +333,37 @@ def ensure_local_gateway(base_url: str) -> None:
     raise RuntimeError(f"本地网关启动失败，查看日志: {GATEWAY_LOG}")
 
 
+def hub_healthy(port: int) -> bool:
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/healthz", method="GET")
+        with urllib.request.urlopen(req, timeout=2):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except OSError:
+        return False
+
+
+def ensure_hub(port: int) -> None:
+    """Start claude-hub if it is not already listening."""
+    if hub_healthy(port):
+        return
+    print("[claude1] claude-hub 未运行，正在启动 ...", file=sys.stderr)
+    HUB_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(HUB_LOG, "ab") as log:
+        subprocess.Popen(
+            [str(HUB_SCRIPT), "serve"],  # shebang: uv run --script
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+    for _ in range(20):
+        time.sleep(0.25)
+        if hub_healthy(port):
+            return
+    raise RuntimeError(f"claude-hub 启动失败，查看日志: {HUB_LOG}")
+
+
 def choose(providers: list[dict], hint: str | None) -> dict:
     if hint:
         matches = [p for p in providers if hint.lower() in p["name"].lower()]
@@ -377,6 +414,14 @@ LOGO = [
 
 _HEADER_H = len(LOGO) + 6  # welcome + blank + logo + blank + heading + hint
 _LOGO_TOP = 2              # 欢迎语占 row0，空一行后从 row2 起画 logo
+
+# 预计算 logo 的非空格单元 (行, 列偏移, 字符)，每帧直接遍历、免去逐帧扫描空格。
+_LOGO_CELLS = [
+    (r, x, ch)
+    for r, line in enumerate(LOGO)
+    for x, ch in enumerate(line)
+    if ch != " "
+]
 C: dict = {}
 
 # 流动的七彩色带（256 色全光谱）：红→橙→黄→绿→青→蓝→紫→品红→回到红，首尾相接无缝循环。
@@ -386,6 +431,19 @@ _logo_pairs: list[int] = []
 # 列表用的七彩色带（256 色）：红→橙→金→黄绿→绿→青→蓝→紫→品红，逐行轮转。
 RAINBOW = [203, 208, 214, 220, 148, 46, 42, 51, 45, 75, 99, 141, 207, 205]
 _row_pairs: list[int] = []
+
+# 选中行呼吸动画：星/菱形逐帧微变 + 橙色辉光明暗脉动。
+_glow_pairs: list[int] = []
+GLOW_FG = [16, 94, 136, 178, 214, 231]            # 暗（融入选中条）→ 白热
+GLOW_SEQ = [0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0]   # 一呼一吸来回
+_STAR_FRAMES = ["✧", "✦", "✷", "✦"]
+_DIAMOND_FRAMES = ["◇", "◆", "◈", "◆"]
+_sel_anim: dict = {}
+
+# 动画能效参数。
+_FRAME_MS = 110          # 帧间隔（~9fps，够顺滑又省电）
+_IDLE_PAUSE_S = 20.0     # 无操作 20s 后暂停动画，CPU 完全休眠、零唤醒
+_ANIM_PERIOD = 2400      # phase 循环周期（24 与 12 的公倍数，无缝且不无限增长）
 
 
 def _addstr(win, y, x, text, attr=0) -> None:
@@ -428,6 +486,7 @@ def _init_colors() -> dict:
     if not curses.has_colors():
         d["sel"] = curses.A_REVERSE
         _row_pairs.clear()
+        _glow_pairs.clear()
         return d
     curses.start_color()
     try:
@@ -489,6 +548,17 @@ def _init_colors() -> dict:
     if not _row_pairs:
         _row_pairs.extend([d["green"], d["cyan"], d["mag"], d["yellow"], d["blue"]])
 
+    # 选中行呼吸辉光：fg 明暗脉动、bg 与橙色选中条（208）一致，256 色专属。
+    _glow_pairs.clear()
+    if has256:
+        for i, fg in enumerate(GLOW_FG):
+            pid = 70 + i
+            try:
+                curses.init_pair(pid, fg, 208)
+                _glow_pairs.append(curses.color_pair(pid))
+            except curses.error:
+                pass
+
     # 流动 logo 色带：256 色可用就上平滑渐变，否则退化成三色循环。
     _logo_pairs.clear()
     if has256:
@@ -509,16 +579,21 @@ def _wide_enough(win) -> bool:
 
 
 def _draw_logo(win, phase: int) -> None:
-    """按 (列+行+phase) 取渐变色，逐字上色 → 横向流动。"""
+    """按 (列+行+phase) 取渐变色，逐字上色 → 横向流动。maxyx 每帧只读一次。"""
     n = len(_logo_pairs) or 1
-    h = win.getmaxyx()[0]
-    if _wide_enough(win) and h > _HEADER_H + _LOGO_MIN_LIST:
-        for r, line in enumerate(LOGO):
-            for x, chx in enumerate(line):
-                if chx == " ":
-                    continue
-                attr = _logo_pairs[(x + r + phase) % n] | curses.A_BOLD
-                _addstr(win, _LOGO_TOP + r, 2 + x, chx, attr)
+    h, w = win.getmaxyx()
+    if w >= 56 and h > _HEADER_H + _LOGO_MIN_LIST:
+        bold = curses.A_BOLD
+        pairs = _logo_pairs
+        limit = w - 1
+        for r, x, chx in _LOGO_CELLS:
+            col = 2 + x
+            if col >= limit:
+                continue
+            try:
+                win.addstr(_LOGO_TOP + r, col, chx, pairs[(x + r + phase) % n] | bold)
+            except curses.error:
+                pass
     else:
         _addstr(win, 0, 2, "◤ claude1 ◢", (_logo_pairs[phase % n]) | curses.A_BOLD)
 
@@ -614,6 +689,22 @@ def _confirm(win, msg) -> bool:
             return False
 
 
+def _animate_selected(win, phase: int) -> None:
+    """选中行的符号呼吸：橙色辉光明暗脉动 + 星/菱形逐帧微变，只重绘两个字符。"""
+    a = _sel_anim
+    if not a:
+        return
+    if _glow_pairs:
+        glow = _glow_pairs[GLOW_SEQ[phase % len(GLOW_SEQ)]] | curses.A_BOLD
+    else:  # 非 256 色：用明/暗/粗模拟呼吸
+        lvl = [curses.A_DIM, 0, curses.A_BOLD, curses.A_BOLD, 0, curses.A_DIM]
+        glow = C.get("sel", curses.A_REVERSE) | lvl[phase % len(lvl)]
+    frames = a["frames"]
+    glyph = frames[(phase // 3) % len(frames)]
+    _addstr(win, a["y"], a["mkx"], "▸", glow)
+    _addstr(win, a["y"], a["dotx"], glyph, glow)
+
+
 def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
     meta = cfg["providers"]
     win.erase()
@@ -646,6 +737,7 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
     list_top = head + 4
 
     if not view:
+        _sel_anim.clear()
         _addstr(win, list_top, 2, "（没有可用渠道）", C.get("yellow", 0))
     for i in range(len(view)):
         name = view[i]
@@ -670,6 +762,15 @@ def _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase=0) -> None:
         if selected:
             line = f"{marker} {rank:>2}. {dot} {label}"
             _addstr(win, row, 2, line.ljust(w - 4), C.get("sel", curses.A_REVERSE))
+            if dot == "★":
+                frames = _STAR_FRAMES
+            elif dot == "◆":
+                frames = _DIAMOND_FRAMES
+            else:
+                frames = [dot]
+            _sel_anim.clear()
+            _sel_anim.update(y=row, mkx=2, dotx=8, frames=frames)
+            _animate_selected(win, phase)
         else:
             name_attr = C.get("dim", 0) if hidden else row_col
             _addstr(win, row, 2, marker, C.get("dim", 0))
@@ -700,15 +801,27 @@ def _launcher_main(win, cfg, db_names):
     idx = 0
     phase = 0
     anim = len(_logo_pairs) > 1  # 有多色才动画
-    win.timeout(110 if anim else -1)  # 110ms 无输入即返回 -1 → 推进流动
+    win.timeout(_FRAME_MS if anim else -1)  # 无输入即返回 -1 → 推进流动
     _draw_launcher(win, cfg, view, idx, show_hidden, mru, phase)
+    last_active = time.monotonic()
+    paused = not anim  # 无动画时本就阻塞等键
     while True:
         ch = win.getch()
-        if ch == -1:  # 动画节拍：只重画 logo，避免整屏闪
-            phase += 1
+        if ch == -1:  # 动画节拍：重画 logo 与选中行呼吸符号，避免整屏闪
+            if anim and (time.monotonic() - last_active) >= _IDLE_PAUSE_S:
+                win.timeout(-1)   # 长时间无操作 → 阻塞等键，停止空转、CPU 零唤醒
+                paused = True
+                continue
+            phase = (phase + 1) % _ANIM_PERIOD
             _draw_logo(win, phase)
+            _animate_selected(win, phase)
             win.refresh()
             continue
+        # 真实按键：记录活跃时间；若处于休眠则先恢复动画节拍
+        last_active = time.monotonic()
+        if paused and anim:
+            win.timeout(_FRAME_MS)
+            paused = False
         if ch in (curses.KEY_UP, ord("k")):
             if view:
                 idx = (idx - 1) % len(view)
@@ -719,7 +832,7 @@ def _launcher_main(win, cfg, db_names):
             if view:
                 win.timeout(-1)
                 _edit_alias(win, view[idx], meta)
-                win.timeout(110 if anim else -1)
+                win.timeout(_FRAME_MS if anim else -1)
                 save_config(cfg)
         elif ch == ord("x"):
             if view:
@@ -728,7 +841,7 @@ def _launcher_main(win, cfg, db_names):
                 verb = "恢复显示" if nowh else "隐藏"
                 win.timeout(-1)
                 ok = _confirm(win, f"{verb} {name}?")
-                win.timeout(110 if anim else -1)
+                win.timeout(_FRAME_MS if anim else -1)
                 if ok:
                     meta[name]["hidden"] = not nowh
                     save_config(cfg)
@@ -784,15 +897,17 @@ def record_backend(kind: str, provider: str | None = None) -> None:
 def set_sticky(word: str) -> int:
     """`claude1 use <后端>`：只设置粘性后端、不启动会话。"""
     kind = BACKEND_ALIASES.get(word.lower(), word.lower())
-    if kind not in ("reclaude", "anyrouter", "current", "direct"):
+    if kind not in ("reclaude", "anyrouter", "current", "direct", "hub"):
         print(
-            f"[claude1] 未知后端: {word}（可用: re/reclaude · any · cc/current · direct）",
+            f"[claude1] 未知后端: {word}（可用: re/reclaude · any · cc/current · direct · hub）",
             file=sys.stderr,
         )
         return 1
     record_backend(kind)
     if kind == "reclaude":
         print("[claude1] 粘性后端 = reclaude —— 之后普通 claude 都走 reclaude，直到再切")
+    elif kind == "hub":
+        print("[claude1] 粘性后端 = hub —— 之后普通 claude 走多渠道网关（/model 别名,模型 切渠道），直到再切")
     else:
         print(f"[claude1] 粘性后端 = {kind} —— 普通 claude 走 CC-Switch（{kind}），直到再切")
     return 0
@@ -832,6 +947,8 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
             backend = "anyrouter"
         elif low in ("--current", "--cc"):
             backend = "current"
+        elif low == "--hub":
+            backend = "hub"
         else:
             claude_args.append(arg)
     return backend, hint, claude_args
@@ -862,6 +979,55 @@ def exec_plain_claude(label: str, claude_args: list[str]) -> int:
     return int(subprocess.run([str(claude_bin), *claude_args]).returncode)
 
 
+def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
+    # Write to a 0600 temp file so tokens never appear in `ps aux`.
+    # --settings (priority 2) overrides cc-switch's settings.json for all fields:
+    # credentials, model, permissions, sandbox, effortLevel, etc.
+    fd, tmp_path = tempfile.mkstemp(prefix="claude1_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+        os.chmod(tmp_path, 0o600)
+        claude_bin = resolve_claude_bin()
+        proc = subprocess.run([str(claude_bin), "--settings", tmp_path, *claude_args])
+        return int(proc.returncode)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def exec_hub(claude_args: list[str]) -> int:
+    """多渠道网关后端：一个会话内 /model 渠道别名,模型 热切换上游渠道。"""
+    if not HUB_CONFIG.exists():
+        raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
+    hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
+    port, token = hub_cfg["port"], hub_cfg["local_token"]
+    ensure_hub(port)
+    dc = hub_cfg["default_channel"]
+    main_model = f"{dc},{hub_cfg['channels'][dc]['models'][0]}"
+    settings = {
+        "env": {
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+            "ANTHROPIC_AUTH_TOKEN": token,
+            # 三档都用「别名,模型」带前缀形式 —— 后台任务的路由零歧义
+            "ANTHROPIC_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": main_model,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+        }
+    }
+    record_backend("hub")
+    aliases = ", ".join(hub_cfg["channels"])
+    print(f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})")
+    print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
+    return launch_with_settings(settings, claude_args)
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "use":
         if len(argv) < 2:
@@ -882,6 +1048,8 @@ def main(argv: list[str]) -> int:
         return exec_plain_claude("current", claude_args)
     if backend == "direct":
         return exec_plain_claude("direct", claude_args)
+    if backend == "hub":
+        return exec_hub(claude_args)
 
     # 默认路径：给了名字就直接匹配启动；没给名字就进 TUI 启动器选一个
     if hint is not None:
@@ -913,22 +1081,7 @@ def main(argv: list[str]) -> int:
     record_backend("provider", selected["name"])
     print(f"[claude1] 本次使用 provider: {selected['name']}")
 
-    # Write to a 0600 temp file so tokens never appear in `ps aux`.
-    # --settings (priority 2) overrides cc-switch's settings.json for all fields:
-    # credentials, model, permissions, sandbox, effortLevel, etc.
-    fd, tmp_path = tempfile.mkstemp(prefix="claude1_", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(settings, f)
-        os.chmod(tmp_path, 0o600)
-        claude_bin = resolve_claude_bin()
-        proc = subprocess.run([str(claude_bin), "--settings", tmp_path, *claude_args])
-        return int(proc.returncode)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    return launch_with_settings(settings, claude_args)
 
 
 if __name__ == "__main__":
