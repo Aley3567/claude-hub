@@ -1,0 +1,35 @@
+# 编译产物
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 敏感数据
+token
+*.token
+*.key
+*.secret
+*.credentials
+*.auth
+
+# 日志与运行时数据
+*.log
+watch.log
+.next_probe
+*.err
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 备份
+*.bak
+*.backup
