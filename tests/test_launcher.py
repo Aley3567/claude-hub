@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 import uuid
 from contextlib import contextmanager, redirect_stdout
@@ -447,6 +448,46 @@ class LauncherTuiLogicTests(unittest.TestCase):
 
 
 class LauncherSafetyTests(unittest.TestCase):
+    def test_recent_provider_state_is_written_atomically_and_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            mru_path = Path(env["CLAUDE1_MRU_PATH"])
+
+            with loaded_launcher(env) as launcher:
+                launcher.record_use("Fixture")
+
+            self.assertIn("Fixture", json.loads(mru_path.read_text(encoding="utf-8")))
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(mru_path.stat().st_mode), 0o600)
+            leftovers = [
+                path.name
+                for path in mru_path.parent.iterdir()
+                if path.name.startswith(f".{mru_path.name}.")
+            ]
+            self.assertEqual(leftovers, [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file safety")
+    def test_runtime_log_rejects_symlinks_and_fifos_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            log_path = Path(env["CLAUDE1_HUB_LOG"])
+            log_path.parent.mkdir(parents=True)
+            target = log_path.parent / "target.log"
+            target.write_text("unchanged", encoding="utf-8")
+
+            with loaded_launcher(env) as launcher:
+                log_path.symlink_to(target)
+                with self.assertRaises(OSError):
+                    launcher._open_private_append(log_path)
+                self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+                log_path.unlink()
+                os.mkfifo(log_path)
+                started = time.monotonic()
+                with self.assertRaises(OSError):
+                    launcher._open_private_append(log_path)
+                self.assertLess(time.monotonic() - started, 1.0)
+
     def test_every_runtime_path_can_be_injected_under_a_temporary_home(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(
@@ -508,6 +549,13 @@ class LauncherSafetyTests(unittest.TestCase):
             )
             self.assertEqual(last_session["backend"], "direct")
             self.assertIsInstance(last_session["at"], float)
+            if os.name == "posix":
+                self.assertEqual(
+                    stat.S_IMODE(
+                        Path(env["CLAUDE1_BACKEND_STATE"]).stat().st_mode
+                    ),
+                    0o600,
+                )
 
     def test_explicit_use_is_the_only_operation_that_changes_sticky(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -521,6 +569,13 @@ class LauncherSafetyTests(unittest.TestCase):
 
             self.assertEqual(sticky.read_text(encoding="utf-8"), "hub\n")
             self.assertEqual(stat.S_IMODE(sticky.stat().st_mode), 0o600)
+            if os.name == "posix":
+                self.assertEqual(
+                    stat.S_IMODE(
+                        Path(env["CLAUDE1_BACKEND_STATE"]).stat().st_mode
+                    ),
+                    0o600,
+                )
             self.assertEqual(
                 json.loads(
                     Path(env["CLAUDE1_BACKEND_STATE"]).read_text(encoding="utf-8")
@@ -734,6 +789,11 @@ class LauncherSafetyTests(unittest.TestCase):
             )
             self.assertEqual(child_env["CLAUDE_HUB_LOG"], env["CLAUDE1_HUB_LOG"])
             self.assertEqual(child_env["CLAUDE_HUB_PORT"], str(port))
+            if os.name == "posix":
+                self.assertEqual(
+                    stat.S_IMODE(Path(env["CLAUDE1_HUB_LOG"]).stat().st_mode),
+                    0o600,
+                )
 
     def test_hub_supports_environment_backed_local_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
