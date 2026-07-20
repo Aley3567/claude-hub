@@ -13,18 +13,26 @@ database in read-only mode; this file never contains provider credentials.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hmac
 import ipaddress
 import json
+import math
 import os
+import re
+import shutil
 import sqlite3
+import stat
 import sys
+import tempfile
 import time
+import zlib
 from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
+from multidict import CIMultiDict
 
 
 SERVICE_NAME = "claude-hub"
@@ -50,6 +58,16 @@ ENV_LOCAL_TOKEN = "CLAUDE_HUB_LOCAL_TOKEN"
 
 LOG_MAX_BYTES = 10 * 1024 * 1024
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
+UPSTREAM_SESSION_KEY = web.AppKey("upstream_session", aiohttp.ClientSession)
+DB_SNAPSHOT_RETRIES = 5
+SSE_LINE_LIMIT = 64 * 1024
+SSE_DECODE_CHUNK = 64 * 1024
+SSE_DECODE_SLACK = 1 * 1024 * 1024
+SSE_DECODE_RATIO_LIMIT = 100
+SSE_DECODE_TOTAL_LIMIT = 256 * 1024 * 1024
+SSE_GZIP_MEMBER_LIMIT = 16
+SSE_NEWLINE_RE = re.compile(br"\r\n|[\r\n]")
+REPRESENTATION_HEADERS = {"content-type", "content-encoding"}
 
 HOP_BY_HOP = {
     "host",
@@ -58,12 +76,18 @@ HOP_BY_HOP = {
     "proxy-authenticate",
     "proxy-authorization",
     "te",
+    "trailer",
     "trailers",
     "transfer-encoding",
     "upgrade",
 }
-REQ_STRIP = HOP_BY_HOP | {"content-length", "authorization", "x-api-key"}
-RESP_STRIP = HOP_BY_HOP | {"content-length", "content-encoding"}
+REQ_STRIP = HOP_BY_HOP | {
+    "content-length",
+    "content-encoding",
+    "authorization",
+    "x-api-key",
+}
+RESP_STRIP = HOP_BY_HOP | {"content-length"}
 
 _log_fp = None
 _log_stderr = False
@@ -109,6 +133,52 @@ def open_log() -> None:
 
 class ConfigError(ValueError):
     """The hub configuration is missing or unsafe to use."""
+
+
+class ProviderDatabaseError(RuntimeError):
+    """The CC Switch provider database is missing, unreadable or malformed."""
+
+
+class UpstreamStreamAborted(RuntimeError):
+    """An upstream stream failed after downstream headers were committed."""
+
+
+_permission_warning_emitted = False
+
+
+def _private_file_issue(path: Path, label: str) -> str | None:
+    """Return a local file safety issue without exposing file contents."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return f"{label} file is missing"
+    except OSError as exc:
+        return f"{label} file cannot be inspected: {exc}"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{label} path is not a regular file"
+    if os.name == "posix":
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & ~0o600:
+            return f"{label} permissions {mode:04o} exceed 0600"
+    return None
+
+
+def _require_private_file(
+    path: Path,
+    label: str,
+    error_type: type[ConfigError] | type[ProviderDatabaseError],
+) -> None:
+    """Fail closed for credential-bearing files on POSIX systems."""
+    global _permission_warning_emitted
+    issue = _private_file_issue(path, label)
+    if issue:
+        raise error_type(issue)
+    if os.name != "posix" and not _permission_warning_emitted:
+        log(
+            "WARNING: POSIX file-permission checks are unavailable on this "
+            "platform; continuing with existence and regular-file checks only"
+        )
+        _permission_warning_emitted = True
 
 
 _cfg_cache: dict[str, object] = {
@@ -213,6 +283,7 @@ def validate_config(raw: object) -> dict:
 
 def get_config() -> dict:
     path = config_path()
+    _require_private_file(path, "config", ConfigError)
     try:
         st = path.stat()
     except OSError as exc:
@@ -227,20 +298,12 @@ def get_config() -> dict:
     if cache_key != old_key:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ConfigError(f"invalid config {path}: {exc}") from exc
         _cfg_cache.update(
             {"path": path, "mtime_ns": st.st_mtime_ns, "size": st.st_size, "raw": raw}
         )
     return validate_config(_cfg_cache["raw"])
-
-
-_db_cache: dict[str, object] = {
-    "path": None,
-    "mtime_ns": None,
-    "size": None,
-    "rows": {},
-}
 
 
 def _normalize_base_url(value: object) -> str:
@@ -251,72 +314,151 @@ def _normalize_base_url(value: object) -> str:
     return base
 
 
-def get_providers() -> dict:
-    """Return provider data from CC Switch, opening SQLite with ``mode=ro``."""
-    path = db_path()
+def _read_provider_rows(path: Path) -> dict:
+    """Read provider rows without mutating the database or contacting providers."""
+    db_uri = path.resolve(strict=False).as_uri() + "?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT name, settings_config FROM providers WHERE app_type='claude'"
+        )
+        rows = {}
+        for name, settings_config in cursor.fetchall():
+            try:
+                settings = json.loads(settings_config)
+            except (json.JSONDecodeError, UnicodeError, TypeError):
+                continue
+            if not isinstance(settings, dict):
+                continue
+            env = settings.get("env") or {}
+            if not isinstance(env, dict):
+                continue
+            base = _normalize_base_url(env.get("ANTHROPIC_BASE_URL"))
+            if not base:
+                continue
+            token = (
+                env.get("ANTHROPIC_AUTH_TOKEN")
+                or env.get("ANTHROPIC_API_KEY")
+                or ""
+            )
+            if not isinstance(token, str):
+                token = ""
+            rows[name] = {
+                "base_url": base,
+                "token": token,
+                "model_map": {
+                    tier: (
+                        value.strip()
+                        if isinstance(
+                            value := env.get(
+                                f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL"
+                            ),
+                            str,
+                        )
+                        and value.strip()
+                        else None
+                    )
+                    for tier in ("opus", "sonnet", "haiku")
+                },
+            }
+        return rows
+    finally:
+        conn.close()
+
+
+def _sqlite_sidecars(path: Path) -> tuple[Path, Path]:
+    return (
+        path.with_name(path.name + "-wal"),
+        path.with_name(path.name + "-shm"),
+    )
+
+
+def _resolve_database_path(path: Path) -> Path:
+    try:
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise ProviderDatabaseError(
+            "provider database path cannot be resolved"
+        ) from exc
+
+
+def _require_private_database(path: Path) -> None:
+    _require_private_file(path, "provider database", ProviderDatabaseError)
+    for sidecar in _sqlite_sidecars(path):
+        if sidecar.exists():
+            label = f"provider database {sidecar.name.removeprefix(path.name)}"
+            _require_private_file(sidecar, label, ProviderDatabaseError)
+
+
+def _snapshot_fingerprint(path: Path) -> tuple | None:
     try:
         st = path.stat()
-        cache_key = (path, st.st_mtime_ns, st.st_size)
-        old_key = (
-            _db_cache["path"],
-            _db_cache["mtime_ns"],
-            _db_cache["size"],
-        )
-        if cache_key == old_key:
-            return _db_cache["rows"]
+    except FileNotFoundError:
+        return None
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_size,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+    )
 
-        db_uri = path.resolve(strict=False).as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+
+def _database_snapshot_state(path: Path) -> tuple:
+    wal_path, _shm_path = _sqlite_sidecars(path)
+    return (_snapshot_fingerprint(path), _snapshot_fingerprint(wal_path))
+
+
+def _read_provider_snapshot(path: Path) -> dict:
+    """Read a stable private main+WAL copy without opening the source SQLite DB."""
+    wal_path, _shm_path = _sqlite_sidecars(path)
+    last_error = None
+    for _attempt in range(DB_SNAPSHOT_RETRIES):
+        before = _database_snapshot_state(path)
+        if before[0] is None:
+            raise ProviderDatabaseError("provider database file is missing")
         try:
-            cursor = conn.execute(
-                "SELECT name, settings_config FROM providers WHERE app_type='claude'"
-            )
-            rows = {}
-            for name, settings_config in cursor.fetchall():
+            with tempfile.TemporaryDirectory(prefix="claude-hub-db-") as temp_dir:
+                snapshot = Path(temp_dir) / "providers.db"
+                shutil.copyfile(path, snapshot)
+                snapshot.chmod(0o600)
+                if before[1] is not None:
+                    snapshot_wal = snapshot.with_name(snapshot.name + "-wal")
+                    shutil.copyfile(wal_path, snapshot_wal)
+                    snapshot_wal.chmod(0o600)
+                after = _database_snapshot_state(path)
+                if before != after:
+                    continue
                 try:
-                    env = json.loads(settings_config).get("env") or {}
-                except (json.JSONDecodeError, AttributeError, TypeError):
-                    continue
-                base = _normalize_base_url(env.get("ANTHROPIC_BASE_URL"))
-                if not base:
-                    continue
-                token = (
-                    env.get("ANTHROPIC_AUTH_TOKEN")
-                    or env.get("ANTHROPIC_API_KEY")
-                    or ""
-                )
-                rows[name] = {
-                    "base_url": base,
-                    "token": token,
-                    "model_map": {
-                        tier: env.get(f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL")
-                        for tier in ("opus", "sonnet", "haiku")
-                    },
-                }
-        finally:
-            conn.close()
+                    return _read_provider_rows(snapshot)
+                except sqlite3.Error as exc:
+                    last_error = exc
+        except (FileNotFoundError, OSError) as exc:
+            last_error = exc
+            continue
+    raise ProviderDatabaseError(
+        "provider database changed while taking a read-only snapshot"
+    ) from last_error
 
-        _db_cache.update(
-            {
-                "path": path,
-                "mtime_ns": st.st_mtime_ns,
-                "size": st.st_size,
-                "rows": rows,
-            }
-        )
+
+def get_providers() -> dict:
+    """Read current provider data from CC Switch using SQLite ``mode=ro``."""
+    path = _resolve_database_path(db_path())
+    _require_private_database(path)
+    try:
+        providers = _read_provider_snapshot(path)
+        # Recheck because a writer can create WAL sidecars while the read is open.
+        _require_private_database(path)
+        return providers
     except (sqlite3.Error, OSError) as exc:
-        log(f"db read failed, using cached providers: {exc}")
-        if _db_cache["path"] != path:
-            return {}
-    return _db_cache["rows"]
+        raise ProviderDatabaseError(
+            "provider database could not be read"
+        ) from exc
 
 
 def reset_caches() -> None:
     """Clear file caches. Primarily useful for isolated diagnostics and tests."""
     _cfg_cache.update({"path": None, "mtime_ns": None, "size": None, "raw": None})
-    _db_cache.update(
-        {"path": None, "mtime_ns": None, "size": None, "rows": {}}
-    )
 
 
 # ---------------------------------------------------------------- routing
@@ -338,7 +480,35 @@ def anthropic_error(
     )
 
 
-def route(model_in: str, cfg: dict) -> tuple[str, str]:
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _parse_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("JSON number is outside the supported finite range")
+    return parsed
+
+
+def _validate_json_unicode(value: object) -> None:
+    """Reject lone surrogate code points before UTF-8 re-encoding."""
+    if isinstance(value, str):
+        value.encode("utf-8")
+    elif isinstance(value, list):
+        for item in value:
+            _validate_json_unicode(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _validate_json_unicode(key)
+            _validate_json_unicode(item)
+
+
+def route(
+    model_in: str,
+    cfg: dict,
+    providers: dict | None = None,
+) -> tuple[str, str]:
     """Map an incoming model field to ``(channel alias, upstream model)``."""
     model = (model_in or "").strip()
     if model.startswith("anthropic/"):
@@ -358,7 +528,9 @@ def route(model_in: str, cfg: dict) -> tuple[str, str]:
     channel = cfg["channels"].get(alias)
     if not channel:
         raise RouteError(500, f"default_channel '{alias}' not in channels config")
-    provider = get_providers().get(channel["provider"])
+    if providers is None:
+        providers = get_providers()
+    provider = providers.get(channel["provider"])
     model_lower = model.lower()
     if provider:
         for tier in ("opus", "sonnet", "haiku"):
@@ -412,16 +584,27 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
     raise RouteError(502, f"channel '{alias}' upstream must use http or https")
 
 
-def resolve_provider(alias: str, cfg: dict) -> dict:
+def resolve_provider(
+    alias: str,
+    cfg: dict,
+    providers: dict | None = None,
+) -> dict:
     channel = cfg["channels"].get(alias)
     if not channel:
         raise RouteError(400, f"unknown channel alias '{alias}'")
-    provider = get_providers().get(channel["provider"])
+    if providers is None:
+        providers = get_providers()
+    provider = providers.get(channel["provider"])
     if not provider:
         raise RouteError(
             502,
             f"channel '{alias}' provider was not found in the CC Switch database "
             f"(check {config_path().name})",
+        )
+    if not provider.get("token"):
+        raise RouteError(
+            502,
+            f"channel '{alias}' provider has no Anthropic credential",
         )
     validate_upstream_url(
         provider["base_url"],
@@ -450,17 +633,53 @@ def channel_proxy(alias: str, cfg: dict) -> str | None:
     return cfg["channels"].get(alias, {}).get("proxy") or cfg.get("proxy") or None
 
 
-def ensure_1m_beta(headers: dict, model_out: str) -> None:
+def _header_values(headers, name: str) -> list[str]:
+    if hasattr(headers, "getall"):
+        return list(headers.getall(name, []))
+    return [
+        value
+        for key, value in headers.items()
+        if key.casefold() == name.casefold()
+    ]
+
+
+def _connection_header_tokens(headers) -> set[str]:
+    tokens = set()
+    for value in _header_values(headers, "connection"):
+        tokens.update(
+            part.strip().casefold()
+            for part in value.split(",")
+            if part.strip()
+        )
+    return tokens
+
+
+def _has_unquoted_comma(value: str) -> bool:
+    """Detect a folded singleton header without rejecting quoted parameters."""
+    quoted = False
+    escaped = False
+    for character in value:
+        if escaped:
+            escaped = False
+        elif quoted and character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif character == "," and not quoted:
+            return True
+    return quoted or escaped
+
+
+def ensure_1m_beta(headers, model_out: str) -> None:
     """Ensure and de-duplicate the context-1m beta marker for ``[1m]`` models."""
     if "[1m]" not in model_out.lower():
         return
 
     beta_values = []
-    beta_keys = []
-    for key, value in list(headers.items()):
-        if key.lower() == "anthropic-beta":
-            beta_keys.append(key)
-            beta_values.extend(part.strip() for part in value.split(",") if part.strip())
+    for value in _header_values(headers, "anthropic-beta"):
+        beta_values.extend(
+            part.strip() for part in value.split(",") if part.strip()
+        )
 
     unique_values = []
     seen = set()
@@ -476,20 +695,247 @@ def ensure_1m_beta(headers: dict, model_out: str) -> None:
     if not has_context_1m:
         unique_values.append(CONTEXT_1M_BETA)
 
-    for key in beta_keys:
-        headers.pop(key, None)
+    if hasattr(headers, "popall"):
+        headers.popall("anthropic-beta", None)
+    else:
+        for key in list(headers):
+            if key.casefold() == "anthropic-beta":
+                headers.pop(key, None)
     headers["anthropic-beta"] = ",".join(unique_values)
 
 
-def upstream_headers(request: web.Request, token: str) -> dict:
-    headers = {
-        key: value
-        for key, value in request.headers.items()
-        if key.lower() not in REQ_STRIP
-    }
+def upstream_headers(request: web.Request, token: str) -> CIMultiDict:
+    strip = REQ_STRIP | _connection_header_tokens(request.headers)
+    headers = CIMultiDict()
+    for key, value in request.headers.items():
+        if key.casefold() not in strip:
+            headers.add(key, value)
     headers["authorization"] = f"Bearer {token}"
     headers["x-api-key"] = token
     return headers
+
+
+class _SSETerminalTracker:
+    """Track bounded SSE lines without buffering the streamed response."""
+
+    def __init__(self) -> None:
+        self.terminal = False
+        self.protocol_error = False
+        self._line = bytearray()
+        self._discarding_line = False
+        self._event_type: bytes | None = None
+        self._event_has_data = False
+        self._skip_leading_lf = False
+        self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="strict"
+        )
+        self._utf8_failed = False
+        self._at_stream_start = True
+        self._bom_prefix = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        if not self._utf8_failed:
+            try:
+                self._utf8_decoder.decode(chunk, final=False)
+            except UnicodeDecodeError:
+                self._utf8_failed = True
+                self.protocol_error = True
+        for parsed_chunk in self._without_initial_bom(chunk):
+            self._feed_lines(parsed_chunk)
+
+    def _without_initial_bom(self, chunk: bytes) -> tuple[bytes, ...]:
+        if not self._at_stream_start or not chunk:
+            return (chunk,) if chunk else ()
+        needed = len(codecs.BOM_UTF8) - len(self._bom_prefix)
+        take = min(needed, len(chunk))
+        self._bom_prefix.extend(chunk[:take])
+        prefix = bytes(self._bom_prefix)
+        remainder = chunk[take:]
+        if codecs.BOM_UTF8.startswith(prefix) and len(prefix) < 3:
+            return ()
+        self._at_stream_start = False
+        self._bom_prefix.clear()
+        if prefix == codecs.BOM_UTF8:
+            return (remainder,) if remainder else ()
+        parts = [prefix]
+        if remainder:
+            parts.append(remainder)
+        return tuple(parts)
+
+    def _feed_lines(self, chunk: bytes) -> None:
+        start = 0
+        if self._skip_leading_lf and chunk:
+            if chunk[0] == 0x0A:
+                start = 1
+            self._skip_leading_lf = False
+        for match in SSE_NEWLINE_RE.finditer(chunk, start):
+            self._append_segment(chunk, start, match.start())
+            if not self._discarding_line:
+                self._consume_line(bytes(self._line))
+            self._line.clear()
+            self._discarding_line = False
+            start = match.end()
+            if match.group() == b"\r" and start == len(chunk):
+                self._skip_leading_lf = True
+        self._append_segment(chunk, start, len(chunk))
+
+    @property
+    def complete(self) -> bool:
+        return self.terminal and not self.protocol_error
+
+    def finish(self) -> None:
+        if self._utf8_failed:
+            return
+        try:
+            self._utf8_decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            self._utf8_failed = True
+            self.protocol_error = True
+
+    def _append_segment(self, chunk: bytes, start: int, end: int) -> None:
+        length = end - start
+        if length <= 0:
+            return
+        if self.terminal and not self._line and chunk[start] != 0x3A:
+            # After message_stop/error, only blank lines and SSE comments are safe.
+            self.protocol_error = True
+        if self._discarding_line:
+            return
+        room = SSE_LINE_LIMIT - len(self._line)
+        if length <= room:
+            self._line.extend(memoryview(chunk)[start:end])
+            return
+        if room:
+            self._line.extend(memoryview(chunk)[start : start + room])
+        # A later event field overrides earlier event fields in the same event.
+        # Preserve that semantic even when its value is too large to retain.
+        if self._line.startswith(b"event:"):
+            self._event_type = None
+        elif self._line.startswith(b"data:"):
+            self._event_has_data = True
+        if self.terminal and not self._line.startswith(b":"):
+            self.protocol_error = True
+        self._line.clear()
+        self._discarding_line = True
+
+    def _consume_line(self, line: bytes) -> None:
+        if self.terminal:
+            if line and not line.startswith(b":"):
+                self.protocol_error = True
+            return
+        if not line:
+            if (
+                self._event_has_data
+                and self._event_type in (b"message_stop", b"error")
+            ):
+                self.terminal = True
+            self._event_type = None
+            self._event_has_data = False
+            return
+        field, separator, value = line.partition(b":")
+        if field == b"data":
+            self._event_has_data = True
+            return
+        if field != b"event":
+            return
+        if separator and value.startswith(b" "):
+            value = value[1:]
+        self._event_type = value if separator else b""
+
+
+class _SSEContentDecoder:
+    """Decode one SSE content-coding for validation while forwarding raw bytes."""
+
+    _WBITS = {
+        "gzip": 16 + zlib.MAX_WBITS,
+        "x-gzip": 16 + zlib.MAX_WBITS,
+        "deflate": zlib.MAX_WBITS,
+    }
+
+    def __init__(self, encoding: str) -> None:
+        self.encoding = encoding
+        self._decompressor = (
+            None
+            if encoding == "identity"
+            else zlib.decompressobj(self._WBITS[encoding])
+        )
+        self._member_complete = False
+        self._member_count = 1 if self._decompressor is not None else 0
+        self._encoded_bytes = 0
+        self._decoded_bytes = 0
+
+    @classmethod
+    def from_headers(cls, headers) -> "_SSEContentDecoder":
+        encodings = [
+            part.strip().casefold()
+            for value in _header_values(headers, "content-encoding")
+            for part in value.split(",")
+            if part.strip() and part.strip().casefold() != "identity"
+        ]
+        if not encodings:
+            return cls("identity")
+        if len(encodings) != 1 or encodings[0] not in cls._WBITS:
+            raise ValueError("unsupported SSE content encoding")
+        return cls(encodings[0])
+
+    def _new_gzip_member(self) -> None:
+        if self._member_count >= SSE_GZIP_MEMBER_LIMIT:
+            raise zlib.error("too many gzip members in SSE stream")
+        self._decompressor = zlib.decompressobj(self._WBITS[self.encoding])
+        self._member_complete = False
+        self._member_count += 1
+
+    def _count_decoded(self, length: int) -> None:
+        self._decoded_bytes += length
+        if self._decoded_bytes > SSE_DECODE_TOTAL_LIMIT:
+            raise zlib.error("decoded SSE stream exceeds size limit")
+        expansion_limit = (
+            SSE_DECODE_SLACK
+            + self._encoded_bytes * SSE_DECODE_RATIO_LIMIT
+        )
+        if self._decoded_bytes > expansion_limit:
+            raise zlib.error("compressed SSE stream exceeds expansion limit")
+
+    def feed(self, chunk: bytes):
+        if self._decompressor is None:
+            for start in range(0, len(chunk), SSE_DECODE_CHUNK):
+                yield chunk[start : start + SSE_DECODE_CHUNK]
+            return
+        self._encoded_bytes += len(chunk)
+        pending = chunk
+        while True:
+            if self._member_complete:
+                if not pending:
+                    return
+                if self.encoding not in ("gzip", "x-gzip"):
+                    raise zlib.error("data follows the deflate stream")
+                self._new_gzip_member()
+            decoded = self._decompressor.decompress(
+                pending,
+                SSE_DECODE_CHUNK,
+            )
+            if decoded:
+                self._count_decoded(len(decoded))
+                yield decoded
+            if self._decompressor.eof:
+                self._member_complete = True
+                pending = self._decompressor.unused_data
+                if pending:
+                    continue
+                return
+            pending = self._decompressor.unconsumed_tail
+            if pending:
+                continue
+            if len(decoded) == SSE_DECODE_CHUNK:
+                pending = b""
+                continue
+            return
+
+    def finish(self) -> None:
+        if self._decompressor is None:
+            return
+        if not self._member_complete:
+            raise zlib.error("incomplete compressed SSE stream")
 
 
 async def handle_messages(request: web.Request) -> web.StreamResponse:
@@ -498,19 +944,50 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         return anthropic_error(
             401, "invalid local hub token", "authentication_error"
         )
+    if _connection_header_tokens(request.headers) & REPRESENTATION_HEADERS:
+        return anthropic_error(
+            400,
+            "Connection must not name request representation headers",
+        )
+    content_encodings = [
+        part.strip().casefold()
+        for value in _header_values(request.headers, "content-encoding")
+        for part in value.split(",")
+        if part.strip()
+    ]
+    if any(value != "identity" for value in content_encodings):
+        return anthropic_error(
+            415,
+            "compressed request bodies are not supported by claude-hub",
+        )
 
     body = await request.read()
     is_count = request.path.endswith("/count_tokens")
     try:
-        payload = json.loads(body)
-        model_in = payload.get("model", "")
-    except (json.JSONDecodeError, AttributeError):
-        payload, model_in = None, ""
+        payload = json.loads(
+            body,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_json_float,
+        )
+        _validate_json_unicode(payload)
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+    ):
+        return anthropic_error(400, "request body must be valid JSON")
+    if not isinstance(payload, dict):
+        return anthropic_error(400, "request body must be a JSON object")
+    model_in = payload.get("model")
+    if not isinstance(model_in, str) or not model_in.strip():
+        return anthropic_error(400, "model must be a non-empty string")
 
     started = time.monotonic()
     try:
-        alias, model_out = route(model_in, cfg)
-        provider = resolve_provider(alias, cfg)
+        providers = await asyncio.to_thread(get_providers)
+        alias, model_out = route(model_in, cfg, providers)
+        provider = resolve_provider(alias, cfg, providers)
     except RouteError as exc:
         log(f"{request.path} '{model_in}' -> ROUTE ERROR {exc.status}: {exc.message}")
         return anthropic_error(
@@ -519,18 +996,25 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             "api_error" if exc.status >= 500 else "invalid_request_error",
         )
 
-    if payload is not None:
-        payload["model"] = model_out
-        data = json.dumps(payload, ensure_ascii=False).encode()
-    else:
-        data = body
+    payload["model"] = model_out
+    try:
+        data = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+    except (UnicodeEncodeError, ValueError):
+        return anthropic_error(400, "request body contains unsupported JSON values")
 
     path_and_query = request.path_qs
     url = provider["base_url"] + path_and_query
     headers = upstream_headers(request, provider["token"])
     ensure_1m_beta(headers, model_out)
     proxy = channel_proxy(alias, cfg)
-    session: aiohttp.ClientSession = request.app["session"]
+    session = request.app.get(UPSTREAM_SESSION_KEY)
+    if session is None:
+        # Kept for small fake-request fixtures that do not construct an aiohttp app.
+        session = request.app["session"]
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
 
     try:
@@ -548,8 +1032,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     len(
                         json.dumps(
                             {
-                                "m": (payload or {}).get("messages"),
-                                "s": (payload or {}).get("system"),
+                                "m": payload.get("messages"),
+                                "s": payload.get("system"),
                             },
                             ensure_ascii=False,
                         )
@@ -565,28 +1049,101 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     headers={"x-hub-estimated": "1"},
                 )
 
+            response_connection_tokens = _connection_header_tokens(
+                upstream.headers
+            )
+            content_types = _header_values(upstream.headers, "content-type")
+            if (
+                len(content_types) > 1
+                or any(_has_unquoted_comma(value) for value in content_types)
+                or response_connection_tokens & REPRESENTATION_HEADERS
+            ):
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    "upstream returned ambiguous representation headers"
+                )
+                return anthropic_error(
+                    502,
+                    f"hub: channel '{alias}' returned invalid response headers",
+                    "api_error",
+                )
+            content_type = content_types[0] if content_types else ""
+            streamed = (
+                upstream.status == 200
+                and content_type.split(";", 1)[0].strip().casefold()
+                == "text/event-stream"
+            )
+            try:
+                sse_decoder = (
+                    _SSEContentDecoder.from_headers(upstream.headers)
+                    if streamed
+                    else None
+                )
+            except ValueError:
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    "upstream SSE used an unsupported content encoding"
+                )
+                return anthropic_error(
+                    502,
+                    f"hub: channel '{alias}' returned an unsupported SSE encoding",
+                    "api_error",
+                )
+
             response = web.StreamResponse(status=upstream.status)
+            response_strip = RESP_STRIP | response_connection_tokens
             for key, value in upstream.headers.items():
-                if key.lower() not in RESP_STRIP:
-                    response.headers[key] = value
+                if key.casefold() not in response_strip:
+                    response.headers.add(key, value)
             response.headers["x-hub-channel"] = alias
             response.headers["x-hub-model"] = model_out
             await response.prepare(request)
 
             byte_count = 0
-            streamed = upstream.headers.get("content-type", "").startswith(
-                "text/event-stream"
-            )
+            sse_tracker = _SSETerminalTracker() if streamed else None
             try:
                 async for chunk in upstream.content.iter_any():
+                    if sse_tracker is not None:
+                        for decoded in sse_decoder.feed(chunk):
+                            sse_tracker.feed(decoded)
+                            # Keep one highly compressible response from
+                            # monopolizing the local gateway event loop.
+                            await asyncio.sleep(0)
                     await response.write(chunk)
                     byte_count += len(chunk)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if sse_tracker is not None:
+                    sse_decoder.finish()
+                    sse_tracker.finish()
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                zlib.error,
+            ) as exc:
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"upstream broke mid-stream after {byte_count}B: {exc}"
+                    f"upstream broke or was invalid after {byte_count}B: "
+                    f"{type(exc).__name__}"
                 )
-                return response
+                transport = request.transport
+                if transport is not None:
+                    transport.abort()
+                raise UpstreamStreamAborted(
+                    "upstream stream ended after downstream response started"
+                ) from exc
+
+            if sse_tracker is not None and not sse_tracker.complete:
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    f"upstream SSE ended without a valid terminal event after "
+                    f"{byte_count}B"
+                )
+                transport = request.transport
+                if transport is not None:
+                    transport.abort()
+                raise UpstreamStreamAborted(
+                    "upstream SSE ended without a valid message_stop or error"
+                )
 
             await response.write_eof()
             log(
@@ -650,14 +1207,55 @@ async def handle_fallback(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------- server
 
 
-async def _close_session(app: web.Application) -> None:
-    await app["session"].close()
+@web.middleware
+async def controlled_error_middleware(
+    request: web.Request,
+    handler,
+) -> web.StreamResponse:
+    """Keep local configuration/DB failures out of aiohttp HTML responses."""
+    try:
+        return await handler(request)
+    except UpstreamStreamAborted as exc:
+        # The downstream transport is already aborted. Cancellation prevents
+        # aiohttp from attempting a normal write_eof or rendering a second body.
+        raise asyncio.CancelledError from exc
+    except ConfigError:
+        log(f"{request.method} {request.path}: configuration unavailable")
+        return anthropic_error(
+            503,
+            "claude-hub configuration is unavailable; run `claude-hub doctor`",
+            "api_error",
+        )
+    except (ProviderDatabaseError, sqlite3.Error) as exc:
+        log(
+            f"{request.method} {request.path}: provider database unavailable: "
+            f"{type(exc).__name__}"
+        )
+        return anthropic_error(
+            503,
+            "claude-hub provider database is unavailable; run `claude-hub doctor`",
+            "api_error",
+        )
+
+
+async def _client_session_context(app: web.Application):
+    session = aiohttp.ClientSession(
+        auto_decompress=False,
+        skip_auto_headers={"Accept-Encoding"},
+    )
+    app[UPSTREAM_SESSION_KEY] = session
+    try:
+        yield
+    finally:
+        await session.close()
 
 
 def create_app() -> web.Application:
-    app = web.Application(client_max_size=64 * 1024 * 1024)
-    app["session"] = aiohttp.ClientSession(auto_decompress=True)
-    app.on_cleanup.append(_close_session)
+    app = web.Application(
+        client_max_size=64 * 1024 * 1024,
+        middlewares=[controlled_error_middleware],
+    )
+    app.cleanup_ctx.append(_client_session_context)
     app.router.add_post("/v1/messages", handle_messages)
     app.router.add_post("/v1/messages/count_tokens", handle_messages)
     app.router.add_get("/v1/models", handle_models)
@@ -671,23 +1269,25 @@ async def run_server(fg: bool) -> None:
     _log_stderr = fg
     open_log()
     cfg = get_config()
+    # Fail before binding when the credential-bearing DB is unreadable or unsafe.
+    get_providers()
     app = create_app()
 
     runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
     try:
-        site = web.TCPSite(runner, "127.0.0.1", cfg["port"])
-        await site.start()
-    except OSError as exc:
-        log(f"FATAL: cannot bind 127.0.0.1:{cfg['port']}: {exc}")
-        await runner.cleanup()
-        raise
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, "127.0.0.1", cfg["port"])
+            await site.start()
+        except OSError as exc:
+            log(f"FATAL: cannot bind 127.0.0.1:{cfg['port']}: {exc}")
+            raise
 
-    log(
-        f"claude-hub listening on 127.0.0.1:{cfg['port']} "
-        f"(channels: {', '.join(cfg['channels'])}; default: {cfg['default_channel']})"
-    )
-    try:
+        log(
+            f"claude-hub listening on 127.0.0.1:{cfg['port']} "
+            f"(channels: {', '.join(cfg['channels'])}; "
+            f"default: {cfg['default_channel']})"
+        )
         while True:
             await asyncio.sleep(3600)
     finally:
@@ -716,6 +1316,116 @@ def cli_list() -> None:
             f"\nUsage: /model alias,model   Example: "
             f"/model {cfg['default_channel']},{default_models[0]}"
         )
+
+
+def cli_doctor() -> int:
+    """Run read-only local readiness checks without contacting any provider."""
+    failures = 0
+
+    def report(level: str, message: str) -> None:
+        nonlocal failures
+        if level == "FAIL":
+            failures += 1
+        print(f"  {level:<4} {message}")
+
+    print("claude-hub doctor (local, read-only)\n")
+
+    cfg_path = config_path()
+    cfg_issue = _private_file_issue(cfg_path, "config")
+    if cfg_issue:
+        report("FAIL", cfg_issue)
+    elif os.name == "posix":
+        report("OK", "config exists and permissions do not exceed 0600")
+    else:
+        report("SKIP", "config permission mode unavailable on this platform")
+
+    cfg = None
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg = validate_config(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError, ConfigError):
+        report("FAIL", "config cannot be parsed or is incomplete")
+    else:
+        report("OK", "config parses and local authentication is ready")
+        report("OK", f"listen address is 127.0.0.1:{cfg['port']}")
+
+    provider_path = None
+    try:
+        provider_path = _resolve_database_path(db_path())
+    except ProviderDatabaseError:
+        report("FAIL", "provider database path cannot be resolved")
+    if provider_path is not None:
+        db_issue = _private_file_issue(provider_path, "provider database")
+        if db_issue:
+            report("FAIL", db_issue)
+        elif os.name == "posix":
+            report(
+                "OK",
+                "provider database exists and permissions do not exceed 0600",
+            )
+        else:
+            report(
+                "SKIP",
+                "provider database permission mode unavailable on this platform",
+            )
+        for sidecar in _sqlite_sidecars(provider_path):
+            if not sidecar.exists():
+                continue
+            suffix = sidecar.name.removeprefix(provider_path.name)
+            sidecar_issue = _private_file_issue(
+                sidecar,
+                f"provider database {suffix}",
+            )
+            if sidecar_issue:
+                report("FAIL", sidecar_issue)
+            elif os.name == "posix":
+                report("OK", f"provider database {suffix} permissions are private")
+            else:
+                report(
+                    "SKIP",
+                    f"provider database {suffix} permission mode unavailable",
+                )
+
+    providers = None
+    if provider_path is not None:
+        try:
+            providers = _read_provider_snapshot(provider_path)
+        except (sqlite3.Error, OSError, ProviderDatabaseError):
+            report("FAIL", "provider database cannot be read")
+        else:
+            report("OK", "provider database opens read-only")
+
+    if cfg is not None and providers is not None:
+        for alias, channel in cfg["channels"].items():
+            problems = []
+            models = channel.get("models", [])
+            if not models:
+                problems.append("no selectable models")
+            provider = providers.get(channel["provider"])
+            if provider is None:
+                problems.append("provider missing")
+            else:
+                if not provider.get("token"):
+                    problems.append("credential missing")
+                try:
+                    validate_upstream_url(
+                        provider.get("base_url", ""),
+                        alias,
+                        channel.get("allow_insecure_http", False),
+                    )
+                except RouteError:
+                    problems.append("upstream policy invalid")
+            if problems:
+                report("FAIL", f"channel '{alias}': {', '.join(problems)}")
+            else:
+                report("OK", f"channel '{alias}' ready ({len(models)} models)")
+
+    print(
+        "\nResult: "
+        + ("ready" if failures == 0 else f"not ready ({failures} failed checks)")
+    )
+    print("No provider connection was attempted. Use `claude-hub check` explicitly.")
+    return 0 if failures == 0 else 1
 
 
 async def cli_check(target: str | None) -> None:
@@ -798,6 +1508,7 @@ USAGE = """claude-hub — local multi-channel Anthropic gateway
 Usage:
   claude-hub serve [--fg]     start the gateway
   claude-hub list             show configured channels and models
+  claude-hub doctor           run local read-only readiness checks
   claude-hub check [alias]    make a real one-token connectivity check
   claude-hub logs [-n N|-f]   show routing logs
 
@@ -818,6 +1529,10 @@ def main() -> None:
             asyncio.run(run_server(fg="--fg" in args))
         elif command == "list":
             cli_list()
+        elif command == "doctor":
+            status = cli_doctor()
+            if status:
+                raise SystemExit(status)
         elif command == "check":
             asyncio.run(cli_check(args[1] if len(args) > 1 else None))
         elif command == "logs":
@@ -829,6 +1544,12 @@ def main() -> None:
             )
     except ConfigError as exc:
         print(f"claude-hub: config error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except ProviderDatabaseError as exc:
+        print(
+            "claude-hub: provider database error; run `claude-hub doctor`",
+            file=sys.stderr,
+        )
         raise SystemExit(2) from exc
 
 
