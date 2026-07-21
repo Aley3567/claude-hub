@@ -25,7 +25,7 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 - 安装器：4 个测试通过；
 - Python 编译、sh/zsh 语法和 `git diff --check` 通过；
 - GitHub Actions 在 macOS 与 Ubuntu、Python 3.11 与 3.12 的四组矩阵全部通过：
-  [tests run 29795714034](https://github.com/Aley3567/claude1/actions/runs/29795714034)。
+  [tests run 29796654627](https://github.com/Aley3567/claude1/actions/runs/29796654627)。
 
 测试覆盖临时 HOME、fixture DB、fake Claude、fake upstream、严格健康契约、鉴权、
 模型发现、请求透传、流式终态、CR/LF/CRLF、UTF-8 BOM、gzip/x-gzip/deflate、
