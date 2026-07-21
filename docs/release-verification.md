@@ -20,7 +20,7 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 
 ## 自动化验证
 
-- Python：79 个测试通过；
+- Python：82 个测试通过；
 - zsh 集成：8 个测试通过；
 - 安装器：4 个测试通过；
 - Python 编译、sh/zsh 语法和 `git diff --check` 通过；
@@ -29,8 +29,8 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 
 测试覆盖临时 HOME、fixture DB、fake Claude、fake upstream、严格健康契约、鉴权、
 模型发现、请求透传、流式终态、CR/LF/CRLF、UTF-8 BOM、gzip/x-gzip/deflate、
-截断与损坏压缩流、文件权限、符号链接和 FIFO 拒绝，以及 Logo 动画 15 秒后
-进入零唤醒休眠。SSE 终态追踪器另以 5 万组
+截断与损坏压缩流、文件权限、符号链接和 FIFO 拒绝，以及 Logo 按真实时间
+推进、15 秒后进入零唤醒休眠、终端 EOF 后快速退出。SSE 终态追踪器另以 5 万组
 随机字段、换行和分块边界与参考实现比对，无差异。
 
 ## 隔离与真实运行验证
@@ -39,8 +39,10 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 - 使用真实配置结构完成离线 `doctor` 与启动验证，全程未连接 provider；
 - 安装后的三份文件与仓库逐字一致，模式为 `0755 / 0755 / 0644`；
 - zsh 中只有一条 managed source，未接入可选 sticky integration；
-- 真实 256 色 PTY 中 Logo 流动与呼吸阶段采样 CPU 为 `0.0–0.1%`，15 秒后
-  自动休眠并保持 `0.0%`；
+- 真实 256 色 PTY 中，纯 Logo 绘制为 `53.6µs/帧`，按 10 FPS 折算约
+  `0.054% CPU`；启动后的 5 秒稳态 CPU 增量低于 `0.01s` 测量分辨率
+  （即低于约 `0.2%`）；自动休眠后的 2 秒窗口输出 `0 bytes`、CPU 增量
+  `0.000s`，断开 PTY 后 `8.8ms` 内退出；
 - live Hub 只有一个 `127.0.0.1` 监听者，健康契约、鉴权和模型发现通过；
 - 通过安装后的 launcher、live Hub 和 fake Claude 完成端到端启动，临时 settings
   权限为 `0600` 且进程结束后删除；
