@@ -682,17 +682,6 @@ _MIN_TUI_COLS = 32
 INTRO_DURATION_SECONDS = 0.24
 INTRO_FRAME_SECONDS = 0.016
 INTRO_FLOW_STEP_SECONDS = 0.04
-# Ten terminal frames per second feels fluid without wasting work; phase is
-# derived from elapsed time, so a slow refresh skips stale frames instead of
-# slowing the flow itself. After 15s the chooser blocks with zero wakeups.
-ANIMATION_FRAME_MS = 100
-ANIMATION_IDLE_SECONDS = 15.0
-ANIMATION_PHASE_PERIOD = 240
-# A closed controlling terminal makes getch() return -1 immediately instead of
-# waiting out its timeout. Bail after this many back-to-back sub-frame empty
-# polls so a detached session never spins a CPU core on invisible animation.
-ANIMATION_DEAD_TTY_POLLS = 4
-_ANIMATION_POLL_FLOOR_SECONDS = (ANIMATION_FRAME_MS / 1000.0) * 0.5
 LOGO_BREATH_LEVELS = (
     0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
@@ -897,12 +886,6 @@ def _animation_enabled() -> bool:
     return disabled not in {"1", "true", "yes", "on"}
 
 
-def _animation_phase(started: float, now: float) -> int:
-    elapsed = max(0.0, now - started)
-    step = ANIMATION_FRAME_MS / 1000.0
-    return int(elapsed / step) % ANIMATION_PHASE_PERIOD
-
-
 def _logo_intensity(phase: int, breathing: bool) -> int:
     if not breathing:
         return curses.A_BOLD
@@ -937,6 +920,7 @@ def _intro(win) -> int | None:
     rows, cols = win.getmaxyx()
     if not _animation_enabled() or not _large_logo_supported(rows, cols):
         return None
+    win.erase()
     win.nodelay(True)
     n = len(_logo_pairs) or 1
     width = max((len(line) for line in LOGO), default=0)
@@ -1139,14 +1123,21 @@ def _draw_launcher(
     h, w = win.getmaxyx()
     big = _large_logo_supported(h, w)
 
-    if big:
-        if show_brand:
-            _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
-            _draw_logo(win, logo_phase, breathing=logo_breathing)
+    if show_brand and big:
+        _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
+        _draw_logo(win, logo_phase, breathing=logo_breathing)
         head = _LOGO_TOP + len(LOGO)
+    elif show_brand:
+        _draw_logo(win, logo_phase, breathing=logo_breathing)
+        head = 1
     else:
-        if show_brand:
-            _draw_logo(win, logo_phase, breathing=logo_breathing)
+        _addstr(
+            win,
+            0,
+            2,
+            "欢迎使用 claude1",
+            C.get("pink", 0) | curses.A_BOLD,
+        )
         head = 1
 
     heading = "选择本次渠道"
@@ -1239,25 +1230,10 @@ def _launcher_main(win, cfg, db_names):
     notice: str | None = None
     rows, cols = win.getmaxyx()
     intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
-    animate = intro_animate and len(_logo_pairs) > 1
-    _draw_launcher(
-        win,
-        cfg,
-        view,
-        idx,
-        show_hidden,
-        mru,
-        show_brand=not intro_animate,
-    )
     pending_key = _intro(win) if intro_animate else None
-    phase = 0
-    paused = not animate
-    blocking = not animate
-    fast_empty = 0
-    animation_started = time.monotonic()
-    last_active = animation_started
-    last_poll = animation_started
-    win.timeout(ANIMATION_FRAME_MS if animate else -1)
+    # The logo is a finite entrance, not a background task. Once it finishes,
+    # erase it and block indefinitely for input with zero timer wakeups.
+    win.timeout(-1)
     _draw_launcher(
         win,
         cfg,
@@ -1265,51 +1241,14 @@ def _launcher_main(win, cfg, db_names):
         idx,
         show_hidden,
         mru,
-        logo_phase=phase,
-        logo_breathing=animate,
+        show_brand=False,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
         pending_key = None
-        now = time.monotonic()
-        poll_elapsed = now - last_poll
-        last_poll = now
         if ch == -1:
-            # A blocking read (timeout == -1) that returns -1 means the input
-            # stream reached EOF — typically the controlling terminal closed.
-            if blocking:
-                return None
-            # While animating we only poll, so a lone -1 is a normal frame
-            # timeout; but a burst returning far quicker than the frame budget
-            # is the same EOF, and must not burn a CPU core on frames nobody
-            # can see.
-            if poll_elapsed < _ANIMATION_POLL_FLOOR_SECONDS:
-                fast_empty += 1
-                if fast_empty >= ANIMATION_DEAD_TTY_POLLS:
-                    return None
-            else:
-                fast_empty = 0
-            if (now - last_active) >= ANIMATION_IDLE_SECONDS:
-                _draw_logo(win, phase, breathing=False)
-                win.refresh()
-                win.timeout(-1)
-                blocking = True
-                paused = True
-                continue
-            next_phase = _animation_phase(animation_started, now)
-            if next_phase == phase:
-                continue
-            phase = next_phase
-            _draw_logo(win, phase, breathing=True)
-            win.refresh()
-            continue
-
-        fast_empty = 0
-        last_active = now
-        if paused and animate:
-            win.timeout(ANIMATION_FRAME_MS)
-            blocking = False
-            paused = False
+            # timeout(-1) returning -1 means the controlling terminal closed.
+            return None
         notice = None
         direct_index = _digit_index(ch)
         if direct_index is not None:
@@ -1324,14 +1263,7 @@ def _launcher_main(win, cfg, db_names):
                 idx = (idx + 1) % len(view)
         elif ch == ord("a"):
             if view:
-                if animate:
-                    win.timeout(-1)
-                try:
-                    changed, notice = _edit_alias(win, view[idx], meta)
-                finally:
-                    if animate:
-                        last_active = time.monotonic()
-                        win.timeout(ANIMATION_FRAME_MS)
+                changed, notice = _edit_alias(win, view[idx], meta)
                 if changed:
                     save_config(cfg)
         elif ch == ord("x"):
@@ -1339,14 +1271,7 @@ def _launcher_main(win, cfg, db_names):
                 name = view[idx]
                 nowh = meta[name].get("hidden")
                 verb = "恢复显示" if nowh else "隐藏"
-                if animate:
-                    win.timeout(-1)
-                try:
-                    ok = _confirm(win, f"{verb} {name}?")
-                finally:
-                    if animate:
-                        last_active = time.monotonic()
-                        win.timeout(ANIMATION_FRAME_MS)
+                ok = _confirm(win, f"{verb} {name}?")
                 if ok:
                     meta[name]["hidden"] = not nowh
                     save_config(cfg)
@@ -1373,11 +1298,22 @@ def _launcher_main(win, cfg, db_names):
             idx,
             show_hidden,
             mru,
+            show_brand=False,
             help_open=help_open,
             notice=notice,
-            logo_phase=phase,
-            logo_breathing=animate,
         )
+
+
+def _launcher_session(win, cfg, db_names):
+    """Run one chooser and remove its full-screen UI before curses restores."""
+    try:
+        return _launcher_main(win, cfg, db_names)
+    finally:
+        try:
+            win.erase()
+            win.refresh()
+        except (AttributeError, curses.error):
+            pass
 
 
 def run_tui_launcher():
@@ -1395,7 +1331,7 @@ def run_tui_launcher():
     if not _tui_size_supported(terminal.lines, terminal.columns):
         return ("no-tui", None)
     try:
-        name = curses.wrapper(_launcher_main, cfg, db_names)
+        name = curses.wrapper(_launcher_session, cfg, db_names)
     except Exception as exc:
         print(f"[claude1] 图形界面无法启动({exc})", file=sys.stderr)
         return ("no-tui", None)
@@ -1824,6 +1760,7 @@ def main(argv: list[str]) -> int:
                 return 1
             selected = choose(providers, None)
         elif action == "quit":
+            print("Bye，欢迎下次使用 claude1。")
             return 0
         else:
             selected = provider_by_name(name)

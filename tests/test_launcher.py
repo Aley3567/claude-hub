@@ -248,6 +248,57 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 )
                 self.assertLessEqual(max(y for y, _x, _text in window.writes), 23)
 
+    def test_compact_launcher_replaces_logo_with_welcome_line(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.writes: list[tuple[int, int, str]] = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def erase(self) -> None:
+                self.writes.clear()
+
+            def addstr(self, y: int, x: int, text: str, _attr: int) -> None:
+                self.writes.append((y, x, text))
+
+            def refresh(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                launcher.C = {
+                    "pink": 0,
+                    "lime": 0,
+                    "dim": 0,
+                    "warning": 0,
+                    "base": 0,
+                    "sel": 0,
+                }
+                launcher._row_pairs[:] = [0]
+                window = FakeWindow()
+
+                launcher._draw_launcher(
+                    window,
+                    cfg,
+                    ["Alpha"],
+                    0,
+                    False,
+                    {},
+                    show_brand=False,
+                )
+
+                rendered = "\n".join(text for _y, _x, text in window.writes)
+                self.assertIn("欢迎使用 claude1", rendered)
+                self.assertFalse(
+                    any("████" in text for _y, _x, text in window.writes)
+                )
+                self.assertTrue(
+                    any(y == 5 and "Alpha" in text for y, _x, text in window.writes)
+                )
+
     def test_cjk_clipping_never_exceeds_requested_width(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -268,6 +319,9 @@ class LauncherTuiLogicTests(unittest.TestCase):
 
             def nodelay(self, value: bool) -> None:
                 self.nodelay_calls.append(value)
+
+            def erase(self) -> None:
+                return
 
             def addstr(self, *_args) -> None:
                 return
@@ -353,11 +407,10 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertEqual(selected, "Beta")
                 self.assertEqual(window.timeouts, [-1])
 
-    def test_logo_animation_pauses_to_zero_wakeup_after_idle(self) -> None:
+    def test_intro_is_followed_by_static_compact_launcher(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
                 self.timeouts: list[int] = []
-                self.keys = iter([-1, -1, ord("q")])
 
             def getmaxyx(self) -> tuple[int, int]:
                 return (24, 100)
@@ -369,7 +422,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.timeouts.append(value)
 
             def getch(self) -> int:
-                return next(self.keys)
+                return ord("q")
 
             def refresh(self) -> None:
                 return
@@ -383,129 +436,34 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 with (
                     mock.patch.object(launcher, "_init_colors", return_value={}),
                     mock.patch.object(launcher, "_intro", return_value=None),
-                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_launcher") as draw_launcher,
                     mock.patch.object(launcher, "_draw_logo") as draw_logo,
                     mock.patch.object(launcher, "load_mru", return_value={}),
-                    mock.patch.object(
-                        launcher.time,
-                        "monotonic",
-                        side_effect=[
-                            0.0,
-                            (launcher.ANIMATION_FRAME_MS / 1000.0) * 1.1,
-                            launcher.ANIMATION_IDLE_SECONDS + 1.0,
-                            launcher.ANIMATION_IDLE_SECONDS + 1.1,
-                        ],
-                    ),
                 ):
                     selected = launcher._launcher_main(window, cfg, {"Alpha"})
 
                 self.assertIsNone(selected)
-                self.assertEqual(
-                    window.timeouts,
-                    [launcher.ANIMATION_FRAME_MS, -1, launcher.ANIMATION_FRAME_MS],
+                self.assertEqual(window.timeouts, [-1])
+                self.assertTrue(draw_launcher.call_args_list)
+                self.assertTrue(
+                    all(
+                        call.kwargs.get("show_brand") is False
+                        for call in draw_launcher.call_args_list
+                    )
                 )
-                self.assertEqual(
-                    draw_logo.call_args_list,
-                    [
-                        mock.call(window, 1, breathing=True),
-                        mock.call(window, 1, breathing=False),
-                    ],
-                )
-
-    def test_logo_flow_uses_elapsed_time_instead_of_counting_slow_frames(self) -> None:
-        class FakeWindow:
-            def __init__(self) -> None:
-                self.timeouts: list[int] = []
-                self.keys = iter([-1, ord("q")])
-
-            def getmaxyx(self) -> tuple[int, int]:
-                return (24, 100)
-
-            def keypad(self, _value: bool) -> None:
-                return
-
-            def timeout(self, value: int) -> None:
-                self.timeouts.append(value)
-
-            def getch(self) -> int:
-                return next(self.keys)
-
-            def refresh(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as raw_home:
-            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
-            with loaded_launcher(env) as launcher:
-                cfg = {"providers": {"Alpha": {"hidden": False}}}
-                window = FakeWindow()
-                launcher._logo_pairs[:] = [1, 2]
-                delayed = (launcher.ANIMATION_FRAME_MS / 1000.0) * 4.5
-                with (
-                    mock.patch.object(launcher, "_init_colors", return_value={}),
-                    mock.patch.object(launcher, "_intro", return_value=None),
-                    mock.patch.object(launcher, "_draw_launcher"),
-                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
-                    mock.patch.object(launcher, "load_mru", return_value={}),
-                    mock.patch.object(
-                        launcher.time,
-                        "monotonic",
-                        side_effect=[0.0, delayed, delayed + 0.01],
-                    ),
-                ):
-                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
-
-                self.assertIsNone(selected)
-                draw_logo.assert_called_once_with(window, 4, breathing=True)
-
-    def test_disconnected_animation_exits_without_drawing_fast_empty_frames(self) -> None:
-        class FakeWindow:
-            def __init__(self) -> None:
-                self.getch_calls = 0
-                self.refresh_calls = 0
-
-            def getmaxyx(self) -> tuple[int, int]:
-                return (24, 100)
-
-            def keypad(self, _value: bool) -> None:
-                return
-
-            def timeout(self, _value: int) -> None:
-                return
-
-            def getch(self) -> int:
-                self.getch_calls += 1
-                return -1
-
-            def refresh(self) -> None:
-                self.refresh_calls += 1
-
-        with tempfile.TemporaryDirectory() as raw_home:
-            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
-            with loaded_launcher(env) as launcher:
-                cfg = {"providers": {"Alpha": {"hidden": False}}}
-                window = FakeWindow()
-                launcher._logo_pairs[:] = [1, 2]
-                clock = iter(i / 1000.0 for i in range(100))
-                with (
-                    mock.patch.object(launcher, "_init_colors", return_value={}),
-                    mock.patch.object(launcher, "_intro", return_value=None),
-                    mock.patch.object(launcher, "_draw_launcher"),
-                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
-                    mock.patch.object(launcher, "load_mru", return_value={}),
-                    mock.patch.object(
-                        launcher.time,
-                        "monotonic",
-                        side_effect=lambda: next(clock),
-                    ),
-                ):
-                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
-
-                self.assertIsNone(selected)
-                self.assertEqual(
-                    window.getch_calls, launcher.ANIMATION_DEAD_TTY_POLLS
-                )
-                self.assertEqual(window.refresh_calls, 0)
                 draw_logo.assert_not_called()
+
+    def test_launcher_session_always_clears_the_tui(self) -> None:
+        window = mock.Mock()
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(launcher, "_launcher_main", return_value="Alpha"):
+                    self.assertEqual(
+                        launcher._launcher_session(window, {}, set()), "Alpha"
+                    )
+                window.erase.assert_called_once_with()
+                window.refresh.assert_called_once_with()
 
     def test_blocking_launcher_and_confirmation_exit_on_terminal_eof(self) -> None:
         class FakeWindow:
@@ -571,6 +529,23 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 rendered = output.getvalue()
                 self.assertIn("默认启动只影响本次会话", rendered)
                 self.assertIn(f"claude1 {launcher.VERSION}", rendered)
+
+    def test_tui_quit_prints_a_compact_farewell(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        launcher, "run_tui_launcher", return_value=("quit", None)
+                    ),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(launcher.main([]), 0)
+
+                self.assertEqual(
+                    output.getvalue(), "Bye，欢迎下次使用 claude1。\n"
+                )
 
     def test_hub_model_option_is_consumed_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
