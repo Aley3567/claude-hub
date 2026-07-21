@@ -63,6 +63,9 @@ claude1 --help                  # 查看完整命令与快捷键
 CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 ```
 
+Logo 以低帧率流动并柔和呼吸；连续 15 秒无操作后会自动进入零唤醒
+休眠，任意按键恢复。需要完全静态时使用 `CLAUDE1_NO_ANIMATION=1`。
+
 Provider 名称匹配不区分大小写；如果多个名称都匹配，会要求再次选择，避免
 静默走错渠道。别名不能与 `hub`、`list`、`doctor` 等保留命令冲突。
 

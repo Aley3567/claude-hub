@@ -291,7 +291,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 ):
                     self.assertFalse(launcher._animation_enabled())
 
-    def test_intro_key_selects_provider_and_final_screen_has_no_timer(self) -> None:
+    def test_intro_key_selects_provider_and_single_color_screen_has_no_timer(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
                 self.timeouts: list[int] = []
@@ -339,6 +339,65 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     )
                 self.assertEqual(selected, "Beta")
                 self.assertEqual(window.timeouts, [-1])
+
+    def test_logo_animation_pauses_to_zero_wakeup_after_idle(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.timeouts: list[int] = []
+                self.keys = iter([-1, -1, ord("q")])
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def keypad(self, _value: bool) -> None:
+                return
+
+            def timeout(self, value: int) -> None:
+                self.timeouts.append(value)
+
+            def getch(self) -> int:
+                return next(self.keys)
+
+            def refresh(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                window = FakeWindow()
+                launcher._logo_pairs[:] = [1, 2]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(
+                        launcher.time,
+                        "monotonic",
+                        side_effect=[
+                            0.0,
+                            1.0,
+                            launcher.ANIMATION_IDLE_SECONDS + 1.0,
+                            launcher.ANIMATION_IDLE_SECONDS + 1.1,
+                        ],
+                    ),
+                ):
+                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
+
+                self.assertIsNone(selected)
+                self.assertEqual(
+                    window.timeouts,
+                    [launcher.ANIMATION_FRAME_MS, -1, launcher.ANIMATION_FRAME_MS],
+                )
+                self.assertEqual(
+                    draw_logo.call_args_list,
+                    [
+                        mock.call(window, 1, breathing=True),
+                        mock.call(window, 1, breathing=False),
+                    ],
+                )
 
     def test_small_terminal_uses_text_fallback_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
