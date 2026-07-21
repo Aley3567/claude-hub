@@ -694,8 +694,8 @@ ANIMATION_PHASE_PERIOD = 240
 ANIMATION_DEAD_TTY_POLLS = 4
 _ANIMATION_POLL_FLOOR_SECONDS = (ANIMATION_FRAME_MS / 1000.0) * 0.5
 LOGO_BREATH_LEVELS = (
-    -1, -1, -1, -1, 0, 0, 0, 1, 1, 1,
-    1, 1, 1, 0, 0, 0, -1, -1, -1, -1,
+    0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
 )
 C: dict = {}
 
@@ -907,8 +907,6 @@ def _logo_intensity(phase: int, breathing: bool) -> int:
     if not breathing:
         return curses.A_BOLD
     level = LOGO_BREATH_LEVELS[phase % len(LOGO_BREATH_LEVELS)]
-    if level < 0:
-        return curses.A_DIM
     if level > 0:
         return curses.A_BOLD
     return 0

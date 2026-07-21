@@ -291,6 +291,19 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 ):
                     self.assertFalse(launcher._animation_enabled())
 
+    def test_logo_breathing_never_dims_the_full_logo(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                attrs = {
+                    launcher._logo_intensity(phase, breathing=True)
+                    for phase in range(len(launcher.LOGO_BREATH_LEVELS))
+                }
+
+                self.assertNotIn(launcher.curses.A_DIM, attrs)
+                self.assertIn(0, attrs)
+                self.assertIn(launcher.curses.A_BOLD, attrs)
+
     def test_intro_key_selects_provider_and_single_color_screen_has_no_timer(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
