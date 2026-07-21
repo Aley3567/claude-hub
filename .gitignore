@@ -115,11 +115,20 @@ ENV/
 # 本地配置（用户特定，不共享）
 # =============================================================================
 .env
+.env.*
+!.env.example
+!.env.*.example
 .env.local
 config.local.json
 settings.local.json
 claude-hub.json
+claude-hub-token
+cc-switch.db
+.cc-switch/
 claude1-config.json
 claude1-mru.json
 claude1-backend
 claude1-backend.json
+
+# 本机设计截图可能把真实渠道信息画进像素，只保留在桌面工作目录
+docs/design-references/local-private-*

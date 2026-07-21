@@ -81,6 +81,9 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude-hub.py" \
     "$home/install root/scripts/claude-hub.py" ||
     fail "hub was not installed"
+  command cmp -s "$REPO_ROOT/claude1_protocol.py" \
+    "$home/install root/scripts/claude1_protocol.py" ||
+    fail "protocol bridge was not installed"
   command cmp -s "$REPO_ROOT/zsh-functions.sh" \
     "$home/install root/claude1/zsh-functions.sh" ||
     fail "safe shell integration was not installed"
@@ -92,6 +95,10 @@ test_first_install_is_safe() {
     fail "installer copied sticky integration"
   [[ "$output" == *"未找到 uv"* ]] ||
     fail "missing uv warning was not shown"
+  HOME="$home" "$SYSTEM_PYTHON" \
+    "$home/install root/scripts/claude-provider-once.py" --help \
+    >/dev/null ||
+    fail "installed launcher cannot import the protocol bridge"
 
   local shell_output
   shell_output="$(
@@ -133,6 +140,7 @@ test_existing_files_are_backed_up() {
   command mkdir -p -- "$home/install root/scripts" "$home/install root/claude1"
   print -r -- 'old launcher' > "$home/install root/scripts/claude-provider-once.py"
   print -r -- 'old hub' > "$home/install root/scripts/claude-hub.py"
+  print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
   command mkdir -p -- "$home/dotfiles"
   print -r -- 'old zshrc' > "$home/dotfiles/zshrc"
@@ -146,6 +154,7 @@ test_existing_files_are_backed_up() {
   local backup="${backups[1]}"
   assert_file_content "old launcher" "$backup/claude-provider-once.py"
   assert_file_content "old hub" "$backup/claude-hub.py"
+  assert_file_content "old protocol" "$backup/claude1_protocol.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
   assert_file_content "old zshrc" "$backup/zshrc"
 

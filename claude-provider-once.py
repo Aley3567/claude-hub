@@ -17,7 +17,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import shutil
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -27,8 +29,11 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
+
+from claude1_protocol import provider_api_format
 
 
 VERSION = "0.1.0"
@@ -279,7 +284,7 @@ def migrate_hidden(cfg: dict) -> bool:
 def provider_by_name(name: str) -> dict | None:
     for r in db_claude_rows():
         if r["name"] == name:
-            return {"id": r["id"], "name": r["name"], "settings_config": r["settings_config"]}
+            return _provider_from_row(r)
     return None
 
 
@@ -337,20 +342,51 @@ def db_claude_rows() -> list[sqlite3.Row]:
     conn = sqlite3.connect(db_uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(providers)")
+        }
+        selected = ["id", "name", "settings_config"]
+        selected.extend(
+            column for column in ("meta", "provider_type") if column in columns
+        )
         return conn.execute(
-            "SELECT id, name, settings_config FROM providers "
+            f"SELECT {', '.join(selected)} FROM providers "
             "WHERE app_type='claude' ORDER BY sort_index"
         ).fetchall()
     finally:
         conn.close()
 
 
+def _provider_from_row(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "settings_config": row["settings_config"],
+        "meta": row["meta"] if "meta" in keys else "{}",
+        "provider_type": row["provider_type"] if "provider_type" in keys else None,
+    }
+
+
+def selected_provider_api_format(provider: dict) -> str:
+    try:
+        settings = json.loads(provider.get("settings_config") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        settings = {}
+    try:
+        meta = json.loads(provider.get("meta") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    return provider_api_format(
+        meta=meta,
+        settings=settings,
+        provider_type=provider.get("provider_type"),
+    )
+
+
 def list_providers() -> list[dict]:
     rows = db_claude_rows()
-    by_name = {
-        r["name"]: {"id": r["id"], "name": r["name"], "settings_config": r["settings_config"]}
-        for r in rows
-    }
+    by_name = {r["name"]: _provider_from_row(r) for r in rows}
     cfg = load_config()
     changed = sync_config(cfg, list(by_name.keys()))
     changed |= migrate_hidden(cfg)
@@ -649,6 +685,200 @@ def choose(providers: list[dict], hint: str | None) -> dict:
         names = "、".join(str(p["name"]) for p in matches)
         raise RuntimeError(f"名称或别名 '{choice}' 存在冲突: {names}")
     raise RuntimeError("无效选择，已取消")
+
+
+# ---------------------------------------------------------------------------
+# Claude-Hub 内置工作区数据模型
+#
+# 之前 hub 只是一堆配置字典即席画在屏幕上。这里把它固化成三个明确类型，
+# 供 Claude1 主界面的 Hub 入口与二级工作区共用；均为只读快照，不改配置、
+# 不启动进程。
+# ---------------------------------------------------------------------------
+
+# hub 配置只存 provider + 模型串，界面上的“类型”只能从模型名推导。
+_HUB_FAMILY_RULES: tuple[tuple[str, str], ...] = (
+    ("claude", "Claude"),
+    ("glm", "GLM"),
+    ("grok", "Grok"),
+    ("kimi", "Kimi"),
+    ("deepseek", "DeepSeek"),
+    ("mimo", "MiMo"),
+    ("codex", "GPT / Codex"),
+    ("gpt", "GPT / Codex"),
+)
+# 类型 → curses 调色板(C) 的键名，纯展示用途。
+_HUB_FAMILY_COLOR = {
+    "Claude": "orange",
+    "GPT / Codex": "teal",
+    "GLM": "accent",
+    "Grok": "violet",
+    "Kimi": "violet",
+    "DeepSeek": "violet",
+    "MiMo": "violet",
+    "其他": "violet",
+}
+
+
+def _hub_model_family(model: str) -> str:
+    """Derive the display family (Claude / GPT / GLM / …) from a model name."""
+    lowered = model.casefold()
+    for needle, family in _HUB_FAMILY_RULES:
+        if needle in lowered:
+            return family
+    return "其他"
+
+
+@dataclass(frozen=True)
+class HubModelOption:
+    """One selectable (channel, model) row inside the Hub workspace."""
+
+    family: str
+    channel: str
+    model: str
+    is_default: bool
+    via_proxy: bool
+    is_1m: bool
+
+    @property
+    def selector(self) -> str:
+        """The `渠道,模型` string consumed by `exec_hub --model`."""
+        return f"{self.channel},{self.model}"
+
+    @property
+    def status_label(self) -> str:
+        if self.is_default:
+            return "默认"
+        if self.is_1m:
+            return "1M"
+        if self.via_proxy:
+            return "代理"
+        return "可用"
+
+
+@dataclass(frozen=True)
+class HubChannel:
+    """One configured hub channel (alias → provider + models)."""
+
+    alias: str
+    provider: str
+    models: tuple[str, ...]
+    via_proxy: bool
+
+
+@dataclass(frozen=True)
+class HubStatus:
+    """A read-only snapshot of the hub for the launcher UI."""
+
+    port: int
+    default_channel: str
+    default_model: str
+    channel_count: int
+    model_count: int
+    healthy: bool | None = None
+
+    @property
+    def summary(self) -> str:
+        """Main-screen one-liner: `N 渠道 · M 模型`."""
+        return f"{self.channel_count} 渠道 · {self.model_count} 模型"
+
+
+@dataclass(frozen=True)
+class HubLaunch:
+    """Launcher result signalling the user picked a hub model to start."""
+
+    option: HubModelOption
+
+
+def build_hub_channels(hub_cfg: dict) -> list[HubChannel]:
+    """Parse the raw hub config into channels, skipping malformed entries."""
+    channels_raw = hub_cfg.get("channels")
+    if not isinstance(channels_raw, dict) or not channels_raw:
+        raise ValueError("hub 配置缺少 channels")
+    channels: list[HubChannel] = []
+    for alias, channel_raw in channels_raw.items():
+        if not isinstance(alias, str) or not alias.strip():
+            continue
+        if not isinstance(channel_raw, dict):
+            continue
+        models = tuple(
+            model.strip()
+            for model in channel_raw.get("models", [])
+            if isinstance(model, str) and model.strip()
+        )
+        if not models:
+            continue
+        proxy = channel_raw.get("proxy")
+        channels.append(
+            HubChannel(
+                alias=alias,
+                provider=str(channel_raw.get("provider", "")),
+                models=models,
+                via_proxy=bool(isinstance(proxy, str) and proxy.strip()),
+            )
+        )
+    if not channels:
+        raise ValueError("hub 配置没有可用的渠道模型")
+    return channels
+
+
+def build_hub_view(hub_cfg: dict) -> tuple[HubStatus, list[HubModelOption]]:
+    """Turn a raw hub config dict into a status snapshot + ordered options.
+
+    The default model is listed first; remaining models follow in channel then
+    model order. Families/statuses are derived, never read from config.
+    """
+    channels = build_hub_channels(hub_cfg)
+    by_alias = {channel.alias: channel for channel in channels}
+    requested_default = hub_cfg.get("default_channel")
+    default_alias = (
+        requested_default if requested_default in by_alias else channels[0].alias
+    )
+    default_model = by_alias[default_alias].models[0]
+
+    def make_option(channel: HubChannel, model: str) -> HubModelOption:
+        return HubModelOption(
+            family=_hub_model_family(model),
+            channel=channel.alias,
+            model=model,
+            is_default=(channel.alias == default_alias and model == default_model),
+            via_proxy=channel.via_proxy,
+            is_1m="[1m]" in model.casefold(),
+        )
+
+    ordered: list[HubModelOption] = [
+        make_option(by_alias[default_alias], default_model)
+    ]
+    for channel in channels:
+        for model in channel.models:
+            if channel.alias == default_alias and model == default_model:
+                continue
+            ordered.append(make_option(channel, model))
+
+    status = HubStatus(
+        port=_hub_port(hub_cfg),
+        default_channel=default_alias,
+        default_model=default_model,
+        channel_count=len(channels),
+        model_count=sum(len(channel.models) for channel in channels),
+    )
+    return status, ordered
+
+
+def _load_hub_view() -> tuple[HubStatus, list[HubModelOption]] | None:
+    """Read HUB_CONFIG for the launcher; return None when hub is unavailable.
+
+    A missing/invalid config (or missing uv) must never break plain provider
+    selection, so any failure degrades silently to “no hub entry”.
+    """
+    if not HUB_CONFIG.is_file():
+        return None
+    try:
+        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(hub_cfg, dict):
+            return None
+        return build_hub_view(hub_cfg)
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1347,8 @@ def _draw_launcher(
     notice: str | None = None,
     logo_phase: int = 0,
     logo_breathing: bool = False,
+    hub_status: "HubStatus | None" = None,
+    hub_focus: bool = False,
 ) -> None:
     meta = cfg["providers"]
     win.erase()
@@ -1151,9 +1383,39 @@ def _draw_launcher(
             C.get("dim", 0),
         )
     guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
+    if hub_status is not None and not notice:
+        guide = "↑↓ / jk 移动 · Enter 进入 Hub / 启动渠道 · 数字直达渠道"
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
     _addstr(win, head + 2, 2, guide, guide_attr)
-    list_top = head + 4
+    row_cursor = head + 4
+    if hub_status is not None:
+        _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
+        row_cursor += 1
+        entry = (
+            f"◆ Claude-Hub · 多渠道会话 · {hub_status.summary}"
+            " · 会话内 /model 切换"
+        )
+        entry_width = max(0, w - 4)
+        if hub_focus:
+            _addstr(
+                win,
+                row_cursor,
+                2,
+                _pad_display(entry, entry_width),
+                C.get("sel", curses.A_REVERSE),
+            )
+        else:
+            _addstr(
+                win,
+                row_cursor,
+                2,
+                _truncate_display(entry, entry_width),
+                C.get("orange", 0) | curses.A_BOLD,
+            )
+        row_cursor += 2
+        _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
+        row_cursor += 1
+    list_top = row_cursor
     footer_row = max(0, h - 1)
     capacity = max(0, footer_row - list_top)
     start, end = _visible_window(len(view), idx, capacity)
@@ -1167,7 +1429,7 @@ def _draw_launcher(
         m = meta[name]
         hidden = m.get("hidden")
         rank = i + 1
-        selected = i == idx
+        selected = (not hub_focus) and (i == idx)
         marker = "▸" if selected else " "
         label = f"{marker} {rank:>2}  {name}"
         status: list[str] = []
@@ -1211,6 +1473,116 @@ def _draw_launcher(
     win.refresh()
 
 
+def _hub_columns(width: int) -> tuple[int, int, int, int]:
+    """Fixed column widths for 类型 / 渠道 / 模型 / 状态; model takes the slack."""
+    usable = max(0, width - 4)
+    family = 14
+    channel = 10
+    status = 8
+    model = max(6, usable - family - channel - status - 3)
+    return (family, channel, model, status)
+
+
+def _hub_row_text(values: tuple[str, str, str, str], cols: tuple[int, int, int, int]) -> str:
+    return " ".join(_pad_display(value, width) for value, width in zip(values, cols))
+
+
+def _draw_hub_workspace(
+    win,
+    status: "HubStatus",
+    options: list["HubModelOption"],
+    idx: int,
+) -> None:
+    """Render the second-level Hub model picker (类型 / 渠道 / 模型 / 状态)."""
+    win.erase()
+    h, w = win.getmaxyx()
+    _addstr(win, 0, 2, "Claude1  ›  Claude-Hub", C.get("dim", 0))
+    _addstr(win, 1, 2, "选择 Hub 模型", C.get("lime", 0) | curses.A_BOLD)
+    if status.healthy is True:
+        badge, badge_attr = "● 已就绪", C.get("lime", 0) | curses.A_BOLD
+    elif status.healthy is False:
+        badge, badge_attr = "● 未就绪（选择后自动拉起）", C.get("warning", 0)
+    else:
+        badge, badge_attr = "● 探测中…", C.get("dim", 0)
+    _addstr(win, 2, 2, badge, badge_attr)
+    meta = (
+        f"127.0.0.1:{status.port} · {status.channel_count} 渠道"
+        f" · {status.model_count} 模型 · 默认 {status.default_channel}"
+    )
+    _addstr(win, 2, 4 + _dwidth(badge), meta, C.get("dim", 0))
+
+    cols = _hub_columns(w)
+    header = _hub_row_text(("  类型", "渠道", "模型", "状态"), cols)
+    _addstr(win, 4, 2, header, C.get("dim", 0))
+    list_top = 5
+    footer_row = max(0, h - 1)
+    capacity = max(0, footer_row - list_top)
+    start, end = _visible_window(len(options), idx, capacity)
+    for offset, i in enumerate(range(start, end)):
+        option = options[i]
+        marker = "▸" if i == idx else " "
+        text = _hub_row_text(
+            (
+                f"{marker} {option.family}",
+                option.channel,
+                option.model,
+                option.status_label,
+            ),
+            cols,
+        )
+        row = list_top + offset
+        if i == idx:
+            _addstr(
+                win,
+                row,
+                2,
+                _pad_display(text, max(0, w - 4)),
+                C.get("sel", curses.A_REVERSE),
+            )
+        else:
+            family_color = _HUB_FAMILY_COLOR.get(option.family, "violet")
+            _addstr(win, row, 2, text, C.get(family_color, 0) | curses.A_BOLD)
+    foot = "Esc 返回 Claude1 · ↑↓ / jk 选择 · Enter 启动 · q 退出"
+    _addstr(win, footer_row, 2, foot, C.get("dim", 0))
+    win.refresh()
+
+
+def _hub_workspace(
+    win,
+    status: "HubStatus",
+    options: list["HubModelOption"],
+) -> tuple[str, "HubModelOption | None"]:
+    """Run the Hub model picker loop.
+
+    Returns (outcome, option) where outcome is:
+      "launch" — start the returned option through the hub,
+      "back"   — Esc, return to the Claude1 home screen,
+      "quit"   — q or terminal EOF, exit the launcher entirely.
+    """
+    idx = 0
+    # Draw once while probing so a down hub does not freeze the screen silently.
+    _draw_hub_workspace(win, status, options, idx)
+    status = replace(status, healthy=hub_healthy(status.port))
+    _draw_hub_workspace(win, status, options, idx)
+    while True:
+        ch = win.getch()
+        if ch == -1:
+            return ("quit", None)
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(options)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(options)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return ("launch", options[idx])
+        elif ch == 27:
+            return ("back", None)
+        elif ch == ord("q"):
+            return ("quit", None)
+        else:
+            continue
+        _draw_hub_workspace(win, status, options, idx)
+
+
 def _launcher_main(win, cfg, db_names):
     """返回要启动的 provider 名，或 None(退出不启动)。hide/alias 即时落盘。"""
     _safe_curs_set(0)
@@ -1226,6 +1598,9 @@ def _launcher_main(win, cfg, db_names):
     show_hidden = False
     view = _build_view(cfg, db_names, mru, show_hidden)
     idx = _initial_index(view, mru)
+    hub_view = _load_hub_view()
+    hub_status, hub_options = hub_view if hub_view is not None else (None, [])
+    hub_focus = hub_view is not None
     help_open = False
     notice: str | None = None
     rows, cols = win.getmaxyx()
@@ -1242,6 +1617,8 @@ def _launcher_main(win, cfg, db_names):
         show_hidden,
         mru,
         show_brand=True,
+        hub_status=hub_status,
+        hub_focus=hub_focus,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -1256,18 +1633,31 @@ def _launcher_main(win, cfg, db_names):
                 return view[direct_index]
             notice = f"没有第 {direct_index + 1} 个渠道"
         if ch in (curses.KEY_UP, ord("k")):
-            if view:
+            if hub_focus:
+                pass
+            elif hub_status is not None:
+                if idx <= 0:
+                    hub_focus = True
+                else:
+                    idx -= 1
+            elif view:
                 idx = (idx - 1) % len(view)
         elif ch in (curses.KEY_DOWN, ord("j")):
-            if view:
+            if hub_focus:
+                hub_focus = False
+                idx = 0
+            elif hub_status is not None:
+                if view and idx < len(view) - 1:
+                    idx += 1
+            elif view:
                 idx = (idx + 1) % len(view)
         elif ch == ord("a"):
-            if view:
+            if not hub_focus and view:
                 changed, notice = _edit_alias(win, view[idx], meta)
                 if changed:
                     save_config(cfg)
         elif ch == ord("x"):
-            if view:
+            if not hub_focus and view:
                 name = view[idx]
                 nowh = meta[name].get("hidden")
                 verb = "恢复显示" if nowh else "隐藏"
@@ -1286,7 +1676,14 @@ def _launcher_main(win, cfg, db_names):
         elif ch == ord("?"):
             help_open = not help_open
         elif ch in (10, 13, curses.KEY_ENTER):
-            if view:
+            if hub_focus and hub_status is not None:
+                outcome, option = _hub_workspace(win, hub_status, hub_options)
+                if outcome == "launch" and option is not None:
+                    return HubLaunch(option)
+                if outcome == "quit":
+                    return None
+                # "back": stay on the home screen and redraw below.
+            elif view:
                 return view[idx]
         elif ch in (27, ord("q")):
             return None
@@ -1301,6 +1698,8 @@ def _launcher_main(win, cfg, db_names):
             show_brand=True,
             help_open=help_open,
             notice=notice,
+            hub_status=hub_status,
+            hub_focus=hub_focus,
         )
 
 
@@ -1331,11 +1730,15 @@ def run_tui_launcher():
     if not _tui_size_supported(terminal.lines, terminal.columns):
         return ("no-tui", None)
     try:
-        name = curses.wrapper(_launcher_session, cfg, db_names)
+        result = curses.wrapper(_launcher_session, cfg, db_names)
     except Exception as exc:
         print(f"[claude1] 图形界面无法启动({exc})", file=sys.stderr)
         return ("no-tui", None)
-    return ("launch", name) if name else ("quit", None)
+    if result is None:
+        return ("quit", None)
+    if isinstance(result, HubLaunch):
+        return ("hub", result.option.selector)
+    return ("launch", result)
 
 
 def record_backend(kind: str, provider: str | None = None) -> None:
@@ -1485,6 +1888,142 @@ def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _provider_models(settings: dict) -> list[str]:
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    names: list[str] = []
+    for key in (
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        value = env.get(key)
+        if isinstance(value, str) and value and value not in names:
+            names.append(value)
+    return names or ["claude1-provider-model"]
+
+
+def _bridge_child_env(
+    *, config: Path, log: Path, port: int, local_token: str
+) -> dict[str, str]:
+    child = {
+        "HOME": str(HOME),
+        "PATH": os.environ.get("PATH", os.defpath),
+        "CLAUDE_HUB_CONFIG": str(config),
+        "CLAUDE_HUB_DB": str(DB_PATH),
+        "CLAUDE_HUB_LOG": str(log),
+        "CLAUDE_HUB_PORT": str(port),
+        "CLAUDE_HUB_LOCAL_TOKEN": local_token,
+    }
+    for key in ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"):
+        value = os.environ.get(key)
+        if value:
+            child[key] = value
+    return child
+
+
+def launch_with_protocol_bridge(
+    provider: dict,
+    settings: dict,
+    api_format: str,
+    claude_args: list[str],
+) -> int:
+    """Run one isolated Hub for a non-Anthropic provider, then remove it.
+
+    This preserves claude1's session-isolation contract: the CC Switch current
+    provider and its shared proxy are never changed, so concurrent sessions can
+    select different wire formats safely.
+    """
+    if not HUB_SCRIPT.is_file():
+        raise RuntimeError(
+            f"{api_format} 渠道需要协议桥，但 Hub 脚本不存在: {HUB_SCRIPT}"
+        )
+    if TEMP_DIR is not None:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="claude1-bridge-",
+        dir=str(TEMP_DIR) if TEMP_DIR is not None else None,
+    ) as raw_dir:
+        runtime = Path(raw_dir)
+        config_path = runtime / "hub.json"
+        log_path = runtime / "hub.log"
+        port = _free_loopback_port()
+        local_token = secrets.token_urlsafe(32)
+        config = {
+            "version": 1,
+            "port": port,
+            "local_token_env": "CLAUDE_HUB_LOCAL_TOKEN",
+            "default_channel": "direct",
+            "channels": {
+                "direct": {
+                    "provider": provider["name"],
+                    "api_format": api_format,
+                    "models": _provider_models(settings),
+                }
+            },
+        }
+        _atomic_private_write(
+            config_path,
+            json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+        )
+
+        with _open_private_append(log_path) as log:
+            process = subprocess.Popen(
+                [str(HUB_SCRIPT), "serve"],
+                stdout=log,
+                stderr=log,
+                env=_bridge_child_env(
+                    config=config_path,
+                    log=log_path,
+                    port=port,
+                    local_token=local_token,
+                ),
+                close_fds=True,
+                start_new_session=True,
+            )
+        try:
+            deadline = time.monotonic() + _hub_start_timeout()
+            while time.monotonic() < deadline:
+                if hub_healthy(port):
+                    break
+                return_code = process.poll()
+                if return_code is not None:
+                    raise RuntimeError(
+                        f"协议桥提前退出（状态 {return_code}），日志: {log_path}"
+                    )
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            else:
+                raise RuntimeError(f"协议桥启动超时，日志: {log_path}")
+
+            bridged = json.loads(json.dumps(settings))
+            env = bridged.setdefault("env", {})
+            env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+            env["ANTHROPIC_AUTH_TOKEN"] = local_token
+            env.pop("ANTHROPIC_API_KEY", None)
+            env["NO_PROXY"] = "127.0.0.1,localhost"
+            env["no_proxy"] = "127.0.0.1,localhost"
+            print(
+                f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
+                f"(隔离端口 {port})"
+            )
+            return launch_with_settings(bridged, claude_args)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
 
 
 def _extract_hub_model(claude_args: list[str]) -> tuple[str | None, list[str]]:
@@ -1752,7 +2291,7 @@ def main(argv: list[str]) -> int:
             return 1
         selected = choose(providers, hint)
     else:
-        action, name = run_tui_launcher()
+        action, payload = run_tui_launcher()
         if action == "no-tui":
             providers = list_providers()
             if not providers:
@@ -1762,18 +2301,28 @@ def main(argv: list[str]) -> int:
         elif action == "quit":
             print("Bye，欢迎下次使用 claude1。")
             return 0
+        elif action == "hub":
+            return exec_hub(["--model", payload, *claude_args])
         else:
-            selected = provider_by_name(name)
+            selected = provider_by_name(payload)
             if selected is None:
-                print(f"[claude1] 找不到 provider: {name}", file=sys.stderr)
+                print(f"[claude1] 找不到 provider: {payload}", file=sys.stderr)
                 return 1
 
     settings = build_settings(selected)
     add_anyrouter_observer(settings, selected["name"])
-    ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
     record_use(selected["name"])
     record_backend("provider", selected["name"])
     print(f"[claude1] 本次使用 provider: {selected['name']}")
+    api_format = selected_provider_api_format(selected)
+    if api_format != "anthropic":
+        return launch_with_protocol_bridge(
+            selected,
+            settings,
+            api_format,
+            claude_args,
+        )
+    ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
     return launch_with_settings(settings, claude_args)
 
 
