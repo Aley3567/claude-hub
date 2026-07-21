@@ -30,7 +30,7 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 测试覆盖临时 HOME、fixture DB、fake Claude、fake upstream、严格健康契约、鉴权、
 模型发现、请求透传、流式终态、CR/LF/CRLF、UTF-8 BOM、gzip/x-gzip/deflate、
 截断与损坏压缩流、文件权限、符号链接和 FIFO 拒绝，以及 Logo 渐进开场、
-呼吸周期不进入 `A_DIM`、开场后紧凑静态等待、退出清屏和终端 EOF 快速退出。
+呼吸周期不进入 `A_DIM`、开场后保留静态 Logo、退出清屏和终端 EOF 快速退出。
 SSE 终态追踪器另以 5 万组
 随机字段、换行和分块边界与参考实现比对，无差异。
 
@@ -41,9 +41,10 @@ SSE 终态追踪器另以 5 万组
 - 安装后的三份文件与仓库逐字一致，模式为 `0755 / 0755 / 0644`；
 - zsh 中只有一条 managed source，未接入可选 sticky integration；
 - 真实 256 色 PTY 中，纯 Logo 绘制为 `53.6µs/帧`；动画只存在于最长
-  `240ms` 的开场。进入紧凑选择器后立即使用阻塞读键，不再运行定时刷新；
+  `240ms` 的开场。Logo 在选择页静态保留，选择器立即使用阻塞读键，不再运行
+  定时刷新；
 - 最新仓库版本在隔离 PTY 中完成一次开场、静置和退出：静置 `800ms` 输出
-  `0 bytes`，整个进程累计 CPU `54.8ms`，按 `q` 后退出码为 `0` 且只留下
+  `0 bytes`，整个进程累计 CPU `57.2ms`，按 `q` 后退出码为 `0` 且只留下
   `Bye，欢迎下次使用 claude1。`；
 - live Hub 只有一个 `127.0.0.1` 监听者，健康契约、鉴权和模型发现通过；
 - 通过安装后的 launcher、live Hub 和 fake Claude 完成端到端启动，临时 settings

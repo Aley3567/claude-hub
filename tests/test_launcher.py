@@ -248,7 +248,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 )
                 self.assertLessEqual(max(y for y, _x, _text in window.writes), 23)
 
-    def test_compact_launcher_replaces_logo_with_welcome_line(self) -> None:
+    def test_branded_launcher_keeps_logo_visible_during_selection(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
                 self.writes: list[tuple[int, int, str]] = []
@@ -277,6 +277,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     "base": 0,
                     "sel": 0,
                 }
+                launcher._logo_pairs[:] = [0]
                 launcher._row_pairs[:] = [0]
                 window = FakeWindow()
 
@@ -287,16 +288,16 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     0,
                     False,
                     {},
-                    show_brand=False,
+                    show_brand=True,
                 )
 
                 rendered = "\n".join(text for _y, _x, text in window.writes)
-                self.assertIn("欢迎使用 claude1", rendered)
-                self.assertFalse(
-                    any("████" in text for _y, _x, text in window.writes)
+                self.assertIn("欢迎回来", rendered)
+                self.assertTrue(
+                    any(text == "█" for _y, _x, text in window.writes)
                 )
                 self.assertTrue(
-                    any(y == 5 and "Alpha" in text for y, _x, text in window.writes)
+                    any(y == 12 and "Alpha" in text for y, _x, text in window.writes)
                 )
 
     def test_cjk_clipping_never_exceeds_requested_width(self) -> None:
@@ -407,7 +408,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertEqual(selected, "Beta")
                 self.assertEqual(window.timeouts, [-1])
 
-    def test_intro_is_followed_by_static_compact_launcher(self) -> None:
+    def test_intro_is_followed_by_static_branded_launcher(self) -> None:
         class FakeWindow:
             def __init__(self) -> None:
                 self.timeouts: list[int] = []
@@ -447,7 +448,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertTrue(draw_launcher.call_args_list)
                 self.assertTrue(
                     all(
-                        call.kwargs.get("show_brand") is False
+                        call.kwargs.get("show_brand") is True
                         for call in draw_launcher.call_args_list
                     )
                 )
