@@ -667,6 +667,12 @@ LOGO = [
     " ╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗ ██║",
     "  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝ ╚═╝",
 ]
+_LOGO_CELLS = [
+    (row, column, char)
+    for row, line in enumerate(LOGO)
+    for column, char in enumerate(line)
+    if char != " "
+]
 
 _HEADER_H = len(LOGO) + 6
 _LOGO_TOP = 2
@@ -675,6 +681,12 @@ _MIN_TUI_ROWS = 8
 _MIN_TUI_COLS = 32
 INTRO_DURATION_SECONDS = 0.24
 INTRO_FRAME_SECONDS = 0.016
+INTRO_FLOW_STEP_SECONDS = 0.04
+# About 6fps while the chooser is active; after 15s it blocks with zero wakeups.
+ANIMATION_FRAME_MS = 160
+ANIMATION_IDLE_SECONDS = 15.0
+ANIMATION_PHASE_PERIOD = 240
+LOGO_BREATH_LEVELS = (-1, -1, 0, 0, 1, 1, 1, 1, 0, 0, -1, -1)
 C: dict = {}
 
 # Logo and provider rows share a vivid full-spectrum identity.
@@ -875,19 +887,35 @@ def _animation_enabled() -> bool:
     return disabled not in {"1", "true", "yes", "on"}
 
 
-def _draw_logo(win, phase: int) -> None:
-    """Draw the final static brand logo."""
+def _logo_intensity(phase: int, breathing: bool) -> int:
+    if not breathing:
+        return curses.A_BOLD
+    level = LOGO_BREATH_LEVELS[phase % len(LOGO_BREATH_LEVELS)]
+    if level < 0:
+        return curses.A_DIM
+    if level > 0:
+        return curses.A_BOLD
+    return 0
+
+
+def _draw_logo(win, phase: int, *, breathing: bool = False) -> None:
+    """Flow the logo palette and optionally pulse its brightness."""
     n = len(_logo_pairs) or 1
     h, w = win.getmaxyx()
+    intensity = _logo_intensity(phase, breathing)
     if _large_logo_supported(h, w):
-        for r, line in enumerate(LOGO):
-            for x, chx in enumerate(line):
-                if chx == " ":
-                    continue
-                attr = _logo_pairs[(x + r + phase) % n] | curses.A_BOLD
-                _addstr(win, _LOGO_TOP + r, 2 + x, chx, attr)
+        limit = w - 1
+        for row, column, char in _LOGO_CELLS:
+            x = 2 + column
+            if x >= limit:
+                continue
+            attr = _logo_pairs[(column + row + phase) % n] | intensity
+            try:
+                win.addstr(_LOGO_TOP + row, x, char, attr)
+            except curses.error:
+                pass
     else:
-        _addstr(win, 0, 2, "◤ claude1 ◢", (_logo_pairs[phase % n]) | curses.A_BOLD)
+        _addstr(win, 0, 2, "◤ claude1 ◢", _logo_pairs[phase % n] | intensity)
 
 
 def _intro(win) -> int | None:
@@ -905,6 +933,7 @@ def _intro(win) -> int | None:
             if elapsed >= INTRO_DURATION_SECONDS:
                 return None
             progress = min(1.0, elapsed / INTRO_DURATION_SECONDS)
+            phase = int(elapsed / INTRO_FLOW_STEP_SECONDS)
             typed = min(
                 len("欢迎回来"),
                 max(1, int((elapsed / 0.12) * len("欢迎回来"))),
@@ -914,7 +943,7 @@ def _intro(win) -> int | None:
                 0,
                 2,
                 _pad_display("欢迎回来"[:typed], _dwidth("欢迎回来")),
-                curses.A_BOLD,
+                C.get("pink", 0) | curses.A_BOLD,
             )
             col = max(1, int(width * progress))
             for r, line in enumerate(LOGO):
@@ -922,7 +951,12 @@ def _intro(win) -> int | None:
                     chx = line[x]
                     if chx == " ":
                         continue
-                    attr = _logo_pairs[(x + r) % n] | curses.A_BOLD
+                    attr = (
+                        _logo_pairs[(x + r + phase) % n]
+                        | _logo_intensity(phase, True)
+                    )
+                    if x >= col - 2:
+                        attr |= curses.A_REVERSE | curses.A_BOLD
                     _addstr(win, _LOGO_TOP + r, 2 + x, chx, attr)
             win.refresh()
             key = win.getch()
@@ -1081,6 +1115,8 @@ def _draw_launcher(
     show_brand: bool = True,
     help_open: bool = False,
     notice: str | None = None,
+    logo_phase: int = 0,
+    logo_breathing: bool = False,
 ) -> None:
     meta = cfg["providers"]
     win.erase()
@@ -1090,11 +1126,11 @@ def _draw_launcher(
     if big:
         if show_brand:
             _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
-            _draw_logo(win, 0)
+            _draw_logo(win, logo_phase, breathing=logo_breathing)
         head = _LOGO_TOP + len(LOGO)
     else:
         if show_brand:
-            _draw_logo(win, 0)
+            _draw_logo(win, logo_phase, breathing=logo_breathing)
         head = 1
 
     heading = "选择本次渠道"
@@ -1186,7 +1222,8 @@ def _launcher_main(win, cfg, db_names):
     help_open = False
     notice: str | None = None
     rows, cols = win.getmaxyx()
-    animate = _animation_enabled() and _large_logo_supported(rows, cols)
+    intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
+    animate = intro_animate and len(_logo_pairs) > 1
     _draw_launcher(
         win,
         cfg,
@@ -1194,14 +1231,45 @@ def _launcher_main(win, cfg, db_names):
         idx,
         show_hidden,
         mru,
-        show_brand=not animate,
+        show_brand=not intro_animate,
     )
-    pending_key = _intro(win) if animate else None
-    win.timeout(-1)
-    _draw_launcher(win, cfg, view, idx, show_hidden, mru)
+    pending_key = _intro(win) if intro_animate else None
+    phase = 0
+    paused = not animate
+    last_active = time.monotonic()
+    win.timeout(ANIMATION_FRAME_MS if animate else -1)
+    _draw_launcher(
+        win,
+        cfg,
+        view,
+        idx,
+        show_hidden,
+        mru,
+        logo_phase=phase,
+        logo_breathing=animate,
+    )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
         pending_key = None
+        if ch == -1:
+            if not animate:
+                win.timeout(-1)
+                continue
+            if (time.monotonic() - last_active) >= ANIMATION_IDLE_SECONDS:
+                _draw_logo(win, phase, breathing=False)
+                win.refresh()
+                win.timeout(-1)
+                paused = True
+                continue
+            phase = (phase + 1) % ANIMATION_PHASE_PERIOD
+            _draw_logo(win, phase, breathing=True)
+            win.refresh()
+            continue
+
+        last_active = time.monotonic()
+        if paused and animate:
+            win.timeout(ANIMATION_FRAME_MS)
+            paused = False
         notice = None
         direct_index = _digit_index(ch)
         if direct_index is not None:
@@ -1216,7 +1284,14 @@ def _launcher_main(win, cfg, db_names):
                 idx = (idx + 1) % len(view)
         elif ch == ord("a"):
             if view:
-                changed, notice = _edit_alias(win, view[idx], meta)
+                if animate:
+                    win.timeout(-1)
+                try:
+                    changed, notice = _edit_alias(win, view[idx], meta)
+                finally:
+                    if animate:
+                        last_active = time.monotonic()
+                        win.timeout(ANIMATION_FRAME_MS)
                 if changed:
                     save_config(cfg)
         elif ch == ord("x"):
@@ -1224,7 +1299,14 @@ def _launcher_main(win, cfg, db_names):
                 name = view[idx]
                 nowh = meta[name].get("hidden")
                 verb = "恢复显示" if nowh else "隐藏"
-                ok = _confirm(win, f"{verb} {name}?")
+                if animate:
+                    win.timeout(-1)
+                try:
+                    ok = _confirm(win, f"{verb} {name}?")
+                finally:
+                    if animate:
+                        last_active = time.monotonic()
+                        win.timeout(ANIMATION_FRAME_MS)
                 if ok:
                     meta[name]["hidden"] = not nowh
                     save_config(cfg)
@@ -1253,6 +1335,8 @@ def _launcher_main(win, cfg, db_names):
             mru,
             help_open=help_open,
             notice=notice,
+            logo_phase=phase,
+            logo_breathing=animate,
         )
 
 
