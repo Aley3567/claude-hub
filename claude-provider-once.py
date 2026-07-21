@@ -1231,8 +1231,8 @@ def _launcher_main(win, cfg, db_names):
     rows, cols = win.getmaxyx()
     intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
     pending_key = _intro(win) if intro_animate else None
-    # The logo is a finite entrance, not a background task. Once it finishes,
-    # erase it and block indefinitely for input with zero timer wakeups.
+    # The logo motion is a finite entrance, not a background task. Keep the
+    # finished logo visible while blocking indefinitely with zero timer wakeups.
     win.timeout(-1)
     _draw_launcher(
         win,
@@ -1241,7 +1241,7 @@ def _launcher_main(win, cfg, db_names):
         idx,
         show_hidden,
         mru,
-        show_brand=False,
+        show_brand=True,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -1298,7 +1298,7 @@ def _launcher_main(win, cfg, db_names):
             idx,
             show_hidden,
             mru,
-            show_brand=False,
+            show_brand=True,
             help_open=help_open,
             notice=notice,
         )
