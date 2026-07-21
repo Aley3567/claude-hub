@@ -20,7 +20,7 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 
 ## 自动化验证
 
-- Python：82 个测试通过；
+- Python：83 个测试通过；
 - zsh 集成：8 个测试通过；
 - 安装器：4 个测试通过；
 - Python 编译、sh/zsh 语法和 `git diff --check` 通过；
@@ -30,7 +30,8 @@ ReClaude，也不会改变 CC Switch 当前渠道。
 测试覆盖临时 HOME、fixture DB、fake Claude、fake upstream、严格健康契约、鉴权、
 模型发现、请求透传、流式终态、CR/LF/CRLF、UTF-8 BOM、gzip/x-gzip/deflate、
 截断与损坏压缩流、文件权限、符号链接和 FIFO 拒绝，以及 Logo 按真实时间
-推进、15 秒后进入零唤醒休眠、终端 EOF 后快速退出。SSE 终态追踪器另以 5 万组
+推进、呼吸周期不进入 `A_DIM`、15 秒后进入零唤醒休眠、终端 EOF 后快速退出。
+SSE 终态追踪器另以 5 万组
 随机字段、换行和分块边界与参考实现比对，无差异。
 
 ## 隔离与真实运行验证
