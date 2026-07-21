@@ -677,11 +677,14 @@ INTRO_DURATION_SECONDS = 0.24
 INTRO_FRAME_SECONDS = 0.016
 C: dict = {}
 
-# Logo is the one branded visual variable. The provider list stays restrained.
+# Logo and provider rows share a vivid full-spectrum identity.
 LOGO_GRAD = [
-    51, 45, 39, 63, 99, 135, 171, 207, 201, 199, 205, 141, 99, 75, 45, 51
+    196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46, 48,
+    50, 51, 45, 39, 33, 63, 99, 135, 171, 207, 201, 199,
 ]
 _logo_pairs: list[int] = []
+RAINBOW = [203, 208, 214, 220, 148, 46, 42, 51, 45, 75, 99, 141, 207, 205]
+_row_pairs: list[int] = []
 
 
 def _addstr(win, y, x, text, attr=0) -> None:
@@ -770,14 +773,22 @@ def _init_colors() -> dict:
         "warning": 0,
         "brand": 0,
         "sel": curses.A_REVERSE,
+        "orange": 0,
+        "pink": 0,
+        "lime": 0,
+        "gold": 0,
+        "teal": 0,
+        "violet": 0,
     }
     _logo_pairs.clear()
+    _row_pairs.clear()
     try:
         has_colors = curses.has_colors()
     except curses.error:
         has_colors = False
     if not has_colors:
         _logo_pairs.append(0)
+        _row_pairs.extend([d["base"], d["accent"], d["brand"], d["warning"]])
         return d
     try:
         curses.start_color()
@@ -810,6 +821,33 @@ def _init_colors() -> dict:
     )
 
     has256 = getattr(curses, "COLORS", 0) >= 256
+
+    # Named vivid accents with safe basic-color fallbacks.
+    d["orange"] = _pair(60, 208, d["warning"]) if has256 else d["warning"]
+    d["pink"] = _pair(61, 205, d["brand"]) if has256 else d["brand"]
+    d["lime"] = _pair(62, 118, d["base"]) if has256 else d["base"]
+    d["gold"] = _pair(63, 220, d["warning"]) if has256 else d["warning"]
+    d["teal"] = _pair(64, 44, d["accent"]) if has256 else d["accent"]
+    d["violet"] = _pair(65, 141, d["brand"]) if has256 else d["brand"]
+
+    # Selected row: bold black text on a vivid orange background.
+    if has256:
+        try:
+            curses.init_pair(66, 16, 208)
+            d["sel"] = curses.color_pair(66) | curses.A_BOLD
+        except curses.error:
+            pass
+
+    # Rotate provider rows through a full spectrum; basic terminals keep
+    # a compact four-color fallback.
+    if has256:
+        for i, cidx in enumerate(RAINBOW):
+            pair = _pair(40 + i, cidx, 0)
+            if pair:
+                _row_pairs.append(pair)
+    if not _row_pairs:
+        _row_pairs.extend([d["base"], d["accent"], d["brand"], d["warning"]])
+
     if has256:
         for i, cidx in enumerate(LOGO_GRAD):
             _logo_pairs.append(_pair(10 + i, cidx, d["brand"]))
@@ -1051,7 +1089,7 @@ def _draw_launcher(
 
     if big:
         if show_brand:
-            _addstr(win, 0, 2, "欢迎回来", curses.A_BOLD)
+            _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
             _draw_logo(win, 0)
         head = _LOGO_TOP + len(LOGO)
     else:
@@ -1060,7 +1098,7 @@ def _draw_launcher(
         head = 1
 
     heading = "选择本次渠道"
-    _addstr(win, head + 1, 2, heading, C.get("accent", 0))
+    _addstr(win, head + 1, 2, heading, C.get("lime", 0) | curses.A_BOLD)
     if show_hidden:
         _addstr(
             win,
@@ -1107,7 +1145,16 @@ def _draw_launcher(
                 C.get("sel", curses.A_REVERSE),
             )
         else:
-            attr = C.get("dim", 0) if hidden else C.get("base", 0)
+            row_attr = (
+                _row_pairs[i % len(_row_pairs)]
+                if _row_pairs
+                else C.get("base", 0)
+            )
+            attr = (
+                C.get("dim", 0)
+                if hidden
+                else row_attr | curses.A_BOLD
+            )
             _addstr(win, row, 2, line, attr)
 
     if help_open:
