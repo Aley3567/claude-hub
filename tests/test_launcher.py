@@ -378,7 +378,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                         "monotonic",
                         side_effect=[
                             0.0,
-                            1.0,
+                            (launcher.ANIMATION_FRAME_MS / 1000.0) * 1.1,
                             launcher.ANIMATION_IDLE_SECONDS + 1.0,
                             launcher.ANIMATION_IDLE_SECONDS + 1.1,
                         ],
@@ -398,6 +398,146 @@ class LauncherTuiLogicTests(unittest.TestCase):
                         mock.call(window, 1, breathing=False),
                     ],
                 )
+
+    def test_logo_flow_uses_elapsed_time_instead_of_counting_slow_frames(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.timeouts: list[int] = []
+                self.keys = iter([-1, ord("q")])
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def keypad(self, _value: bool) -> None:
+                return
+
+            def timeout(self, value: int) -> None:
+                self.timeouts.append(value)
+
+            def getch(self) -> int:
+                return next(self.keys)
+
+            def refresh(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                window = FakeWindow()
+                launcher._logo_pairs[:] = [1, 2]
+                delayed = (launcher.ANIMATION_FRAME_MS / 1000.0) * 4.5
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(
+                        launcher.time,
+                        "monotonic",
+                        side_effect=[0.0, delayed, delayed + 0.01],
+                    ),
+                ):
+                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
+
+                self.assertIsNone(selected)
+                draw_logo.assert_called_once_with(window, 4, breathing=True)
+
+    def test_disconnected_animation_exits_without_drawing_fast_empty_frames(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.getch_calls = 0
+                self.refresh_calls = 0
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def keypad(self, _value: bool) -> None:
+                return
+
+            def timeout(self, _value: int) -> None:
+                return
+
+            def getch(self) -> int:
+                self.getch_calls += 1
+                return -1
+
+            def refresh(self) -> None:
+                self.refresh_calls += 1
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                window = FakeWindow()
+                launcher._logo_pairs[:] = [1, 2]
+                clock = iter(i / 1000.0 for i in range(100))
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(
+                        launcher.time,
+                        "monotonic",
+                        side_effect=lambda: next(clock),
+                    ),
+                ):
+                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
+
+                self.assertIsNone(selected)
+                self.assertEqual(
+                    window.getch_calls, launcher.ANIMATION_DEAD_TTY_POLLS
+                )
+                self.assertEqual(window.refresh_calls, 0)
+                draw_logo.assert_not_called()
+
+    def test_blocking_launcher_and_confirmation_exit_on_terminal_eof(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.getch_calls = 0
+                self.timeouts: list[int] = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def keypad(self, _value: bool) -> None:
+                return
+
+            def timeout(self, value: int) -> None:
+                self.timeouts.append(value)
+
+            def erase(self) -> None:
+                return
+
+            def addstr(self, *_args) -> None:
+                return
+
+            def refresh(self) -> None:
+                return
+
+            def getch(self) -> int:
+                self.getch_calls += 1
+                return -1
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                window = FakeWindow()
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    selected = launcher._launcher_main(window, cfg, {"Alpha"})
+
+                self.assertIsNone(selected)
+                self.assertFalse(launcher._confirm(window, "隐藏 Alpha?"))
+                self.assertEqual(window.getch_calls, 2)
 
     def test_small_terminal_uses_text_fallback_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

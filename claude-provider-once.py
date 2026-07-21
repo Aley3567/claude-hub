@@ -682,11 +682,21 @@ _MIN_TUI_COLS = 32
 INTRO_DURATION_SECONDS = 0.24
 INTRO_FRAME_SECONDS = 0.016
 INTRO_FLOW_STEP_SECONDS = 0.04
-# About 6fps while the chooser is active; after 15s it blocks with zero wakeups.
-ANIMATION_FRAME_MS = 160
+# Ten terminal frames per second feels fluid without wasting work; phase is
+# derived from elapsed time, so a slow refresh skips stale frames instead of
+# slowing the flow itself. After 15s the chooser blocks with zero wakeups.
+ANIMATION_FRAME_MS = 100
 ANIMATION_IDLE_SECONDS = 15.0
 ANIMATION_PHASE_PERIOD = 240
-LOGO_BREATH_LEVELS = (-1, -1, 0, 0, 1, 1, 1, 1, 0, 0, -1, -1)
+# A closed controlling terminal makes getch() return -1 immediately instead of
+# waiting out its timeout. Bail after this many back-to-back sub-frame empty
+# polls so a detached session never spins a CPU core on invisible animation.
+ANIMATION_DEAD_TTY_POLLS = 4
+_ANIMATION_POLL_FLOOR_SECONDS = (ANIMATION_FRAME_MS / 1000.0) * 0.5
+LOGO_BREATH_LEVELS = (
+    -1, -1, -1, -1, 0, 0, 0, 1, 1, 1,
+    1, 1, 1, 0, 0, 0, -1, -1, -1, -1,
+)
 C: dict = {}
 
 # Logo and provider rows share a vivid full-spectrum identity.
@@ -885,6 +895,12 @@ def _tui_size_supported(rows: int, cols: int) -> bool:
 def _animation_enabled() -> bool:
     disabled = os.environ.get("CLAUDE1_NO_ANIMATION", "").strip().casefold()
     return disabled not in {"1", "true", "yes", "on"}
+
+
+def _animation_phase(started: float, now: float) -> int:
+    elapsed = max(0.0, now - started)
+    step = ANIMATION_FRAME_MS / 1000.0
+    return int(elapsed / step) % ANIMATION_PHASE_PERIOD
 
 
 def _logo_intensity(phase: int, breathing: bool) -> int:
@@ -1092,6 +1108,8 @@ def _confirm(win, msg) -> bool:
         _addstr(win, h - 1, base + 4, " n ", C.get("sel", curses.A_REVERSE) if not choice else C.get("dim", 0))
         win.refresh()
         ch = win.getch()
+        if ch == -1:
+            return False
         if ch in (ord("y"), ord("Y")):
             choice = True
         elif ch in (ord("n"), ord("N")):
@@ -1236,7 +1254,11 @@ def _launcher_main(win, cfg, db_names):
     pending_key = _intro(win) if intro_animate else None
     phase = 0
     paused = not animate
-    last_active = time.monotonic()
+    blocking = not animate
+    fast_empty = 0
+    animation_started = time.monotonic()
+    last_active = animation_started
+    last_poll = animation_started
     win.timeout(ANIMATION_FRAME_MS if animate else -1)
     _draw_launcher(
         win,
@@ -1251,24 +1273,44 @@ def _launcher_main(win, cfg, db_names):
     while True:
         ch = pending_key if pending_key is not None else win.getch()
         pending_key = None
+        now = time.monotonic()
+        poll_elapsed = now - last_poll
+        last_poll = now
         if ch == -1:
-            if not animate:
-                win.timeout(-1)
-                continue
-            if (time.monotonic() - last_active) >= ANIMATION_IDLE_SECONDS:
+            # A blocking read (timeout == -1) that returns -1 means the input
+            # stream reached EOF — typically the controlling terminal closed.
+            if blocking:
+                return None
+            # While animating we only poll, so a lone -1 is a normal frame
+            # timeout; but a burst returning far quicker than the frame budget
+            # is the same EOF, and must not burn a CPU core on frames nobody
+            # can see.
+            if poll_elapsed < _ANIMATION_POLL_FLOOR_SECONDS:
+                fast_empty += 1
+                if fast_empty >= ANIMATION_DEAD_TTY_POLLS:
+                    return None
+            else:
+                fast_empty = 0
+            if (now - last_active) >= ANIMATION_IDLE_SECONDS:
                 _draw_logo(win, phase, breathing=False)
                 win.refresh()
                 win.timeout(-1)
+                blocking = True
                 paused = True
                 continue
-            phase = (phase + 1) % ANIMATION_PHASE_PERIOD
+            next_phase = _animation_phase(animation_started, now)
+            if next_phase == phase:
+                continue
+            phase = next_phase
             _draw_logo(win, phase, breathing=True)
             win.refresh()
             continue
 
-        last_active = time.monotonic()
+        fast_empty = 0
+        last_active = now
         if paused and animate:
             win.timeout(ANIMATION_FRAME_MS)
+            blocking = False
             paused = False
         notice = None
         direct_index = _digit_index(ch)
