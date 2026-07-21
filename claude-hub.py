@@ -34,6 +34,16 @@ import aiohttp
 from aiohttp import web
 from multidict import CIMultiDict
 
+from claude1_protocol import (
+    AnthropicStreamBridge,
+    ProtocolTransformError,
+    SSEParser,
+    provider_api_format,
+    transform_error,
+    transform_request,
+    transform_response,
+)
+
 
 SERVICE_NAME = "claude-hub"
 PROTOCOL_VERSION = 1
@@ -292,6 +302,18 @@ def validate_config(raw: object) -> dict:
             "models": [model.strip() for model in models_raw],
             "allow_insecure_http": allow_insecure,
         }
+        api_format = channel_raw.get("api_format")
+        if api_format is not None:
+            if api_format not in {
+                "anthropic",
+                "openai_chat",
+                "openai_responses",
+            }:
+                raise ConfigError(
+                    f"channels.{alias}.api_format must be anthropic, "
+                    "openai_chat, or openai_responses"
+                )
+            channel["api_format"] = api_format
         if "proxy" in channel_raw:
             proxy = channel_raw["proxy"]
             if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
@@ -364,21 +386,44 @@ def _read_provider_rows(path: Path) -> dict:
     db_uri = path.resolve(strict=False).as_uri() + "?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     try:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()
+        }
+        selected = ["name", "settings_config"]
+        selected.extend(
+            column for column in ("meta", "provider_type") if column in columns
+        )
         cursor = conn.execute(
-            "SELECT name, settings_config FROM providers WHERE app_type='claude'"
+            f"SELECT {', '.join(selected)} FROM providers "
+            "WHERE app_type='claude'"
         )
         rows = {}
-        for name, settings_config in cursor.fetchall():
+        for raw_row in cursor.fetchall():
+            values = dict(zip(selected, raw_row))
+            name = values["name"]
+            settings_config = values["settings_config"]
             try:
                 settings = json.loads(settings_config)
             except (json.JSONDecodeError, UnicodeError, TypeError):
                 continue
             if not isinstance(settings, dict):
                 continue
+            try:
+                meta = json.loads(values.get("meta") or "{}")
+            except (json.JSONDecodeError, UnicodeError, TypeError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
             env = settings.get("env") or {}
             if not isinstance(env, dict):
                 continue
-            base = _normalize_base_url(env.get("ANTHROPIC_BASE_URL"))
+            is_full_url = meta.get("isFullUrl") is True
+            raw_base = env.get("ANTHROPIC_BASE_URL")
+            base = (
+                raw_base.strip().rstrip("/")
+                if is_full_url and isinstance(raw_base, str)
+                else _normalize_base_url(raw_base)
+            )
             if not base:
                 continue
             token = (
@@ -391,6 +436,15 @@ def _read_provider_rows(path: Path) -> dict:
             rows[name] = {
                 "base_url": base,
                 "token": token,
+                "api_format": provider_api_format(
+                    meta=meta,
+                    settings=settings,
+                    provider_type=values.get("provider_type"),
+                ),
+                "provider_type": (
+                    values.get("provider_type") or meta.get("providerType")
+                ),
+                "is_full_url": is_full_url,
                 "model_map": {
                     tier: (
                         value.strip()
@@ -656,7 +710,10 @@ def resolve_provider(
         alias,
         channel.get("allow_insecure_http", False),
     )
-    return provider
+    resolved = dict(provider)
+    if channel.get("api_format"):
+        resolved["api_format"] = channel["api_format"]
+    return resolved
 
 
 # ---------------------------------------------------------------- forwarding
@@ -983,6 +1040,222 @@ class _SSEContentDecoder:
             raise zlib.error("incomplete compressed SSE stream")
 
 
+def _estimated_input_tokens(payload: dict) -> int:
+    """Bounded local fallback for formats without an Anthropic count endpoint."""
+    relevant = {
+        "messages": payload.get("messages"),
+        "system": payload.get("system"),
+        "tools": payload.get("tools"),
+    }
+    return max(
+        1,
+        len(json.dumps(relevant, ensure_ascii=False, separators=(",", ":"))) // 4,
+    )
+
+
+def _transformed_headers(token: str, streaming: bool) -> CIMultiDict:
+    """Use only OpenAI-compatible headers; Anthropic beta headers are invalid here."""
+    headers = CIMultiDict()
+    headers["authorization"] = f"Bearer {token}"
+    headers["content-type"] = "application/json"
+    headers["accept"] = "text/event-stream" if streaming else "application/json"
+    # Ask intermediaries not to compress translated SSE. A non-compliant upstream
+    # is still handled by _SSEContentDecoder.
+    headers["accept-encoding"] = "identity"
+    return headers
+
+
+async def _read_upstream_body(upstream, limit: int = 64 * 1024 * 1024) -> bytes:
+    body = bytearray()
+    async for chunk in upstream.content.iter_any():
+        body.extend(chunk)
+        if len(body) > limit:
+            raise ProtocolTransformError("upstream response exceeds size limit")
+    return bytes(body)
+
+
+async def _handle_transformed_messages(
+    request: web.Request,
+    *,
+    cfg: dict,
+    provider: dict,
+    payload: dict,
+    alias: str,
+    model_in: str,
+    model_out: str,
+    is_count: bool,
+    started: float,
+) -> web.StreamResponse:
+    api_format = provider["api_format"]
+    if is_count:
+        estimate = _estimated_input_tokens(payload)
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"{api_format} locally estimated {estimate} tokens"
+        )
+        return web.json_response(
+            {"input_tokens": estimate},
+            headers={"x-hub-estimated": "1"},
+        )
+
+    endpoint, upstream_payload = transform_request(
+        payload,
+        api_format,
+        provider_type=provider.get("provider_type"),
+    )
+    data = json.dumps(
+        upstream_payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode()
+    streaming = upstream_payload.get("stream") is True
+    url = (
+        provider["base_url"]
+        if provider.get("is_full_url")
+        else provider["base_url"] + endpoint
+    )
+    session = request.app.get(UPSTREAM_SESSION_KEY)
+    if session is None:
+        session = request.app["session"]
+    timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
+
+    try:
+        async with session.post(
+            url,
+            data=data,
+            headers=_transformed_headers(provider["token"], streaming),
+            timeout=timeout,
+            proxy=channel_proxy(alias, cfg),
+            allow_redirects=False,
+        ) as upstream:
+            content_type = (
+                upstream.headers.get("content-type", "")
+                .split(";", 1)[0]
+                .strip()
+                .casefold()
+            )
+            is_sse = (
+                upstream.status == 200
+                and streaming
+                and content_type == "text/event-stream"
+            )
+            if not is_sse:
+                raw = await _read_upstream_body(upstream)
+                try:
+                    decoded = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    decoded = raw.decode("utf-8", "replace")
+                if upstream.status >= 400:
+                    body = transform_error(decoded, upstream.status)
+                    log(
+                        f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                        f"{api_format} upstream {upstream.status}"
+                    )
+                    return web.json_response(body, status=upstream.status)
+                if not isinstance(decoded, dict):
+                    raise ProtocolTransformError(
+                        "upstream returned a non-object JSON response"
+                    )
+                body = transform_response(decoded, api_format)
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    f"{api_format} {upstream.status} json "
+                    f"{time.monotonic() - started:.1f}s {len(raw)}B"
+                )
+                return web.json_response(
+                    body,
+                    status=upstream.status,
+                    headers={
+                        "x-hub-channel": alias,
+                        "x-hub-model": model_out,
+                        "x-hub-upstream-format": api_format,
+                    },
+                )
+
+            try:
+                decoder = _SSEContentDecoder.from_headers(upstream.headers)
+            except ValueError as exc:
+                raise ProtocolTransformError(
+                    "upstream SSE uses an unsupported content encoding"
+                ) from exc
+            parser = SSEParser()
+            bridge = AnthropicStreamBridge(api_format)
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                    "x-hub-channel": alias,
+                    "x-hub-model": model_out,
+                    "x-hub-upstream-format": api_format,
+                },
+            )
+            await response.prepare(request)
+            byte_count = 0
+            try:
+                async for chunk in upstream.content.iter_any():
+                    for decoded_chunk in decoder.feed(chunk):
+                        for event, event_data in parser.feed(decoded_chunk):
+                            for translated in bridge.feed(event, event_data):
+                                await response.write(translated)
+                                byte_count += len(translated)
+                    await asyncio.sleep(0)
+                decoder.finish()
+                parser.finish()
+                for translated in bridge.finish():
+                    await response.write(translated)
+                    byte_count += len(translated)
+                await response.write_eof()
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                UnicodeDecodeError,
+                ProtocolTransformError,
+                zlib.error,
+            ) as exc:
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    f"{api_format} stream failed after {byte_count}B: "
+                    f"{type(exc).__name__}"
+                )
+                transport = request.transport
+                if transport is not None:
+                    transport.abort()
+                raise UpstreamStreamAborted(
+                    "translated upstream stream ended after response started"
+                ) from exc
+            log(
+                f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                f"{api_format} 200 stream {time.monotonic() - started:.1f}s "
+                f"{byte_count}B"
+            )
+            return response
+    except UpstreamStreamAborted:
+        raise
+    except ProtocolTransformError as exc:
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"{api_format} TRANSFORM FAIL: {exc}"
+        )
+        return anthropic_error(
+            502,
+            f"hub: channel '{alias}' returned an incompatible {api_format} response",
+            "api_error",
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"{api_format} CONNECT FAIL: {type(exc).__name__}"
+        )
+        return anthropic_error(
+            502,
+            f"hub: cannot reach channel '{alias}'",
+            "api_error",
+        )
+
+
 async def handle_messages(request: web.Request) -> web.StreamResponse:
     cfg = get_config()
     if not check_local_auth(request, cfg):
@@ -1042,6 +1315,18 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         )
 
     payload["model"] = model_out
+    if provider.get("api_format", "anthropic") != "anthropic":
+        return await _handle_transformed_messages(
+            request,
+            cfg=cfg,
+            provider=provider,
+            payload=payload,
+            alias=alias,
+            model_in=model_in,
+            model_out=model_out,
+            is_count=is_count,
+            started=started,
+        )
     try:
         data = json.dumps(
             payload,

@@ -526,7 +526,7 @@ class ClaudeHubTests(unittest.TestCase):
 
             updated_env = {
                 "ANTHROPIC_BASE_URL": "https://updated.invalid/v1",
-                "ANTHROPIC_AUTH_TOKEN": "updated-wal-token",
+                        "ANTHROPIC_AUTH_TOKEN": "updated-wal-token",  # secret-guard: allow
             }
             writer.execute(
                 "UPDATE providers SET settings_config=? WHERE name=?",

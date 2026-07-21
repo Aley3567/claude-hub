@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -33,8 +34,14 @@ def loaded_launcher(env: dict[str, str]):
         spec = importlib.util.spec_from_file_location(name, LAUNCHER)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        yield module
+        # Register before exec so dataclasses can resolve the module's string
+        # annotations (the launcher uses ``from __future__ import annotations``).
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+            yield module
+        finally:
+            sys.modules.pop(name, None)
 
 
 def write_executable(path: Path, source: str) -> None:
@@ -1101,6 +1108,225 @@ class LauncherSafetyTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 with self.assertRaisesRegex(RuntimeError, "hub 本地凭证缺失"):
                     launcher.exec_hub([])
+
+
+class ScriptedWindow:
+    """A minimal curses window that replays a fixed key sequence."""
+
+    def __init__(self, keys, size=(30, 120)) -> None:
+        self._keys = list(keys)
+        self._size = size
+        self.timeouts: list[int] = []
+
+    def getmaxyx(self):
+        return self._size
+
+    def keypad(self, _value):
+        return
+
+    def timeout(self, value):
+        self.timeouts.append(value)
+
+    def nodelay(self, _value):
+        return
+
+    def erase(self):
+        return
+
+    def addstr(self, *_args):
+        return
+
+    def refresh(self):
+        return
+
+    def getch(self):
+        return self._keys.pop(0) if self._keys else -1
+
+
+HUB_FIXTURE = {
+    "port": 18787,
+    "default_channel": "glm",
+    "channels": {
+        "glm": {"provider": "GLM Provider", "models": ["glm-5.2"]},
+        "gpt": {
+            "provider": "GPT Provider",
+            "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+            "proxy": "http://127.0.0.1:7890",
+        },
+        "any": {
+            "provider": "Any",
+            "models": ["claude-fable-5[1m]", "claude-opus-4-6"],
+        },
+        "grok": {"provider": "Grok", "models": ["grok-4.5"]},
+    },
+}
+
+
+class HubWorkspaceTests(unittest.TestCase):
+    def _hub_env(self, home: Path, write_config: bool = True) -> dict[str, str]:
+        env = isolated_env(home, CLAUDE1_NO_ANIMATION="1")
+        if write_config:
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps(HUB_FIXTURE), encoding="utf-8")
+        return env
+
+    def test_build_hub_view_orders_default_first_and_derives_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                status, options = launcher.build_hub_view(HUB_FIXTURE)
+                self.assertEqual(status.channel_count, 4)
+                self.assertEqual(status.model_count, 6)
+                self.assertEqual(status.default_channel, "glm")
+                self.assertEqual(status.default_model, "glm-5.2")
+                self.assertEqual(status.summary, "4 渠道 · 6 模型")
+
+                self.assertTrue(options[0].is_default)
+                self.assertEqual(options[0].selector, "glm,glm-5.2")
+                self.assertEqual(options[0].status_label, "默认")
+                self.assertEqual(len(options), 6)
+
+                by_selector = {opt.selector: opt for opt in options}
+                self.assertEqual(
+                    by_selector["gpt,gpt-5.6-sol"].family, "GPT / Codex"
+                )
+                self.assertEqual(by_selector["gpt,gpt-5.6-sol"].status_label, "代理")
+                self.assertEqual(by_selector["any,claude-opus-4-6"].family, "Claude")
+                self.assertEqual(by_selector["grok,grok-4.5"].family, "Grok")
+                self.assertTrue(by_selector["any,claude-fable-5[1m]"].is_1m)
+                self.assertEqual(
+                    by_selector["any,claude-fable-5[1m]"].status_label, "1M"
+                )
+
+    def test_hub_model_family_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(launcher._hub_model_family("kimi-k3"), "Kimi")
+                self.assertEqual(
+                    launcher._hub_model_family("deepseek-v4-pro"), "DeepSeek"
+                )
+                self.assertEqual(launcher._hub_model_family("Xiaomi-MiMo"), "MiMo")
+                self.assertEqual(
+                    launcher._hub_model_family("codex-mini"), "GPT / Codex"
+                )
+                self.assertEqual(launcher._hub_model_family("glm-5.2"), "GLM")
+                self.assertEqual(launcher._hub_model_family("mystery-1"), "其他")
+
+    def test_load_hub_view_absent_then_present(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home), write_config=False)
+            with loaded_launcher(env) as launcher:
+                self.assertIsNone(launcher._load_hub_view())
+                config = Path(env["CLAUDE1_HUB_CONFIG"])
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text(json.dumps(HUB_FIXTURE), encoding="utf-8")
+                view = launcher._load_hub_view()
+                self.assertIsNotNone(view)
+                _status, options = view
+                self.assertEqual(len(options), 6)
+
+    def _run_home(self, launcher, keys):
+        cfg = {"providers": {"Alpha": {"hidden": False}}}
+        window = ScriptedWindow(keys)
+        launcher._logo_pairs[:] = [0]
+        with (
+            mock.patch.object(launcher, "_init_colors", return_value={}),
+            mock.patch.object(launcher, "_intro", return_value=None),
+            mock.patch.object(launcher, "load_mru", return_value={}),
+            mock.patch.object(launcher, "hub_healthy", return_value=True),
+        ):
+            return launcher._launcher_main(window, cfg, {"Alpha"})
+
+    def test_enter_opens_hub_and_launches_default_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                # Enter (home -> hub workspace), Enter (launch default).
+                result = self._run_home(launcher, [10, 10])
+                self.assertIsInstance(result, launcher.HubLaunch)
+                self.assertEqual(result.option.selector, "glm,glm-5.2")
+
+    def test_hub_workspace_down_then_enter_launches_second_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                # Enter -> hub, j (down), Enter -> launch second option.
+                result = self._run_home(launcher, [10, ord("j"), 10])
+                self.assertIsInstance(result, launcher.HubLaunch)
+                self.assertEqual(result.option.selector, "gpt,gpt-5.6-sol")
+
+    def test_hub_workspace_esc_returns_home_then_quit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                # Enter -> hub, Esc -> home, q -> quit launcher.
+                result = self._run_home(launcher, [10, 27, ord("q")])
+                self.assertIsNone(result)
+
+    def test_home_has_no_hub_entry_without_config(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home), write_config=False)
+            with loaded_launcher(env) as launcher:
+                # No hub config: digit still selects the provider directly.
+                result = self._run_home(launcher, [ord("1")])
+                self.assertEqual(result, "Alpha")
+
+    def test_main_launches_hub_backend_from_tui_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "run_tui_launcher",
+                        return_value=("hub", "gpt,gpt-5.6-sol"),
+                    ),
+                    mock.patch.object(
+                        launcher, "exec_hub", return_value=0
+                    ) as exec_hub,
+                ):
+                    self.assertEqual(launcher.main([]), 0)
+                exec_hub.assert_called_once_with(["--model", "gpt,gpt-5.6-sol"])
+
+    def test_run_tui_launcher_maps_hub_launch_to_hub_action(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                option = launcher.HubModelOption(
+                    family="GLM",
+                    channel="glm",
+                    model="glm-5.2",
+                    is_default=True,
+                    via_proxy=False,
+                    is_1m=False,
+                )
+                with (
+                    mock.patch.object(launcher, "db_claude_rows", return_value=[]),
+                    mock.patch.object(
+                        launcher,
+                        "load_config",
+                        return_value={"version": 2, "providers": {}},
+                    ),
+                    mock.patch.object(launcher.sys.stdin, "isatty", return_value=True),
+                    mock.patch.object(
+                        launcher.sys.stdout, "isatty", return_value=True
+                    ),
+                    mock.patch.object(
+                        launcher.shutil,
+                        "get_terminal_size",
+                        return_value=os.terminal_size((120, 40)),
+                    ),
+                    mock.patch.object(
+                        launcher.curses,
+                        "wrapper",
+                        return_value=launcher.HubLaunch(option),
+                    ),
+                ):
+                    self.assertEqual(
+                        launcher.run_tui_launcher(), ("hub", "glm,glm-5.2")
+                    )
 
 
 if __name__ == "__main__":

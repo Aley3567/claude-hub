@@ -12,6 +12,7 @@
     },
     "proxy-channel": {
       "provider": "Another CC Switch provider",
+      "api_format": "openai_chat",
       "models": [
         "claude-sonnet-4-20250514"
       ],

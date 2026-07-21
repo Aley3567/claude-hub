@@ -76,6 +76,7 @@ fi
 for source_file in \
   "$SCRIPT_DIR/claude-provider-once.py" \
   "$SCRIPT_DIR/claude-hub.py" \
+  "$SCRIPT_DIR/claude1_protocol.py" \
   "$SCRIPT_DIR/zsh-functions.sh"
 do
   if [ ! -f "$source_file" ] || [ ! -r "$source_file" ]; then
@@ -86,6 +87,7 @@ done
 
 if [ -L "$INSTALL_ROOT/scripts/claude-provider-once.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude-hub.py" ] ||
+  [ -L "$INSTALL_ROOT/scripts/claude1_protocol.py" ] ||
   [ -L "$INSTALL_ROOT/claude1/zsh-functions.sh" ]; then
   printf '%s\n' \
     "[claude1] 安装失败：目标脚本包含符号链接。为避免改写链接目标，请先手动处理后重试。" \
@@ -96,6 +98,7 @@ fi
 for target_path in \
   "$INSTALL_ROOT/scripts/claude-provider-once.py" \
   "$INSTALL_ROOT/scripts/claude-hub.py" \
+  "$INSTALL_ROOT/scripts/claude1_protocol.py" \
   "$INSTALL_ROOT/claude1/zsh-functions.sh"
 do
   if [ -e "$target_path" ] && [ ! -f "$target_path" ]; then
@@ -122,6 +125,7 @@ INSTALL_ROOT=$(CDPATH= cd "$INSTALL_ROOT" && pwd -P)
 
 LAUNCHER_TARGET="$INSTALL_ROOT/scripts/claude-provider-once.py"
 HUB_TARGET="$INSTALL_ROOT/scripts/claude-hub.py"
+PROTOCOL_TARGET="$INSTALL_ROOT/scripts/claude1_protocol.py"
 SHELL_TARGET="$INSTALL_ROOT/claude1/zsh-functions.sh"
 
 shell_quote() {
@@ -167,12 +171,15 @@ zshrc_needs_update() {
 
 NEED_LAUNCHER=0
 NEED_HUB=0
+NEED_PROTOCOL=0
 NEED_SHELL=0
 NEED_ZSHRC=0
 needs_install "$SCRIPT_DIR/claude-provider-once.py" "$LAUNCHER_TARGET" 755 &&
   NEED_LAUNCHER=1
 needs_install "$SCRIPT_DIR/claude-hub.py" "$HUB_TARGET" 755 &&
   NEED_HUB=1
+needs_install "$SCRIPT_DIR/claude1_protocol.py" "$PROTOCOL_TARGET" 644 &&
+  NEED_PROTOCOL=1
 needs_install "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644 &&
   NEED_SHELL=1
 zshrc_needs_update && NEED_ZSHRC=1
@@ -210,6 +217,9 @@ fi
 if [ "$NEED_HUB" -eq 1 ]; then
   backup_existing "$HUB_TARGET" "claude-hub.py"
 fi
+if [ "$NEED_PROTOCOL" -eq 1 ]; then
+  backup_existing "$PROTOCOL_TARGET" "claude1_protocol.py"
+fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   backup_existing "$SHELL_TARGET" "zsh-functions.sh"
 fi
@@ -233,6 +243,9 @@ if [ "$NEED_LAUNCHER" -eq 1 ]; then
 fi
 if [ "$NEED_HUB" -eq 1 ]; then
   install_file "$SCRIPT_DIR/claude-hub.py" "$HUB_TARGET" 755
+fi
+if [ "$NEED_PROTOCOL" -eq 1 ]; then
+  install_file "$SCRIPT_DIR/claude1_protocol.py" "$PROTOCOL_TARGET" 644
 fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   install_file "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644

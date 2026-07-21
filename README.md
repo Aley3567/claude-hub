@@ -4,6 +4,10 @@
 管理，`claude1` 只为本次会话选择渠道。可选的 `claude-hub` 还能在同一个
 Claude Code 会话里沿用原生 `/model` 切换渠道和模型。
 
+本仓库的桌面主工作目录、常改文件、兼容层入口和安全发布流程见
+[维护与兼容指南](docs/维护与兼容指南.md)。提交和推送前建议先运行
+`./scripts/install-git-guards.sh`，启用凭证、私有渠道名和本机配置拦截。
+
 默认安装只新增 `claude1` 和 `claude1-direct` 两个 zsh 函数，不会替换普通
 `claude`，也不会修改或启动 ReClaude。
 
@@ -31,9 +35,10 @@ cd claude1
 source ~/.zshrc
 ```
 
-安装器会把两份 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
+安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-已有目标文件和 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
+安装器实际复制启动器、Hub 和共享协议桥三份 Python 文件。已有目标文件和
+`~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
 
@@ -129,7 +134,8 @@ provider 或 current 状态。
 ~/.claude/
 ├── scripts/
 │   ├── claude-provider-once.py
-│   └── claude-hub.py
+│   ├── claude-hub.py
+│   └── claude1_protocol.py
 ├── claude1/
 │   └── zsh-functions.sh
 └── backups/
@@ -152,6 +158,7 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | --- | --- |
 | `claude-provider-once.py` | 一次性 provider 选择、TUI 与 Claude Code 启动 |
 | `claude-hub.py` | 可选的本地 Anthropic gateway |
+| `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |
@@ -168,6 +175,7 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 
 ```bash
 python3 -m pip install "aiohttp>=3.9"
+./scripts/install-git-guards.sh
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ./tests/test_shell_integration.zsh
 ./tests/test_install.zsh

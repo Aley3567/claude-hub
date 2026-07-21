@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude1 启动动画原型</title>
+  <style>
+    /*
+      PROTOTYPE — throw away after the animation direction is chosen.
+      Question: which Claude1 cold-start sequence feels fast, clear, and terminal-native?
+      Three variants are switchable with ?variant=A|B|C.
+    */
+    :root {
+      color-scheme: dark;
+      font-family: Menlo, Monaco, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+      background: #101010;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #101010;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .viewport {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: start center;
+      overflow: hidden;
+      background: #101010;
+    }
+
+    .stage {
+      position: absolute;
+      top: 0;
+      left: 50%;
+      width: 1288px;
+      height: 806px;
+      overflow: hidden;
+      transform-origin: top center;
+      background: #1d1d1d;
+      color: #21c78b;
+    }
+
+    .welcome {
+      position: absolute;
+      top: 24px;
+      left: 24px;
+      height: 31px;
+      color: #b8b8b8;
+      font-size: 25px;
+      line-height: 31px;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 14px;
+      height: 24px;
+      margin-left: 3px;
+      vertical-align: -4px;
+      background: #b8b8b8;
+    }
+
+    .cursor.blink {
+      animation: cursor-blink 520ms steps(1, end) 2;
+    }
+
+    @keyframes cursor-blink {
+      50% { opacity: 0; }
+    }
+
+    .logo-window {
+      position: absolute;
+      top: 72px;
+      left: 24px;
+      width: 876px;
+      height: 180px;
+      overflow: hidden;
+      background: #1d1d1d;
+    }
+
+    .logo-mask {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0;
+      overflow: hidden;
+      opacity: 1;
+    }
+
+    .logo-source {
+      position: absolute;
+      top: -18px;
+      left: -20px;
+      width: 1288px;
+      height: 806px;
+      max-width: none;
+      user-select: none;
+      pointer-events: none;
+    }
+
+    .scan-line {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 2px;
+      height: 100%;
+      opacity: 0;
+      background: #36d7eb;
+    }
+
+    .content {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+    }
+
+    .heading {
+      position: absolute;
+      top: 276px;
+      left: 24px;
+      color: #d0d0d0;
+      font-size: 25px;
+      line-height: 32px;
+    }
+
+    .hint {
+      position: absolute;
+      top: 310px;
+      left: 24px;
+      color: #9c9c9c;
+      font-size: 22px;
+      line-height: 30px;
+    }
+
+    .list {
+      position: absolute;
+      top: 361px;
+      left: 22px;
+      width: 590px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      font-size: 25px;
+      line-height: 30px;
+      font-weight: 700;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 34px 58px 31px 1fr;
+      height: 30px;
+      padding: 0 8px 0 0;
+      color: #21c78b;
+      opacity: 1;
+    }
+
+    .row .pointer {
+      padding-left: 3px;
+      color: #101010;
+    }
+
+    .row.selected {
+      color: #101010;
+      background: #19a9c5;
+    }
+
+    .footer {
+      position: absolute;
+      top: 682px;
+      left: 24px;
+      color: #9c9c9c;
+      font-size: 22px;
+      line-height: 30px;
+      white-space: nowrap;
+    }
+
+    .skip-note {
+      position: fixed;
+      top: 14px;
+      right: 16px;
+      z-index: 10;
+      color: #7d7d7d;
+      font: 12px/1.4 Menlo, Monaco, monospace;
+      opacity: 0;
+      transition: opacity 120ms ease-out;
+    }
+
+    .skip-note.visible {
+      opacity: 1;
+    }
+
+    .switcher {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 42px;
+      padding: 6px;
+      transform: translateX(-50%);
+      border: 1px solid #424242;
+      border-radius: 999px;
+      background: rgba(10, 10, 10, 0.94);
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+      color: #dedede;
+    }
+
+    .switcher button {
+      min-width: 34px;
+      height: 30px;
+      padding: 0 10px;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .switcher button:hover,
+    .switcher button:focus-visible {
+      outline: none;
+      background: #242424;
+    }
+
+    .variant-label {
+      min-width: 150px;
+      padding: 0 8px;
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .prototype-tag {
+      margin-left: 3px;
+      color: #6f6f6f;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .cursor,
+      .content,
+      .logo-mask {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="viewport" aria-label="Claude1 启动动画原型">
+    <section class="stage" id="stage">
+      <div class="welcome" aria-live="polite">
+        <span id="welcomeText"></span><span class="cursor" id="cursor"></span>
+      </div>
+
+      <div class="logo-window" aria-label="CLAUDE1">
+        <div class="logo-mask" id="logoMask">
+          <img class="logo-source" src="./claude1-ui-original.png" alt="">
+          <span class="scan-line" id="scanLine"></span>
+        </div>
+      </div>
+
+      <div class="content" id="content">
+        <div class="heading">选择渠道</div>
+        <div class="hint">↑↓ 选择 · Enter 启动</div>
+
+        <ol class="list" id="channelList">
+          <li class="row"><span class="pointer"></span><span>1.</span><span>★</span><span>Xiaomi MiMo api</span></li>
+          <li class="row selected"><span class="pointer">›</span><span>2.</span><span>★</span><span>Any router</span></li>
+          <li class="row"><span class="pointer"></span><span>3.</span><span>★</span><span>Bailian</span></li>
+          <li class="row"><span class="pointer"></span><span>4.</span><span>★</span><span>supertoken</span></li>
+          <li class="row"><span class="pointer"></span><span>5.</span><span>★</span><span>My Claude</span></li>
+          <li class="row"><span class="pointer"></span><span>6.</span><span>★</span><span>AIHub</span></li>
+          <li class="row"><span class="pointer"></span><span>7.</span><span>◆</span><span>NlnEAPI</span></li>
+          <li class="row"><span class="pointer"></span><span>8.</span><span>◆</span><span>Codex</span></li>
+          <li class="row"><span class="pointer"></span><span>9.</span><span>◆</span><span>Unity2.Ai</span></li>
+          <li class="row"><span class="pointer"></span><span>10.</span><span>◆</span><span>火山-key2-备用</span></li>
+        </ol>
+
+        <div class="footer">10 个渠道　 a 别名 · x 隐藏 · h 查看隐藏 · q 退出</div>
+      </div>
+    </section>
+  </main>
+
+  <div class="skip-note" id="skipNote">按任意键跳过</div>
+
+  <nav class="switcher" aria-label="原型方案切换">
+    <button id="prevVariant" type="button" aria-label="上一个方案">←</button>
+    <span class="variant-label"><span id="variantLabel"></span> <span class="prototype-tag">PROTOTYPE</span></span>
+    <button id="nextVariant" type="button" aria-label="下一个方案">→</button>
+    <button id="replay" type="button">重播</button>
+  </nav>
+
+  <script>
+    const variants = [
+      { key: "A", name: "混合敲入" },
+      { key: "B", name: "扫描构建" },
+      { key: "C", name: "快速进入" }
+    ];
+
+    const stage = document.querySelector("#stage");
+    const welcomeText = document.querySelector("#welcomeText");
+    const cursor = document.querySelector("#cursor");
+    const logoMask = document.querySelector("#logoMask");
+    const scanLine = document.querySelector("#scanLine");
+    const content = document.querySelector("#content");
+    const rows = [...document.querySelectorAll(".row")];
+    const skipNote = document.querySelector("#skipNote");
+    const variantLabel = document.querySelector("#variantLabel");
+
+    let timers = [];
+    let animationRunning = false;
+    let activeVariant = normalizeVariant(new URLSearchParams(location.search).get("variant"));
+
+    function normalizeVariant(value) {
+      return variants.some((item) => item.key === value) ? value : "A";
+    }
+
+    function later(fn, ms) {
+      const id = window.setTimeout(fn, ms);
+      timers.push(id);
+      return id;
+    }
+
+    function clearTimers() {
+      timers.forEach(window.clearTimeout);
+      timers = [];
+    }
+
+    function resetFrame() {
+      clearTimers();
+      animationRunning = true;
+      welcomeText.textContent = "";
+      cursor.style.display = "inline-block";
+      cursor.classList.remove("blink");
+      logoMask.style.transition = "none";
+      logoMask.style.width = "0";
+      logoMask.style.opacity = "1";
+      logoMask.style.transform = "translateY(0)";
+      scanLine.style.opacity = "0";
+      content.style.transition = "none";
+      content.style.opacity = "0";
+      rows.forEach((row) => {
+        row.style.transition = "none";
+        row.style.opacity = "1";
+        row.style.transform = "none";
+      });
+      skipNote.classList.add("visible");
+    }
+
+    function finishImmediately() {
+      clearTimers();
+      animationRunning = false;
+      welcomeText.textContent = "欢迎回来";
+      cursor.style.display = "none";
+      logoMask.style.transition = "none";
+      logoMask.style.width = "100%";
+      logoMask.style.opacity = "1";
+      logoMask.style.transform = "none";
+      scanLine.style.opacity = "0";
+      content.style.transition = "none";
+      content.style.opacity = "1";
+      rows.forEach((row) => {
+        row.style.opacity = "1";
+        row.style.transform = "none";
+      });
+      skipNote.classList.remove("visible");
+    }
+
+    function typeText(text, interval, startAt = 0, onDone = () => {}) {
+      [...text].forEach((character, index) => {
+        later(() => {
+          welcomeText.textContent += character;
+        }, startAt + index * interval);
+      });
+      later(onDone, startAt + text.length * interval);
+    }
+
+    function playVariantA() {
+      resetFrame();
+      typeText("欢迎回来", 42, 80, () => {
+        const steps = [14, 28, 42, 57, 72, 87, 100];
+        steps.forEach((width, index) => {
+          later(() => {
+            logoMask.style.width = width + "%";
+          }, 55 + index * 52);
+        });
+
+        later(() => {
+          cursor.classList.add("blink");
+        }, 130);
+
+        later(() => {
+          cursor.style.display = "none";
+          content.style.transition = "opacity 130ms ease-out";
+          content.style.opacity = "1";
+        }, 460);
+
+        later(() => {
+          animationRunning = false;
+          skipNote.classList.remove("visible");
+        }, 610);
+      });
+    }
+
+    function playVariantB() {
+      resetFrame();
+      welcomeText.textContent = "> ";
+      typeText("CLAUDE1", 34, 70, () => {
+        cursor.style.display = "none";
+        scanLine.style.opacity = "1";
+        logoMask.style.transition = "width 420ms steps(14, end)";
+        logoMask.style.width = "100%";
+
+        later(() => {
+          scanLine.style.opacity = "0";
+          welcomeText.textContent = "欢迎回来";
+          content.style.opacity = "1";
+          rows.forEach((row, index) => {
+            row.style.opacity = "0";
+            row.style.transform = "translateX(-8px)";
+            row.style.transition = "opacity 70ms ease-out, transform 70ms ease-out";
+            later(() => {
+              row.style.opacity = "1";
+              row.style.transform = "translateX(0)";
+            }, index * 24);
+          });
+        }, 440);
+
+        later(() => {
+          animationRunning = false;
+          skipNote.classList.remove("visible");
+        }, 730);
+      });
+    }
+
+    function playVariantC() {
+      resetFrame();
+      welcomeText.textContent = "欢迎回来";
+      cursor.style.display = "none";
+      logoMask.style.width = "100%";
+      logoMask.style.opacity = "0";
+      logoMask.style.transform = "translateY(8px)";
+      content.style.opacity = "0";
+
+      later(() => {
+        logoMask.style.transition = "opacity 180ms ease-out, transform 180ms ease-out";
+        logoMask.style.opacity = "1";
+        logoMask.style.transform = "translateY(0)";
+      }, 40);
+
+      later(() => {
+        content.style.transition = "opacity 120ms ease-out";
+        content.style.opacity = "1";
+      }, 150);
+
+      later(() => {
+        animationRunning = false;
+        skipNote.classList.remove("visible");
+      }, 300);
+    }
+
+    function playCurrent() {
+      variantLabel.textContent = `${activeVariant} — ${variants.find((item) => item.key === activeVariant).name}`;
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        resetFrame();
+        finishImmediately();
+        return;
+      }
+      ({ A: playVariantA, B: playVariantB, C: playVariantC })[activeVariant]();
+    }
+
+    function selectVariant(offset) {
+      const currentIndex = variants.findIndex((item) => item.key === activeVariant);
+      const nextIndex = (currentIndex + offset + variants.length) % variants.length;
+      activeVariant = variants[nextIndex].key;
+      const url = new URL(location.href);
+      url.searchParams.set("variant", activeVariant);
+      history.replaceState(null, "", url);
+      playCurrent();
+    }
+
+    function fitStage() {
+      const controlsAllowance = 72;
+      const scale = Math.min(innerWidth / 1288, (innerHeight - controlsAllowance) / 806, 1);
+      stage.style.transform = `translateX(-50%) scale(${scale})`;
+    }
+
+    document.querySelector("#prevVariant").addEventListener("click", () => selectVariant(-1));
+    document.querySelector("#nextVariant").addEventListener("click", () => selectVariant(1));
+    document.querySelector("#replay").addEventListener("click", playCurrent);
+
+    window.addEventListener("keydown", (event) => {
+      if (animationRunning) {
+        finishImmediately();
+        return;
+      }
+      if (event.key === "ArrowLeft") selectVariant(-1);
+      if (event.key === "ArrowRight") selectVariant(1);
+      if (event.key.toLowerCase() === "r") playCurrent();
+    });
+
+    window.addEventListener("resize", fitStage);
+    fitStage();
+    playCurrent();
+  </script>
+</body>
+</html>
