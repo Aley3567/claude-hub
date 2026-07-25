@@ -368,6 +368,53 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
     }
 
 
+PROVIDER_MODEL_ENV_KEYS = (
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_REASONING_MODEL",
+)
+
+
+def _provider_model_values(settings: dict) -> list[str]:
+    """Return configured model ids in effective/default-role order."""
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    names: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value.strip() and value.strip() not in names:
+            names.append(value.strip())
+
+    add(env.get("ANTHROPIC_MODEL"))
+    add(settings.get("model"))
+    for key in PROVIDER_MODEL_ENV_KEYS:
+        add(env.get(key))
+    return names
+
+
+def _provider_model_summary(settings: dict) -> str:
+    models = _provider_model_values(settings)
+    if not models:
+        return "自动"
+    if len(models) == 1:
+        return models[0]
+    return f"{models[0]} +{len(models) - 1}"
+
+
+def _provider_model_labels(rows) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for row in rows:
+        try:
+            settings = json.loads(row["settings_config"] or "{}")
+        except (json.JSONDecodeError, TypeError, UnicodeError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        labels[str(row["name"])] = _provider_model_summary(settings)
+    return labels
+
+
 def selected_provider_api_format(provider: dict) -> str:
     try:
         settings = json.loads(provider.get("settings_config") or "{}")
@@ -1349,6 +1396,7 @@ def _draw_launcher(
     logo_breathing: bool = False,
     hub_status: "HubStatus | None" = None,
     hub_focus: bool = False,
+    provider_models: dict[str, str] | None = None,
 ) -> None:
     meta = cfg["providers"]
     win.erase()
@@ -1433,6 +1481,9 @@ def _draw_launcher(
         marker = "▸" if selected else " "
         label = f"{marker} {rank:>2}  {name}"
         status: list[str] = []
+        model_label = (provider_models or {}).get(name)
+        if model_label:
+            status.append(f"模型 {_truncate_display(model_label, 30)}")
         if m.get("alias"):
             status.append(str(m["alias"]))
         if name == recent:
@@ -1463,7 +1514,10 @@ def _draw_launcher(
             _addstr(win, row, 2, line, attr)
 
     if help_open:
-        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+        foot = (
+            "m 在 CC Switch 编辑模型 · r 刷新 · a 别名 · x 隐藏"
+            " · h 隐藏项 · ? 返回"
+        )
     else:
         visible_range = ""
         if start > 0 or end < len(view):
@@ -1583,7 +1637,24 @@ def _hub_workspace(
         _draw_hub_workspace(win, status, options, idx)
 
 
-def _launcher_main(win, cfg, db_names):
+def _open_cc_switch_editor() -> bool:
+    """Raise the authoritative CC Switch editor without writing its database."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.Popen(
+            ["open", "-a", "CC Switch"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _launcher_main(win, cfg, db_names, provider_models=None):
     """返回要启动的 provider 名，或 None(退出不启动)。hide/alias 即时落盘。"""
     _safe_curs_set(0)
     win.keypad(True)
@@ -1595,6 +1666,7 @@ def _launcher_main(win, cfg, db_names):
     C = _init_colors()
     mru = load_mru()
     meta = cfg["providers"]
+    provider_models = dict(provider_models or {})
     show_hidden = False
     view = _build_view(cfg, db_names, mru, show_hidden)
     idx = _initial_index(view, mru)
@@ -1619,6 +1691,7 @@ def _launcher_main(win, cfg, db_names):
         show_brand=True,
         hub_status=hub_status,
         hub_focus=hub_focus,
+        provider_models=provider_models,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -1656,6 +1729,28 @@ def _launcher_main(win, cfg, db_names):
                 changed, notice = _edit_alias(win, view[idx], meta)
                 if changed:
                     save_config(cfg)
+        elif ch == ord("m"):
+            if hub_focus:
+                notice = "Hub 模型来自 claude-hub.json；请编辑该文件后按 r 刷新"
+            elif view:
+                name = view[idx]
+                if _open_cc_switch_editor():
+                    notice = f"已打开 CC Switch；编辑 {name} 并保存，返回后按 r 刷新"
+                else:
+                    notice = "请在 CC Switch 中编辑 provider 模型，保存后按 r 刷新"
+        elif ch == ord("r"):
+            try:
+                refreshed_rows = db_claude_rows()
+                provider_models = _provider_model_labels(refreshed_rows)
+                refreshed_hub = _load_hub_view()
+                hub_status, hub_options = (
+                    refreshed_hub if refreshed_hub is not None else (None, [])
+                )
+                if hub_status is None:
+                    hub_focus = False
+                notice = "已从 CC Switch 刷新 provider 模型"
+            except (OSError, RuntimeError, sqlite3.Error):
+                notice = "刷新失败：CC Switch 数据库当前不可读"
         elif ch == ord("x"):
             if not hub_focus and view:
                 name = view[idx]
@@ -1700,13 +1795,14 @@ def _launcher_main(win, cfg, db_names):
             notice=notice,
             hub_status=hub_status,
             hub_focus=hub_focus,
+            provider_models=provider_models,
         )
 
 
-def _launcher_session(win, cfg, db_names):
+def _launcher_session(win, cfg, db_names, provider_models=None):
     """Run one chooser and remove its full-screen UI before curses restores."""
     try:
-        return _launcher_main(win, cfg, db_names)
+        return _launcher_main(win, cfg, db_names, provider_models)
     finally:
         try:
             win.erase()
@@ -1719,6 +1815,7 @@ def run_tui_launcher():
     """打开 TUI 启动器。返回 ('launch', name) | ('quit', None) | ('no-tui', None)。"""
     rows = db_claude_rows()
     db_names = {r["name"] for r in rows}
+    provider_models = _provider_model_labels(rows)
     cfg = load_config()
     changed = sync_config(cfg, [r["name"] for r in rows])
     changed |= migrate_hidden(cfg)
@@ -1730,7 +1827,12 @@ def run_tui_launcher():
     if not _tui_size_supported(terminal.lines, terminal.columns):
         return ("no-tui", None)
     try:
-        result = curses.wrapper(_launcher_session, cfg, db_names)
+        result = curses.wrapper(
+            _launcher_session,
+            cfg,
+            db_names,
+            provider_models,
+        )
     except Exception as exc:
         print(f"[claude1] 图形界面无法启动({exc})", file=sys.stderr)
         return ("no-tui", None)
@@ -1897,19 +1999,7 @@ def _free_loopback_port() -> int:
 
 
 def _provider_models(settings: dict) -> list[str]:
-    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
-    names: list[str] = []
-    for key in (
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_FABLE_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    ):
-        value = env.get(key)
-        if isinstance(value, str) and value and value not in names:
-            names.append(value)
-    return names or ["claude1-provider-model"]
+    return _provider_model_values(settings) or ["claude1-provider-model"]
 
 
 def _bridge_child_env(
@@ -2168,6 +2258,13 @@ def cli_list_providers(show_all: bool = False) -> int:
     for index, name in enumerate(names, 1):
         meta = cfg["providers"][name]
         details: list[str] = []
+        try:
+            settings = json.loads(by_name[name]["settings_config"] or "{}")
+        except (json.JSONDecodeError, TypeError, UnicodeError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        details.append(f"模型 {_provider_model_summary(settings)}")
         if meta.get("alias"):
             details.append(f"别名 {meta['alias']}")
         if name == recent:
