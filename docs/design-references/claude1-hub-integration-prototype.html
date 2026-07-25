@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude1 × Claude-Hub 内嵌界面原型</title>
+  <style>
+    /*
+      PROTOTYPE — throw away after the Claude-Hub integration structure is chosen.
+      Question: how should Claude-Hub live inside Claude1 without turning the launcher into a cluttered control panel?
+      Three structural variants are switchable with ?variant=A|B|C.
+    */
+    :root {
+      color-scheme: dark;
+      font-family: Menlo, Monaco, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+      background: #101010;
+      --bg: #1d1d1d;
+      --text: #d7d7d7;
+      --muted: #858585;
+      --green: #27d69a;
+      --pink: #f05aab;
+      --lime: #a7db45;
+      --orange: #ff8700;
+      --cyan: #22c9d8;
+      --violet: #ab75e8;
+      --line: #353535;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #101010; }
+    button { font: inherit; }
+
+    .viewport {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: start center;
+      overflow: hidden;
+      background: #101010;
+    }
+
+    .stage {
+      position: absolute;
+      top: 0;
+      left: 50%;
+      width: 1288px;
+      height: 806px;
+      overflow: hidden;
+      transform-origin: top center;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .brand { position: absolute; inset: 0 0 auto 0; height: 260px; }
+    .welcome {
+      position: absolute;
+      top: 22px;
+      left: 24px;
+      color: var(--pink);
+      font-size: 25px;
+      line-height: 32px;
+      font-weight: 700;
+    }
+
+    .logo-window {
+      position: absolute;
+      top: 70px;
+      left: 24px;
+      width: 876px;
+      height: 180px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .logo-source {
+      position: absolute;
+      top: -18px;
+      left: -20px;
+      width: 1288px;
+      height: 806px;
+      max-width: none;
+      user-select: none;
+      pointer-events: none;
+    }
+
+    .variant { display: none; position: absolute; inset: 265px 22px 66px; }
+    .variant.active { display: block; }
+    .eyebrow { color: var(--lime); font-size: 22px; font-weight: 700; line-height: 32px; }
+    .hint { color: var(--muted); font-size: 17px; line-height: 28px; }
+    .rule { height: 1px; margin: 8px 0; background: var(--line); }
+    .section-label { margin: 10px 0 5px; color: #777; font-size: 14px; letter-spacing: .08em; }
+    .mono-row {
+      width: 100%;
+      min-height: 38px;
+      border: 0;
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+    .mono-row:hover, .mono-row:focus-visible { outline: 1px solid #575757; outline-offset: -1px; }
+    .mono-row.selected { background: var(--orange); color: #101010; font-weight: 700; }
+    .muted { color: var(--muted); }
+    .selected .muted { color: #3b250c; }
+    .accent { color: var(--cyan); }
+    .pink { color: var(--pink); }
+    .green { color: var(--green); }
+    .violet { color: var(--violet); }
+    .status-ok { color: var(--green); }
+    .footer {
+      position: absolute;
+      left: 24px;
+      right: 24px;
+      bottom: 22px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 28px;
+    }
+
+    /* A — hierarchical workspace */
+    .a-home, .a-hub { position: absolute; inset: 0; }
+    .a-hub { display: none; }
+    .stage.hub-open .brand { display: none; }
+    .stage.hub-open .variant { inset: 20px 22px 66px; }
+    .stage.hub-open .a-home { display: none; }
+    .stage.hub-open .a-hub { display: block; }
+    .hub-entry {
+      display: grid;
+      grid-template-columns: 36px 220px 180px 1fr;
+      align-items: center;
+      min-height: 64px;
+      margin-top: 10px;
+      padding: 7px 12px;
+      background: var(--orange);
+      color: #111;
+      cursor: pointer;
+    }
+    .hub-entry .symbol { font-size: 25px; }
+    .hub-entry .title { font-size: 20px; font-weight: 800; }
+    .hub-entry .kind { font-size: 16px; font-weight: 700; }
+    .hub-entry .summary { font-size: 15px; }
+    .direct-row {
+      display: grid;
+      grid-template-columns: 38px 55px 35px minmax(260px, 1fr) 180px;
+      align-items: center;
+      height: 33px;
+      color: var(--green);
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .breadcrumb { color: var(--muted); font-size: 16px; }
+    .hub-title { margin-top: 9px; color: var(--lime); font-size: 24px; font-weight: 800; }
+    .hub-health { margin: 5px 0 14px; color: var(--muted); font-size: 16px; }
+    .model-head, .model-row {
+      display: grid;
+      grid-template-columns: 44px 150px 170px minmax(280px, 1fr) 150px;
+      align-items: center;
+      min-height: 35px;
+      padding: 0 10px;
+      font-size: 16px;
+    }
+    .model-head { color: #737373; border-bottom: 1px solid var(--line); }
+    .model-row { border: 0; width: 100%; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+    .model-row:hover, .model-row:focus-visible { outline: 1px solid #575757; outline-offset: -1px; }
+    .model-row.selected { background: var(--orange); color: #111; font-weight: 800; }
+    .type { font-weight: 800; }
+    .type.claude { color: #d88a56; }
+    .type.gpt { color: #55d7bd; }
+    .type.glm { color: #75a7ff; }
+    .type.other { color: #ca7cf3; }
+    .selected .type { color: #111; }
+
+    /* B — split console */
+    .split {
+      display: grid;
+      grid-template-columns: 330px 1fr;
+      gap: 20px;
+      height: 100%;
+      margin-top: 8px;
+    }
+    .left-nav { border-right: 1px solid var(--line); padding-right: 18px; }
+    .nav-item { display: block; width: 100%; min-height: 45px; border: 0; padding: 6px 9px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+    .nav-item.active { background: var(--orange); color: #111; font-weight: 800; }
+    .nav-item small { display: block; margin-top: 3px; color: var(--muted); }
+    .nav-item.active small { color: #4c2c08; }
+    .summary-line { display: grid; grid-template-columns: 150px 1fr; min-height: 30px; font-size: 16px; }
+    .family-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin: 12px 0; background: var(--line); }
+    .family-cell { min-height: 56px; padding: 8px 10px; background: var(--bg); }
+    .family-cell strong { display: block; font-size: 17px; }
+    .family-cell span { color: var(--muted); font-size: 14px; }
+    .channel-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 12px; }
+    .channel-line { display: grid; grid-template-columns: 70px 1fr 70px; min-height: 30px; color: var(--text); font-size: 15px; }
+
+    /* C — command palette */
+    .palette { width: 910px; margin: 10px auto 0; border: 1px solid #484848; background: #181818; box-shadow: 0 14px 40px rgba(0,0,0,.3); }
+    .query { height: 48px; padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--text); font-size: 20px; }
+    .query .prompt { color: var(--pink); }
+    .palette-group { padding: 7px 10px 3px; color: #777; font-size: 13px; letter-spacing: .08em; }
+    .result-row { display: grid; grid-template-columns: 40px 130px 220px 1fr 100px; align-items: center; min-height: 38px; padding: 0 10px; font-size: 15px; }
+    .result-row.selected { background: var(--orange); color: #111; font-weight: 800; }
+    .result-row .tag { color: var(--muted); }
+    .result-row.selected .tag { color: #4a2b08; }
+
+    .switcher {
+      position: fixed;
+      left: 50%;
+      bottom: 15px;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 42px;
+      padding: 6px;
+      transform: translateX(-50%);
+      border: 1px solid #424242;
+      border-radius: 999px;
+      background: rgba(10,10,10,.95);
+      box-shadow: 0 8px 30px rgba(0,0,0,.4);
+      color: #dedede;
+    }
+    .switcher button { min-width: 34px; height: 30px; padding: 0 10px; border: 0; border-radius: 999px; background: transparent; color: inherit; cursor: pointer; }
+    .switcher button:hover, .switcher button:focus-visible { outline: none; background: #242424; }
+    .variant-label { min-width: 260px; text-align: center; font-size: 13px; }
+    .prototype-tag { color: #707070; font-size: 10px; letter-spacing: .08em; }
+  </style>
+</head>
+<body>
+  <main class="viewport" aria-label="Claude1 与 Claude-Hub 内嵌界面原型">
+    <section class="stage" id="stage">
+      <header class="brand">
+        <div class="welcome">欢迎回来</div>
+        <div class="logo-window" aria-label="CLAUDE1">
+          <img class="logo-source" src="./claude1-ui-original.png" alt="">
+        </div>
+      </header>
+
+      <section class="variant" data-variant="A">
+        <div class="a-home">
+          <div class="eyebrow">选择本次启动方式</div>
+          <div class="hint">↑↓ / jk 移动 · Enter 进入 · 数字直达单渠道</div>
+          <button class="hub-entry" id="openHub" type="button">
+            <span class="symbol">◆</span>
+            <span class="title">Claude-Hub</span>
+            <span class="kind">多渠道会话</span>
+            <span class="summary">● 已就绪 · 10 渠道 · 15 模型 · 会话内 /model 切换</span>
+          </button>
+          <div class="section-label">单渠道直连</div>
+          <div class="direct-row"><span></span><span>1.</span><span>★</span><span>Xiaomi MiMo api</span><span>最近</span></div>
+          <div class="direct-row"><span></span><span>2.</span><span>★</span><span>Any router</span><span>直连</span></div>
+          <div class="direct-row"><span></span><span>3.</span><span>★</span><span>***REMOVED***</span><span>直连</span></div>
+          <div class="direct-row"><span></span><span>4.</span><span>★</span><span>***REMOVED***</span><span>直连</span></div>
+          <div class="direct-row"><span></span><span>5.</span><span>★</span><span>***REMOVED***</span><span>直连</span></div>
+        </div>
+        <div class="a-hub">
+          <div class="breadcrumb">Claude1  ›  Claude-Hub</div>
+          <div class="hub-title">选择 Hub 模型</div>
+          <div class="hub-health"><span class="status-ok">● 已就绪</span> · 127.0.0.1:18787 · 10 渠道 · 15 模型 · 默认 glm</div>
+          <div class="model-head"><span></span><span>类型</span><span>渠道</span><span>模型</span><span>状态</span></div>
+          <button class="model-row selected" type="button"><span>▸</span><span class="type glm">GLM</span><span>glm</span><span>glm-5.2</span><span>默认</span></button>
+          <button class="model-row" type="button"><span></span><span class="type gpt">GPT / Codex</span><span>gpt</span><span>gpt-5.6-sol</span><span>代理</span></button>
+          <button class="model-row" type="button"><span></span><span class="type gpt">GPT / Codex</span><span>gpt</span><span>gpt-5.6-luna</span><span>代理</span></button>
+          <button class="model-row" type="button"><span></span><span class="type claude">Claude</span><span>any</span><span>claude-fable-5[1M]</span><span>1M</span></button>
+          <button class="model-row" type="button"><span></span><span class="type claude">Claude</span><span>claude-main</span><span>claude-opus-4-6</span><span>可用</span></button>
+          <button class="model-row" type="button"><span></span><span class="type other">Grok</span><span>grok</span><span>grok-4.5</span><span>可用</span></button>
+          <button class="model-row" type="button"><span></span><span class="type other">Kimi</span><span>kimi</span><span>kimi-k3</span><span>可用</span></button>
+          <button class="model-row" type="button"><span></span><span class="type other">DeepSeek</span><span>st</span><span>deepseek-v4-pro</span><span>可用</span></button>
+          <div class="footer">Esc 返回 Claude1 · ↑↓ 选择 · Enter 启动 · q 退出</div>
+        </div>
+      </section>
+
+      <section class="variant" data-variant="B">
+        <div class="eyebrow">Claude1 控制台</div>
+        <div class="hint">启动方式与 Hub 状态同屏，不进入第二层</div>
+        <div class="split">
+          <nav class="left-nav" aria-label="启动方式">
+            <div class="section-label">启动方式</div>
+            <button class="nav-item active" type="button">◆ Claude-Hub<small>多渠道 · 会话内切换</small></button>
+            <button class="nav-item" type="button">★ 单渠道直连<small>稳定编号 · 一次性会话</small></button>
+            <div class="section-label">状态</div>
+            <div class="hint"><span class="status-ok">● Hub 已就绪</span><br>18787 · protocol 1</div>
+          </nav>
+          <div>
+            <div class="eyebrow">Claude-Hub</div>
+            <div class="summary-line"><span class="muted">默认启动</span><span>glm / glm-5.2</span></div>
+            <div class="summary-line"><span class="muted">模型发现</span><span>10 渠道 · 15 模型</span></div>
+            <div class="family-grid">
+              <div class="family-cell"><strong class="type claude">Claude</strong><span>6 个模型</span></div>
+              <div class="family-cell"><strong class="type gpt">GPT / Codex</strong><span>2 个模型</span></div>
+              <div class="family-cell"><strong class="type glm">GLM</strong><span>3 个模型</span></div>
+              <div class="family-cell"><strong class="type other">其他</strong><span>4 个模型</span></div>
+            </div>
+            <div class="section-label">渠道</div>
+            <div class="channel-list">
+              <div class="channel-line"><span class="green">glm</span><span>GLM</span><span>默认</span></div>
+              <div class="channel-line"><span class="green">gpt</span><span>GPT / Codex</span><span>2 模型</span></div>
+              <div class="channel-line"><span class="green">any</span><span>Claude</span><span>2 模型</span></div>
+              <div class="channel-line"><span class="green">claude-main</span><span>Claude</span><span>2 模型</span></div>
+              <div class="channel-line"><span class="green">st</span><span>GLM / DeepSeek</span><span>2 模型</span></div>
+              <div class="channel-line"><span class="green">grok</span><span>Grok</span><span>1 模型</span></div>
+              <div class="channel-line"><span class="green">kimi</span><span>Kimi</span><span>1 模型</span></div>
+              <div class="channel-line"><span class="green">mimo</span><span>MiMo</span><span>1 模型</span></div>
+            </div>
+            <div class="footer">←→ 切换启动方式 · ↑↓ 选择默认模型 · Enter 启动</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="variant" data-variant="C">
+        <div class="eyebrow">快速启动</div>
+        <div class="hint">一个搜索面板统一直连渠道、Hub 模型和隔离入口</div>
+        <div class="palette">
+          <div class="query"><span class="prompt">›</span> 搜索渠道、模型或启动方式<span class="muted">_</span></div>
+          <div class="palette-group">推荐</div>
+          <div class="result-row selected"><span>▸</span><span>多渠道</span><span>Claude-Hub</span><span>默认 glm-5.2 · 进入后可 /model</span><span>已就绪</span></div>
+          <div class="palette-group">HUB 模型</div>
+          <div class="result-row"><span></span><span class="type gpt">GPT / Codex</span><span>gpt / gpt-5.6-sol</span><span>通过 Claude-Hub 启动</span><span class="tag">代理</span></div>
+          <div class="result-row"><span></span><span class="type claude">Claude</span><span>any / fable-5[1M]</span><span>通过 Claude-Hub 启动</span><span class="tag">1M</span></div>
+          <div class="result-row"><span></span><span class="type other">Grok</span><span>grok / grok-4.5</span><span>通过 Claude-Hub 启动</span><span class="tag">Hub</span></div>
+          <div class="palette-group">单渠道直连</div>
+          <div class="result-row"><span></span><span class="green">直连</span><span>Xiaomi MiMo api</span><span>本次会话固定渠道</span><span class="tag">最近</span></div>
+          <div class="result-row"><span></span><span class="green">直连</span><span>Any router</span><span>本次会话固定渠道</span><span class="tag">2</span></div>
+        </div>
+        <div class="footer">输入筛选 · ↑↓ 选择 · Enter 启动 · Tab 只看某一类型 · q 退出</div>
+      </section>
+    </section>
+  </main>
+
+  <nav class="switcher" aria-label="原型方案切换">
+    <button id="prevVariant" type="button" aria-label="上一个方案">←</button>
+    <span class="variant-label"><span id="variantLabel"></span> <span class="prototype-tag">PROTOTYPE</span></span>
+    <button id="nextVariant" type="button" aria-label="下一个方案">→</button>
+    <button id="resetView" type="button">重置</button>
+  </nav>
+
+  <script>
+    const variants = [
+      { key: "A", name: "入口 → Hub 工作区" },
+      { key: "B", name: "左右双栏控制台" },
+      { key: "C", name: "统一命令面板" }
+    ];
+    const stage = document.querySelector("#stage");
+    const label = document.querySelector("#variantLabel");
+    let active = normalize(new URLSearchParams(location.search).get("variant"));
+
+    function normalize(value) {
+      return variants.some((item) => item.key === value) ? value : "A";
+    }
+
+    function render() {
+      stage.classList.remove("hub-open");
+      document.querySelectorAll(".variant").forEach((node) => {
+        node.classList.toggle("active", node.dataset.variant === active);
+      });
+      label.textContent = `${active} — ${variants.find((item) => item.key === active).name}`;
+    }
+
+    function selectVariant(offset) {
+      const index = variants.findIndex((item) => item.key === active);
+      active = variants[(index + offset + variants.length) % variants.length].key;
+      const url = new URL(location.href);
+      url.searchParams.set("variant", active);
+      history.replaceState(null, "", url);
+      render();
+    }
+
+    function fitStage() {
+      const allowance = 70;
+      const scale = Math.min(innerWidth / 1288, (innerHeight - allowance) / 806, 1);
+      stage.style.transform = `translateX(-50%) scale(${scale})`;
+    }
+
+    document.querySelector("#openHub").addEventListener("click", () => stage.classList.add("hub-open"));
+    document.querySelector("#prevVariant").addEventListener("click", () => selectVariant(-1));
+    document.querySelector("#nextVariant").addEventListener("click", () => selectVariant(1));
+    document.querySelector("#resetView").addEventListener("click", render);
+    window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && stage.classList.contains("hub-open")) {
+        stage.classList.remove("hub-open");
+        return;
+      }
+      if (event.key === "Enter" && active === "A" && !stage.classList.contains("hub-open")) {
+        stage.classList.add("hub-open");
+        return;
+      }
+      if (event.key === "ArrowLeft") selectVariant(-1);
+      if (event.key === "ArrowRight") selectVariant(1);
+    });
+    window.addEventListener("resize", fitStage);
+    fitStage();
+    render();
+  </script>
+</body>
+</html>
