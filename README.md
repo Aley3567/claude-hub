@@ -9,7 +9,7 @@ Claude Code 会话里沿用原生 `/model` 切换渠道和模型。
 `./scripts/install-git-guards.sh`，启用凭证、私有渠道名和本机配置拦截。
 
 默认安装只新增 `claude1` 和 `claude1-direct` 两个 zsh 函数，不会替换普通
-`claude`，也不会修改或启动 ReClaude。
+`claude`。
 
 ## 第一次使用：3 步完成
 
@@ -58,7 +58,6 @@ claude1                         # 打开渠道选择器
 claude1 mimo                    # 按 provider 名或唯一别名直达
 claude1 direct                  # 本次直接启动原生 Claude Code
 claude1 current                 # 本次使用 CC Switch 当前渠道
-claude1 re                      # 本次使用已有的 ReClaude 隔离入口
 claude1 any                     # 本次使用已有的 AnyRouter settings
 claude1 hub                     # 本次通过可选 claude-hub 启动
 claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
@@ -80,7 +79,7 @@ Provider 名称匹配不区分大小写；如果多个名称都匹配，会要�
 
 - `claude1` 的普通启动只影响本次 Claude Code 会话；
 - 不切换 CC Switch 的全局 current provider；
-- 不接管普通 `claude`，不修改 `reclaude`；
+- 不接管普通 `claude`；
 - provider 凭证只进入本次 Claude Code 子进程使用的临时 settings；临时文件
   权限为 `0600`，进程结束后删除；
 - Hub 以只读方式从 CC Switch DB 获取上游地址和凭证，配置示例中不保存上游

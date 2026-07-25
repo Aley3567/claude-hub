@@ -66,9 +66,6 @@ ANYROUTER_OBSERVER = _env_path(
 )
 
 # Composable backends & overlays (claude1 [backend] [overlay...] -- <claude args>)
-RECLAUDE_ISOLATED = _env_path(
-    "CLAUDE1_RECLAUDE_BIN", HOME / ".local" / "bin" / "reclaude-isolated"
-)
 ANYROUTER_SETTINGS = _env_path(
     "CLAUDE1_ANYROUTER_SETTINGS", HOME / ".claude" / "settings.anyrouter.json"
 )
@@ -83,9 +80,6 @@ TEMP_DIR = (
 
 # First positional token → a backend instead of a provider-name hint.
 BACKEND_ALIASES = {
-    "re": "reclaude",
-    "reclaude": "reclaude",
-    "rec": "reclaude",
     "any": "anyrouter",
     "anyrouter": "anyrouter",
     "cc": "current",
@@ -291,7 +285,6 @@ def provider_by_name(name: str) -> dict | None:
 MANAGED_ENV_PREFIXES = (
     "ANTHROPIC_",
     "CLAUDE_CODE_",
-    "RECLAUDE_",
 )
 MANAGED_ENV_KEYS = {
     "HTTP_PROXY",
@@ -1762,10 +1755,10 @@ def _atomic_write_sticky(kind: str) -> None:
 def set_sticky(word: str) -> int:
     """`claude1 use <后端>`：只设置粘性后端、不启动会话。"""
     kind = BACKEND_ALIASES.get(word.lower(), word.lower())
-    if kind not in ("reclaude", "anyrouter", "current", "direct", "hub"):
+    if kind not in ("anyrouter", "current", "direct", "hub"):
         print(
             f"[claude1] 未知后端: {word}"
-            "（可用: re/reclaude · any · cc/current · direct · hub）",
+            "（可用: any · cc/current · direct · hub）",
             file=sys.stderr,
         )
         return 1
@@ -1774,9 +1767,7 @@ def set_sticky(word: str) -> int:
     except OSError as exc:
         print(f"[claude1] 无法写入粘性后端: {exc}", file=sys.stderr)
         return 1
-    if kind == "reclaude":
-        print("[claude1] 粘性后端 = reclaude —— 之后普通 claude 都走 reclaude，直到再切")
-    elif kind == "hub":
+    if kind == "hub":
         print(
             "[claude1] 粘性后端 = hub —— 之后普通 claude 走多渠道网关，"
             "直到再次显式切换"
@@ -1789,7 +1780,7 @@ def set_sticky(word: str) -> int:
 def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     """拆成 (backend, provider_hint, claude_args)。
 
-    backend: 'reclaude' | 'anyrouter' | 'current' | 'direct' | 'hub' | None
+    backend: 'anyrouter' | 'current' | 'direct' | 'hub' | None
     provider_hint: 匹配 CC-Switch provider 的子串（None => 弹菜单）
     claude_args: 展开后的 overlay + 其余原样透传给 claude
     """
@@ -1816,8 +1807,6 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
             if not NOTION_MCP.exists():
                 print(f"[claude1] 警告: notion 配置不存在 {NOTION_MCP}", file=sys.stderr)
             claude_args += ["--mcp-config", str(NOTION_MCP)]
-        elif low in ("--reclaude", "--re"):
-            backend = "reclaude"
         elif low in ("--any", "--anyrouter"):
             backend = "anyrouter"
         elif low in ("--current", "--cc"):
@@ -1827,14 +1816,6 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
         else:
             claude_args.append(arg)
     return backend, hint, claude_args
-
-
-def exec_reclaude(claude_args: list[str]) -> int:
-    if not RECLAUDE_ISOLATED.exists():
-        raise RuntimeError(f"reclaude 未安装: {RECLAUDE_ISOLATED}")
-    record_backend("reclaude")
-    print("[claude1] 后端: reclaude（独立入口，不改 CC Switch）")
-    return int(subprocess.run([str(RECLAUDE_ISOLATED), *claude_args]).returncode)
 
 
 def exec_settings_backend(settings_path: Path, label: str, claude_args: list[str]) -> int:
@@ -2136,7 +2117,7 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 快捷键:
   ↑↓ / jk 移动 · Enter 启动 · 1–9/0 数字直达 · ? 更多操作 · q 退出
 
-默认启动只影响本次会话，不修改普通 claude、CC Switch 当前渠道或 ReClaude。
+默认启动只影响本次会话，不修改普通 claude 或 CC Switch 当前渠道。
 """
 
 
@@ -2261,7 +2242,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "use":
         if len(argv) < 2:
             print(
-                "[claude1] 用法: claude1 use <re|cc|any|direct|hub>",
+                "[claude1] 用法: claude1 use <cc|any|direct|hub>",
                 file=sys.stderr,
             )
             return 1
@@ -2272,8 +2253,6 @@ def main(argv: list[str]) -> int:
 
     backend, hint, claude_args = parse_args(argv)
 
-    if backend == "reclaude":
-        return exec_reclaude(claude_args)
     if backend == "anyrouter":
         return exec_settings_backend(ANYROUTER_SETTINGS, "anyrouter", claude_args)
     if backend == "current":

@@ -60,7 +60,6 @@ def isolated_env(home: Path, **overrides: str) -> dict[str, str]:
         "CLAUDE1_BACKEND_STATE": str(state / "last-session.json"),
         "CLAUDE1_BACKEND_STICKY": str(state / "sticky"),
         "CLAUDE1_ANYROUTER_OBSERVER": str(home / "bin" / "observer"),
-        "CLAUDE1_RECLAUDE_BIN": str(home / "bin" / "reclaude"),
         "CLAUDE1_ANYROUTER_SETTINGS": str(home / "settings" / "anyrouter.json"),
         "CLAUDE1_NOTION_MCP": str(home / "settings" / "notion.json"),
         "CLAUDE1_GATEWAY_BIN": str(home / "bin" / "gateway"),
@@ -697,7 +696,6 @@ class LauncherSafetyTests(unittest.TestCase):
                 "BACKEND_STATE": "CLAUDE1_BACKEND_STATE",
                 "BACKEND_STICKY": "CLAUDE1_BACKEND_STICKY",
                 "ANYROUTER_OBSERVER": "CLAUDE1_ANYROUTER_OBSERVER",
-                "RECLAUDE_ISOLATED": "CLAUDE1_RECLAUDE_BIN",
                 "ANYROUTER_SETTINGS": "CLAUDE1_ANYROUTER_SETTINGS",
                 "NOTION_MCP": "CLAUDE1_NOTION_MCP",
                 "GATEWAY_BIN": "CLAUDE1_GATEWAY_BIN",
@@ -733,12 +731,12 @@ class LauncherSafetyTests(unittest.TestCase):
             env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
             sticky = Path(env["CLAUDE1_BACKEND_STICKY"])
             sticky.parent.mkdir(parents=True)
-            sticky.write_text("reclaude\n", encoding="utf-8")
+            sticky.write_text("hub\n", encoding="utf-8")
 
             with loaded_launcher(env) as launcher:
                 self.assertEqual(launcher.exec_plain_claude("direct", ["-p", "ok"]), 0)
 
-            self.assertEqual(sticky.read_text(encoding="utf-8"), "reclaude\n")
+            self.assertEqual(sticky.read_text(encoding="utf-8"), "hub\n")
             last_session = json.loads(
                 Path(env["CLAUDE1_BACKEND_STATE"]).read_text(encoding="utf-8")
             )
@@ -817,13 +815,12 @@ class LauncherSafetyTests(unittest.TestCase):
             env.update(
                 CLAUDE1_CLAUDE_BIN=str(fake_claude),
                 FAKE_CLAUDE_CAPTURE=str(capture),
-                ANTHROPIC_BASE_URL="https://reclaude.invalid",
+                ANTHROPIC_BASE_URL="https://untrusted.invalid",
                 ANTHROPIC_AUTH_TOKEN="must-not-leak",
                 HTTP_PROXY="http://must-not-leak.invalid",
                 https_proxy="http://must-not-leak.invalid",
-                CLAUDE_CONFIG_DIR=str(home / "reclaude-config"),
+                CLAUDE_CONFIG_DIR=str(home / "untrusted-config"),
                 CLAUDE_CODE_PARENT_SESSION_ID="must-not-leak",
-                RECLAUDE_SESSION_ID="must-not-leak",
                 CLAUDE_HUB_LOCAL_TOKEN="must-not-leak",
                 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="1",
             )
@@ -857,7 +854,6 @@ class LauncherSafetyTests(unittest.TestCase):
                 "https_proxy",
                 "CLAUDE_CONFIG_DIR",
                 "CLAUDE_CODE_PARENT_SESSION_ID",
-                "RECLAUDE_SESSION_ID",
                 "CLAUDE_HUB_LOCAL_TOKEN",
             ):
                 self.assertNotIn(key, child_env)
@@ -1045,7 +1041,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 )
                 sticky = Path(env["CLAUDE1_BACKEND_STICKY"])
                 sticky.parent.mkdir(parents=True)
-                sticky.write_text("reclaude\n", encoding="utf-8")
+                sticky.write_text("direct\n", encoding="utf-8")
                 env.update(
                     CLAUDE1_CLAUDE_BIN=str(fake_claude),
                     FAKE_CLAUDE_CAPTURE=str(capture),
@@ -1082,7 +1078,7 @@ class LauncherSafetyTests(unittest.TestCase):
                         legacy_settings["env"]["ANTHROPIC_AUTH_TOKEN"],
                         "legacy-config-token",
                     )
-                self.assertEqual(sticky.read_text(encoding="utf-8"), "reclaude\n")
+                self.assertEqual(sticky.read_text(encoding="utf-8"), "direct\n")
 
     def test_hub_fails_before_start_when_no_local_token_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
