@@ -43,9 +43,7 @@ source ~/.zshrc
 
 ```bash
 claude1              # 交互式菜单（推荐）
-claude1 deepseek     # 按名称匹配 provider
-claude1 re           # 使用 reclaude 后端
-claude1 any          # 使用 anyrouter 后端
+claude1 anthropic     # 按名称匹配 provider
 claude1 cc           # 使用 CC-Switch 当前 provider
 claude1 --notion     # 加载 Notion MCP overlay
 ```
