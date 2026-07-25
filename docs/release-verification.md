@@ -6,8 +6,8 @@
 ## 结论
 
 `claude1` 的首次引导、日常渠道直达、可选 Hub 会话内切换、安装与隔离边界均已
-通过本机和 GitHub CI 验证。默认安装不会接管普通 `claude`，不会修改或重启
-ReClaude，也不会改变 CC Switch 当前渠道。
+通过本机和 GitHub CI 验证。默认安装不会接管普通 `claude`，也不会改变
+CC Switch 当前渠道。
 
 ## 分阶段交付
 
@@ -53,8 +53,8 @@ SSE 终态追踪器另以 5 万组
   正确、实际路由与所选路由一致；
 - Hub 配置、CC Switch DB、日志、MRU 和后端状态均为 `0600`，DB 只读检查后未
   产生 WAL/SHM 副作用；
-- 普通 `claude` 函数、共享 settings、sticky 状态、既有 ReClaude 进程、长运行
-  launcher 和 CC Switch 监听均保持安装前状态。
+- 普通 `claude` 函数、共享 settings、sticky 状态、长运行 launcher 和
+  CC Switch 监听均保持安装前状态。
 
 真实验收不记录或提交 provider 名称、上游地址、token、请求正文或响应正文。
 
@@ -73,4 +73,4 @@ SSE 终态追踪器另以 5 万组
 安装前的脚本、shell 配置、Hub 配置、数据库一致性快照和运行状态文件已保存在
 `~/.claude/backups/` 下的自动备份与 `manual-stage4-*` 私密目录中。回滚时只应
 停止经端口、命令路径和父子关系确认的 Hub 进程，再恢复对应文件；不得按模糊
-进程名终止 Claude、ReClaude 或 CC Switch。
+进程名终止 Claude 或 CC Switch。

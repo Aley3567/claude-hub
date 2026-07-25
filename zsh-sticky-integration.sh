@@ -38,22 +38,6 @@ claude() {
       "$executable" "$@"
       ;;
 
-    reclaude)
-      local configured="${CLAUDE1_RECLAUDE_BIN:-reclaude-isolated}"
-      local executable=""
-      if [[ "$configured" == */* ]]; then
-        executable="$configured"
-      else
-        executable="$(whence -p "$configured" 2>/dev/null)"
-      fi
-      if [[ -z "$executable" || ! -x "$executable" ]]; then
-        print -u2 -- "[claude1] reclaude backend selected but executable not found: $configured"
-        print -u2 -- "[claude1] install ReClaude or set CLAUDE1_RECLAUDE_BIN, then retry."
-        return 127
-      fi
-      "$executable" "$@"
-      ;;
-
     current|anyrouter|hub)
       if (( ${+functions[claude1]} )); then
         claude1 "$backend" "$@"
@@ -71,7 +55,7 @@ claude() {
 
     *)
       print -u2 -- "[claude1] unsupported sticky backend '$backend' in $state_file"
-      print -u2 -- "[claude1] supported values: direct, reclaude, hub, current, anyrouter."
+      print -u2 -- "[claude1] supported values: direct, hub, current, anyrouter."
       return 2
       ;;
   esac

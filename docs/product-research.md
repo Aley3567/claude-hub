@@ -1,7 +1,7 @@
 # claude1 产品研究与 v1 产品合同
 
 > 更新日期：2026-07-20
-> 范围：`claude1` 终端启动器、可选的 `claude-hub` 本地网关，以及它们与 CC Switch、原生 Claude Code、ReClaude 的边界。
+> 范围：`claude1` 终端启动器、可选的 `claude-hub` 本地网关，以及它们与 CC Switch、原生 Claude Code 的边界。
 
 ## 结论
 
@@ -17,7 +17,7 @@ claude-hub 让同一个 Claude Code 会话通过 /model 热切换渠道与模型
 
 它的核心差异不是“支持更多供应商”，而是以下四点同时成立：
 
-1. **默认只影响本次会话**：不切换 CC Switch 全局 provider，不修改普通 `claude` 或 `reclaude` 的后续路由。
+1. **默认只影响本次会话**：不切换 CC Switch 全局 provider，不修改普通 `claude` 的后续路由。
 2. **新手一条路径完成**：运行 `claude1`，看懂当前选择，按 Enter 启动；失败时给出明确恢复动作。
 3. **熟练用户零菜单直达**：`claude1 <provider-or-alias>`、`claude1 hub --model <channel,model>`。
 4. **沿用 Claude Code 原生交互**：Hub 通过官方 gateway model discovery 进入 `/model` picker，不另造一套会话内命令系统。
@@ -85,9 +85,8 @@ claude-hub 让同一个 Claude Code 会话通过 /model 热切换渠道与模型
 
 ### 1. 隔离合同
 
-- `claude1`、`claude1 <provider>`、`claude1 hub`、`claude1 re` 均为**单次启动**，不得写入普通 `claude` 使用的粘性后端。
+- `claude1`、`claude1 <provider>`、`claude1 hub` 均为**单次启动**，不得写入普通 `claude` 使用的粘性后端。
 - 只有显式 `claude1 use <backend>` 可以修改粘性状态，并必须在输出中说明影响范围。
-- 不修改 `~/.reclaude/**`，不重启 ReClaude，不复用它的配置目录。
 - Hub 只读 CC Switch DB；不修改 provider、current marker 或 proxy 状态。
 - 真实 token 不进入命令行、日志、Git 或错误响应；临时 settings 必须为 `0600` 且进程结束后删除。
 
@@ -108,7 +107,7 @@ Hub 的路由字段只消费 `model`，其余内容保持原样。未知渠道�
 ### 3. 安全合同
 
 - 只监听 `127.0.0.1`，健康检查必须验证 HTTP 200、`service=claude-hub` 和兼容协议版本，不能把任意 HTTP 响应当成健康。
-- Hub 子进程使用环境白名单启动，不继承 Anthropic 凭证、代理、ReClaude 或 Claude child-session 标记。
+- Hub 子进程使用环境白名单启动，不继承 Anthropic 凭证、代理或 Claude child-session 标记。
 - 远端上游默认只允许 HTTPS；非 loopback HTTP 必须由单个渠道显式设置 `allow_insecure_http: true`。
 - 配置与 DB 权限必须为 `0600`；公开健康端点不返回 provider 名、上游主机或凭证信息。
 - 日志只记录渠道别名、模型、状态、延迟、字节数和恢复原因，不记录请求或响应正文。
@@ -130,7 +129,6 @@ Hub 的路由字段只消费 `model`，其余内容保持原样。未知渠道�
 - 不实现团队、预算、RBAC、Postgres、Bot、MCP 聚合或流量抓包；
 - 不在流式输出已经开始后自动重放到另一渠道；
 - 不记录完整 prompt、代码或 response；
-- 不修改或“顺手修复” ReClaude。
 
 ## 分阶段验收
 
@@ -161,7 +159,7 @@ Hub 的路由字段只消费 `model`，其余内容保持原样。未知渠道�
 - 使用临时 HOME、随机端口与 fake upstream 完成全套测试；
 - 再使用 `claude1` 在独立测试端口做最小真实 smoke；
 - 安装前备份 Home 脚本和配置；
-- 安装前后 ReClaude daemon、现有 ReClaude 会话、15721 代理和普通 `claude` 路由保持不变；
+- 安装前后现有本机服务、代理和普通 `claude` 路由保持不变；
 - 每个阶段测试、secret scan、Git 状态通过后提交并推送。
 
 ## 最终产品判断

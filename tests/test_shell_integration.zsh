@@ -41,14 +41,11 @@ make_home() {
   print -r -- '#!/bin/sh' > "$home/bin/claude"
   print -r -- 'printf "claude:%s\n" "$*" >> "$CALL_LOG"' >> "$home/bin/claude"
 
-  print -r -- '#!/bin/sh' > "$home/bin/reclaude-isolated"
-  print -r -- 'printf "reclaude:%s\n" "$*" >> "$CALL_LOG"' >> "$home/bin/reclaude-isolated"
-
   print -r -- '#!/bin/sh' > "$home/bin/python3"
   print -r -- 'printf "python3:%s\n" "$*" >> "$CALL_LOG"' >> "$home/bin/python3"
 
   print -r -- '# launcher fixture' > "$home/launcher.py"
-  command chmod +x "$home/bin/claude" "$home/bin/reclaude-isolated" "$home/bin/python3"
+  command chmod +x "$home/bin/claude" "$home/bin/python3"
   print -r -- "$home"
 }
 
@@ -136,30 +133,7 @@ test_opt_in_routes() {
   run_sticky_case "$home" "current" "python3:${home}/launcher.py current sample"
   run_sticky_case "$home" "anyrouter" "python3:${home}/launcher.py anyrouter sample"
   run_sticky_case "$home" "hub" "python3:${home}/launcher.py hub sample"
-  run_sticky_case "$home" "reclaude" "reclaude:sample"
-
   pass "opt-in integration routes every supported sticky backend"
-}
-
-test_opt_in_reports_missing_reclaude() {
-  local home="$(make_home missing-reclaude)"
-  local output exit_code
-  print -r -- "reclaude" > "$home/.cc-switch/claude1-backend"
-
-  set +e
-  output="$(
-    HOME="$home" PATH="$home/bin:/usr/bin:/bin" \
-      DEFAULT_SCRIPT_PATH="$DEFAULT_INTEGRATION" STICKY_SCRIPT_PATH="$STICKY_INTEGRATION" \
-      CLAUDE1_RECLAUDE_BIN="missing-reclaude" \
-      zsh -f -c 'source "$DEFAULT_SCRIPT_PATH"; source "$STICKY_SCRIPT_PATH"; claude' 2>&1
-  )"
-  exit_code=$?
-  set -e
-
-  [[ $exit_code -eq 127 ]] || fail "missing reclaude should return 127"
-  [[ "$output" == *"reclaude backend selected but executable not found"* ]] \
-    || fail "missing reclaude error is unclear"
-  pass "opt-in integration reports a missing reclaude executable clearly"
 }
 
 test_opt_in_reports_missing_direct_binary() {
@@ -225,7 +199,6 @@ test_default_does_not_override_claude
 test_default_preserves_existing_claude_function
 test_default_reports_missing_launcher
 test_opt_in_routes
-test_opt_in_reports_missing_reclaude
 test_opt_in_reports_missing_direct_binary
 test_opt_in_reports_missing_launcher
 test_opt_in_rejects_unknown_backend
