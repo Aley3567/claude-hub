@@ -296,16 +296,65 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     False,
                     {},
                     show_brand=True,
+                    provider_models={"Alpha": "model-fixture"},
                 )
 
                 rendered = "\n".join(text for _y, _x, text in window.writes)
                 self.assertIn("欢迎回来", rendered)
+                self.assertIn("模型 model-fixture", rendered)
                 self.assertTrue(
                     any(text == "█" for _y, _x, text in window.writes)
                 )
                 self.assertTrue(
                     any(y == 12 and "Alpha" in text for y, _x, text in window.writes)
                 )
+
+    def test_provider_model_summary_uses_cc_switch_model_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                settings = {
+                    "model": "root-fallback",
+                    "env": {
+                        "ANTHROPIC_MODEL": "main-model",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": "main-model",
+                    },
+                }
+                self.assertEqual(
+                    launcher._provider_model_values(settings),
+                    ["main-model", "root-fallback", "sonnet-model"],
+                )
+                self.assertEqual(
+                    launcher._provider_model_summary(settings),
+                    "main-model +2",
+                )
+                self.assertEqual(launcher._provider_model_summary({}), "自动")
+
+    def test_model_edit_key_opens_cc_switch_without_writing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+                window = ScriptedWindow([ord("m"), ord("q")])
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "_load_hub_view", return_value=None),
+                    mock.patch.object(
+                        launcher, "_open_cc_switch_editor", return_value=True
+                    ) as open_editor,
+                ):
+                    selected = launcher._launcher_main(
+                        window,
+                        cfg,
+                        {"Alpha"},
+                        {"Alpha": "model-fixture"},
+                    )
+                self.assertIsNone(selected)
+                open_editor.assert_called_once_with()
 
     def test_cjk_clipping_never_exceeds_requested_width(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

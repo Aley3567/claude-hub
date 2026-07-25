@@ -49,7 +49,9 @@ claude1
 ```
 
 使用 `↑↓` 或 `j/k` 移动，按 Enter 启动；前 10 项也可以用 `1–9` 和 `0`
-直接选择。最近使用的渠道会成为默认光标，但列表顺序和数字编号保持稳定。
+直接选择。每个 provider 行会显示 CC Switch 中配置的主模型；选中后按 `m`
+打开 CC Switch 官方编辑界面，保存后回到菜单按 `r` 即可刷新。最近使用的
+渠道会成为默认光标，但列表顺序和数字编号保持稳定。
 
 ## 高频使用速查
 
@@ -75,6 +77,12 @@ CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 
 Provider 名称匹配不区分大小写；如果多个名称都匹配，会要求再次选择，避免
 静默走错渠道。别名不能与 `hub`、`list`、`doctor` 等保留命令冲突。
+
+普通 provider 的模型以 CC Switch `providers.settings_config` 为唯一真相源；
+`claude1` 只读显示，不直接改写 CC Switch 数据库。当前 provider 在 CC Switch
+官方编辑器中保存时，还会执行 live config 回填与同步，因此不要绕过该流程。
+Hub 二级菜单的可选模型仍来自 `~/.cc-switch/claude-hub.json`，与普通 provider
+的模型字段是两个不同层次。
 
 ## 默认隔离边界
 
