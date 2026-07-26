@@ -10,6 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+desktop = [
+    "PySide6>=6.8,<7",
+    "keyring>=25,<26",
+]
+
 [project.scripts]
 claude-hub = "claude_hub.entrypoints:hub_main"
 claude1 = "claude_hub.entrypoints:claude1_main"
