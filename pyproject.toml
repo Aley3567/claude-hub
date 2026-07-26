@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-hub-kit"
+version = "0.1.0"
+description = "Installable command entry points for the claude-hub toolkit"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+claude-hub = "claude_hub.entrypoints:hub_main"
+claude1 = "claude_hub.entrypoints:claude1_main"
+switchctl = "claude_hub.switchctl:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["claude_hub", "claude_hub.*"]

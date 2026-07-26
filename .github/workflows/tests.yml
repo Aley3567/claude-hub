@@ -32,8 +32,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install test dependency
-        run: python -m pip install "aiohttp>=3.9"
+      - name: Install test dependencies
+        run: python -m pip install "aiohttp>=3.9" "setuptools>=68" wheel
 
       - name: Install zsh on Linux
         if: runner.os == 'Linux'
