@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-import stat
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +15,29 @@ GUARD = ROOT / "claude1-turn-guard.py"
 
 
 class TurnGuardTests(unittest.TestCase):
+    def _run_guard(
+        self,
+        home: Path,
+        event: str,
+        hook_input: dict,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        state_dir = home / "guard-state"
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "CLAUDE1_TURN_GUARD_STATE_DIR": str(state_dir),
+        }
+        result = subprocess.run(
+            [sys.executable, str(GUARD), event],
+            input=json.dumps(hook_input),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+        return result, state_dir
+
     def test_thinking_only_end_turn_requests_one_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
@@ -42,7 +65,7 @@ class TurnGuardTests(unittest.TestCase):
             hook_input = {
                 "transcript_path": str(transcript),
                 "stop_hook_active": False,
-                "last_assistant_message": "",
+                "last_assistant_message": " \t",
             }
             env = {
                 **os.environ,
@@ -205,6 +228,48 @@ class TurnGuardTests(unittest.TestCase):
                 (state_dir / "watch.log").read_text(encoding="utf-8"),
             )
 
+    def test_last_assistant_message_wins_over_stale_thinking_transcript(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            transcript = home / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_fixture_stale",
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": "stale fixture reasoning",
+                                }
+                            ],
+                            "stop_reason": "end_turn",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result, state_dir = self._run_guard(
+                home,
+                "stop",
+                {
+                    "transcript_path": str(transcript),
+                    "stop_hook_active": False,
+                    "last_assistant_message": "new fixture final answer",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            log = (state_dir / "watch.log").read_text(encoding="utf-8")
+            self.assertIn("LIVE_OK usable assistant response", log)
+            self.assertNotIn("stale fixture reasoning", log)
+            self.assertNotIn("new fixture final answer", log)
+
     def test_tool_use_end_turn_is_released_as_usable(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
@@ -302,36 +367,240 @@ class TurnGuardTests(unittest.TestCase):
             self.assertIn("LIVE_UNK transcript unavailable", log)
             self.assertNotIn(private_marker, log)
 
-    def test_explicit_connection_failure_is_recorded_as_drop(self) -> None:
+    def test_corrupt_or_missing_tail_never_reuses_older_thinking_only(
+        self,
+    ) -> None:
+        stale_event = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "msg_fixture_stale_tail",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "old fixture reasoning",
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                },
+            }
+        )
+        tails = (
+            '{"type":"assistant","message":',
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {"content": "new fixture request"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_fixture_incomplete",
+                        "content": [{"type": "thinking", "thinking": "new"}],
+                        "stop_reason": None,
+                    },
+                }
+            ),
+        )
+
+        for index, tail in enumerate(tails):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as raw_home:
+                home = Path(raw_home)
+                transcript = home / "session.jsonl"
+                transcript.write_text(
+                    f"{stale_event}\n{tail}\n",
+                    encoding="utf-8",
+                )
+                result, state_dir = self._run_guard(
+                    home,
+                    "stop",
+                    {
+                        "transcript_path": str(transcript),
+                        "stop_hook_active": False,
+                        "last_assistant_message": "",
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                log = (state_dir / "watch.log").read_text(encoding="utf-8")
+                self.assertIn("LIVE_UNK transcript unavailable", log)
+                self.assertNotIn("old fixture reasoning", log)
+
+    def test_missing_transcript_is_released_safely(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
-            state_dir = home / "guard-state"
-            env = {
-                **os.environ,
-                "HOME": str(home),
-                "CLAUDE1_TURN_GUARD_STATE_DIR": str(state_dir),
-            }
+            result, state_dir = self._run_guard(
+                home,
+                "stop",
+                {
+                    "transcript_path": str(home / "missing.jsonl"),
+                    "stop_hook_active": False,
+                    "last_assistant_message": "",
+                },
+            )
 
-            result = subprocess.run(
-                [sys.executable, str(GUARD), "failure"],
-                input=json.dumps(
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(
+                "LIVE_UNK transcript unavailable",
+                (state_dir / "watch.log").read_text(encoding="utf-8"),
+            )
+
+    def test_bounded_tail_ignores_oversized_invalid_old_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            transcript = home / "session.jsonl"
+            final_event = json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_fixture_bounded_tail",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "fixture bounded reasoning",
+                            }
+                        ],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            ).encode("utf-8")
+            transcript.write_bytes(
+                b"\xff" * (600 * 1024) + b"\n" + final_event + b"\n"
+            )
+
+            result, _state_dir = self._run_guard(
+                home,
+                "stop",
+                {
+                    "transcript_path": str(transcript),
+                    "stop_hook_active": False,
+                    "last_assistant_message": "",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_oversized_unterminated_final_segment_fails_open(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            transcript = home / "session.jsonl"
+            old_event = json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_fixture_old_large",
+                        "content": [{"type": "thinking", "thinking": "old"}],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            ).encode("utf-8")
+            transcript.write_bytes(
+                old_event
+                + b"\n"
+                + b'{"type":"assistant","message":{"id":"msg_fixture_large",'
+                + b'"content":"'
+                + b"x" * (600 * 1024)
+            )
+
+            result, state_dir = self._run_guard(
+                home,
+                "stop",
+                {
+                    "transcript_path": str(transcript),
+                    "stop_hook_active": False,
+                    "last_assistant_message": "",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(
+                "LIVE_UNK transcript unavailable",
+                (state_dir / "watch.log").read_text(encoding="utf-8"),
+            )
+
+    def test_stop_failure_uses_official_observation_only_taxonomy(self) -> None:
+        cases = {
+            "rate_limit": "LIVE_BUSY rate limited",
+            "overloaded": "LIVE_DOWN upstream unavailable",
+            "authentication_failed": "LIVE_AUTH authentication failed",
+            "oauth_org_not_allowed": "LIVE_AUTH authentication failed",
+            "billing_error": "LIVE_BILLING billing unavailable",
+            "invalid_request": "LIVE_REJECT request rejected",
+            "model_not_found": "LIVE_REJECT model unavailable",
+            "server_error": "LIVE_DOWN upstream unavailable",
+            "max_output_tokens": "LIVE_LIMIT output limit reached",
+            "unknown": "LIVE_UNK unclassified API failure",
+        }
+        private_marker = "fixture-private-failure-detail"
+
+        for error_type, expected in cases.items():
+            with (
+                self.subTest(error_type=error_type),
+                tempfile.TemporaryDirectory() as raw_home,
+            ):
+                home = Path(raw_home)
+                result, state_dir = self._run_guard(
+                    home,
+                    "failure",
                     {
-                        "error": "connection_failed",
-                        "last_assistant_message": "fixture private message",
-                    }
-                ),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                check=False,
+                        "error": error_type,
+                        "error_details": {"message": private_marker},
+                        "last_assistant_message": private_marker,
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
+                log = (state_dir / "watch.log").read_text(encoding="utf-8")
+                self.assertIn(expected, log)
+                self.assertNotIn(private_marker, log)
+                self.assertNotIn("续跑", log)
+                self.assertNotIn("decision", log)
+
+    def test_unofficial_failure_value_is_only_observed_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            result, state_dir = self._run_guard(
+                home,
+                "failure",
+                {
+                    "error": "connection_failed",
+                    "error_details": "fixture private message",
+                },
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
             log = (state_dir / "watch.log").read_text(encoding="utf-8")
-            self.assertIn("LIVE_DROP explicit API failure", log)
+            self.assertIn("LIVE_UNK unclassified API failure", log)
             self.assertNotIn("fixture private message", log)
+
+    def test_user_interrupt_has_no_guard_event_or_continuation_claim(self) -> None:
+        # Claude does not invoke Stop for a user interrupt.  An unsupported
+        # event must therefore be a complete no-op rather than inferred from
+        # transcript content.
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            result, state_dir = self._run_guard(
+                home,
+                "user-interrupt",
+                {
+                    "transcript_path": str(home / "session.jsonl"),
+                    "last_assistant_message": "fixture private message",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "")
+            self.assertFalse(state_dir.exists())
 
     def test_large_log_is_rotated_and_kept_private(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -348,7 +617,7 @@ class TurnGuardTests(unittest.TestCase):
 
             result = subprocess.run(
                 [sys.executable, str(GUARD), "failure"],
-                input=json.dumps({"error": "connection_failed"}),
+                input=json.dumps({"error": "server_error"}),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -359,7 +628,7 @@ class TurnGuardTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertLess(log_path.stat().st_size, 256 * 1024)
             self.assertIn(
-                "LIVE_DROP explicit API failure",
+                "LIVE_DOWN upstream unavailable",
                 log_path.read_text(encoding="utf-8"),
             )
             rotated = state_dir / "watch.log.1"

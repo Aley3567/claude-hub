@@ -20,6 +20,20 @@ BREAKER_MESSAGE = (
     "建议用同一模型 /resume 恢复本会话，或 fork 会话重试。"
 )
 MAX_LOG_BYTES = 256 * 1024
+MAX_TRANSCRIPT_BYTES = 512 * 1024
+
+STOP_FAILURE_OBSERVATIONS = {
+    "rate_limit": ("LIVE_BUSY", "rate limited"),
+    "overloaded": ("LIVE_DOWN", "upstream unavailable"),
+    "authentication_failed": ("LIVE_AUTH", "authentication failed"),
+    "oauth_org_not_allowed": ("LIVE_AUTH", "authentication failed"),
+    "billing_error": ("LIVE_BILLING", "billing unavailable"),
+    "invalid_request": ("LIVE_REJECT", "request rejected"),
+    "model_not_found": ("LIVE_REJECT", "model unavailable"),
+    "server_error": ("LIVE_DOWN", "upstream unavailable"),
+    "max_output_tokens": ("LIVE_LIMIT", "output limit reached"),
+    "unknown": ("LIVE_UNK", "unclassified API failure"),
+}
 
 
 def _state_dir() -> Path:
@@ -70,10 +84,8 @@ def _record(status: str, message: str) -> None:
         return
 
 
-def _last_assistant_shape(transcript_path: Path) -> tuple[str | None, set[str]]:
-    message_id: str | None = None
-    stop_reason: str | None = None
-    content_types: set[str] = set()
+def _bounded_transcript_tail(transcript_path: Path) -> str:
+    """Read only complete lines from a stable, bounded regular-file tail."""
 
     expected = transcript_path.lstat()
     if not stat.S_ISREG(expected.st_mode):
@@ -84,56 +96,120 @@ def _last_assistant_shape(transcript_path: Path) -> tuple[str | None, set[str]]:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(transcript_path, flags)
-    opened = os.fstat(descriptor)
-    if not stat.S_ISREG(opened.st_mode) or (
-        opened.st_dev,
-        opened.st_ino,
-    ) != (
-        expected.st_dev,
-        expected.st_ino,
-    ):
-        os.close(descriptor)
-        raise OSError("transcript changed while opening")
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OSError("transcript changed while opening")
 
-    with os.fdopen(descriptor, "r", encoding="utf-8") as transcript:
-        for line in transcript:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+        start = max(0, opened.st_size - MAX_TRANSCRIPT_BYTES)
+        read_start = start - 1 if start else 0
+        os.lseek(descriptor, read_start, os.SEEK_SET)
+        remaining = opened.st_size - read_start
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+        ):
+            raise OSError("transcript changed while reading")
+    finally:
+        os.close(descriptor)
+
+    raw_tail = b"".join(chunks)
+    if start:
+        if raw_tail.startswith(b"\n"):
+            raw_tail = raw_tail[1:]
+        else:
+            first_newline = raw_tail.find(b"\n")
+            if first_newline < 0:
+                raise OSError("transcript tail has no complete line")
+            raw_tail = raw_tail[first_newline + 1 :]
+    return raw_tail.decode("utf-8")
+
+
+def _last_assistant_shape(transcript_path: Path) -> tuple[str | None, set[str]]:
+    message_id: str | None = None
+    stop_reason: str | None = None
+    content_types: set[str] = set()
+
+    transcript = _bounded_transcript_tail(transcript_path)
+    last_meaningful_line = -1
+    last_assistant_line = -1
+    for line_number, line in enumerate(transcript.splitlines()):
+        if not line.strip():
+            continue
+        last_meaningful_line = line_number
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        current_id = message.get("id")
+        if not isinstance(current_id, str) or not current_id:
+            continue
+
+        last_assistant_line = line_number
+        if current_id != message_id:
+            message_id = current_id
+            stop_reason = None
+            content_types = set()
+        current_stop = message.get("stop_reason")
+        stop_reason = current_stop if isinstance(current_stop, str) else None
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                content_types.add("text")
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
                 continue
-            message = event.get("message")
-            if event.get("type") != "assistant" or not isinstance(message, dict):
+            block_type = block.get("type")
+            if block_type == "text" and not block.get("text"):
                 continue
-            current_id = message.get("id")
-            if not isinstance(current_id, str) or not current_id:
-                continue
-            if current_id != message_id:
-                message_id = current_id
-                stop_reason = None
-                content_types = set()
-            current_stop = message.get("stop_reason")
-            if isinstance(current_stop, str):
-                stop_reason = current_stop
-            content = message.get("content")
-            if isinstance(content, str):
-                if content:
-                    content_types.add("text")
-                continue
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if block_type == "text" and not block.get("text"):
-                    continue
-                if isinstance(block_type, str):
-                    content_types.add(block_type)
+            if isinstance(block_type, str):
+                content_types.add(block_type)
+
+    # Stop can run before the transcript contains its final assistant record.
+    # Never fall back to an older thinking-only response when the newest line
+    # is corrupt, non-assistant, or otherwise incomplete.
+    if (
+        last_meaningful_line < 0
+        or last_assistant_line != last_meaningful_line
+        or stop_reason is None
+    ):
+        raise OSError("final assistant transcript segment unavailable")
 
     return stop_reason, content_types
 
 
 def _handle_stop(hook_input: dict) -> None:
+    last_assistant_message = hook_input.get("last_assistant_message")
+    if (
+        isinstance(last_assistant_message, str)
+        and last_assistant_message.strip()
+    ):
+        _record("LIVE_OK", "usable assistant response")
+        return
+
     transcript_value = hook_input.get("transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
         _record("LIVE_UNK", "transcript unavailable")
@@ -180,24 +256,17 @@ def _handle_stop(hook_input: dict) -> None:
 
 def _handle_failure(hook_input: dict) -> None:
     error_type = hook_input.get("error")
-    if error_type in {
-        "connection_failed",
-        "connection_closed",
-        "network_error",
-        "response_stalled",
-    }:
-        _record("LIVE_DROP", "explicit API failure")
-        return
-    if error_type == "rate_limit":
-        _record("LIVE_BUSY", "rate limited")
-        return
-    if error_type in {"overloaded", "server_error"}:
-        _record("LIVE_DOWN", "upstream unavailable")
-        return
-    if error_type in {"authentication_failed", "oauth_org_not_allowed"}:
-        _record("LIVE_AUTH", "authentication failed")
-        return
-    _record("LIVE_UNK", "unclassified API failure")
+    observation = (
+        STOP_FAILURE_OBSERVATIONS.get(error_type)
+        if isinstance(error_type, str)
+        else None
+    )
+    if observation is None:
+        observation = STOP_FAILURE_OBSERVATIONS["unknown"]
+    # StopFailure is observation-only. Its output and exit status cannot
+    # control whether Claude continues, so this handler deliberately emits
+    # neither a decision nor user-visible error content.
+    _record(*observation)
 
 
 def main(argv: list[str]) -> int:
@@ -205,7 +274,7 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         hook_input = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError, RecursionError):
         return 0
     if isinstance(hook_input, dict):
         if argv == ["stop"]:
