@@ -471,6 +471,19 @@ def _read_provider_rows(path: Path) -> dict:
             token = auth_token or api_key or ""
             if not isinstance(token, str):
                 token = ""
+            try:
+                capability_profile = resolve_capability_profile(
+                    meta=meta,
+                    settings=settings,
+                    provider_type=values.get("provider_type"),
+                )
+                capability_error = None
+            except ProviderPolicyError as exc:
+                # Degrade only this provider: healthy channels keep serving
+                # while requests routed here fail closed with a redacted
+                # reason that doctor/list can also surface.
+                capability_profile = None
+                capability_error = str(exc)
             rows[name] = {
                 "base_url": base,
                 "token": token,
@@ -490,11 +503,8 @@ def _read_provider_rows(path: Path) -> dict:
                 "provider_type": (
                     values.get("provider_type") or meta.get("providerType")
                 ),
-                "capability_profile": resolve_capability_profile(
-                    meta=meta,
-                    settings=settings,
-                    provider_type=values.get("provider_type"),
-                ),
+                "capability_profile": capability_profile,
+                "capability_error": capability_error,
                 "_capability_meta": meta,
                 "_capability_settings": settings,
                 "is_full_url": is_full_url,
@@ -763,6 +773,12 @@ def resolve_provider(
             502,
             "selected channel provider has ambiguous credential sources",
         )
+    if provider.get("capability_error"):
+        raise RouteError(
+            502,
+            f"channel '{alias}' has an invalid capability declaration; "
+            "run `claude-hub doctor` for the redacted reason",
+        )
     validate_upstream_url(
         provider["base_url"],
         alias,
@@ -981,6 +997,14 @@ def apply_request_capabilities(
     profile: CapabilityProfile,
 ) -> list[str]:
     """Apply safe request degradation and return non-sensitive reason codes."""
+    # Direct launch refuses background_worker_safe=unsafe providers; the hub
+    # must not serve them either, or the launcher policy could be bypassed.
+    if profile.get("background_worker_safe") == "unsafe":
+        raise RouteError(
+            400,
+            "the selected channel declares background workers unsafe; "
+            "claude-hub refuses to serve it",
+        )
     tools = payload.get("tools")
     if (
         profile.get("protocol") != "anthropic"
@@ -1911,7 +1935,12 @@ def cli_list() -> None:
     for alias, channel in cfg["channels"].items():
         provider = providers.get(channel["provider"])
         marker = "*" if alias == cfg["default_channel"] else " "
-        status = "ready" if provider else "provider missing from DB"
+        if provider is None:
+            status = "provider missing from DB"
+        elif provider.get("capability_error"):
+            status = "capability declaration invalid"
+        else:
+            status = "ready"
         print(
             f" {marker}{alias:<{width}}  {channel['provider']:<16} "
             f"{status:<24} {', '.join(channel.get('models', []))}"
@@ -2016,6 +2045,11 @@ def cli_doctor() -> int:
                     problems.append("credential missing")
                 if provider.get("credential_ambiguous"):
                     problems.append("credential sources ambiguous")
+                if provider.get("capability_error"):
+                    problems.append(
+                        "capability declaration invalid "
+                        f"({provider['capability_error']})"
+                    )
                 try:
                     validate_upstream_url(
                         provider.get("base_url", ""),

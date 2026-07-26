@@ -119,7 +119,14 @@ class TurnGuardTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "")
+            payload = json.loads(result.stdout)
+            # 熔断时必须放行（不再 block），但要向用户显示降级状态与恢复建议。
+            self.assertNotIn("decision", payload)
+            self.assertIn("systemMessage", payload)
+            self.assertIn("已停止自动续跑", payload["systemMessage"])
+            self.assertIn("/resume", payload["systemMessage"])
+            # 提示不得携带 transcript 内容。
+            self.assertNotIn("fixture", result.stdout)
             self.assertIn(
                 "LIVE_BROKEN repeated thinking-only end_turn",
                 (state_dir / "watch.log").read_text(encoding="utf-8"),

@@ -222,6 +222,118 @@ class ProviderIsolationTests(unittest.TestCase):
                 ),
             )
 
+    def test_remote_http_base_url_is_rejected_without_echoing_the_url(self) -> None:
+        profile = policy.resolve_capability_profile()
+        with self.assertRaisesRegex(
+            policy.ProviderPolicyError,
+            "cleartext http",
+        ) as caught:
+            policy.prepare_provider_settings(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://third-party.invalid/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-auth",  # secret-guard: allow
+                    }
+                },
+                profile,
+            )
+        self.assertNotIn("third-party.invalid", str(caught.exception))
+
+    def test_loopback_http_and_remote_https_base_urls_are_accepted(self) -> None:
+        profile = policy.resolve_capability_profile()
+        for base_url in (
+            "http://127.0.0.1:8080",
+            "http://localhost:8080/v1",
+            "http://[::1]:8080",
+            "https://third-party.invalid/v1",
+        ):
+            with self.subTest(base_url=base_url):
+                prepared = policy.prepare_provider_settings(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": base_url,
+                            "ANTHROPIC_AUTH_TOKEN": "fixture-auth",  # secret-guard: allow
+                        }
+                    },
+                    profile,
+                )
+                self.assertEqual(
+                    prepared["env"]["ANTHROPIC_BASE_URL"],
+                    base_url,
+                )
+
+    def test_1m_suffix_on_any_model_env_key_requires_a_1m_window(self) -> None:
+        for key in (
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+        ):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    policy.ProviderPolicyError,
+                    "context window is unknown",
+                ):
+                    policy.prepare_provider_settings(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": (
+                                    "https://third-party.invalid"
+                                ),
+                                "ANTHROPIC_AUTH_TOKEN": "fixture-auth",  # secret-guard: allow
+                                key: "opaque-model[1m]",
+                            }
+                        },
+                        policy.resolve_capability_profile(),
+                    )
+
+    def test_explicit_disable_1m_context_is_preserved(self) -> None:
+        base_env = {
+            "ANTHROPIC_BASE_URL": "https://third-party.invalid",
+            "ANTHROPIC_AUTH_TOKEN": "fixture-auth",  # secret-guard: allow
+        }
+        large = policy.resolve_capability_profile(
+            override={"context_window": 1_000_000}
+        )
+        small = policy.resolve_capability_profile()
+
+        # 1M window: an explicit user value is no longer popped.
+        prepared = policy.prepare_provider_settings(
+            {"env": {**base_env, "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1"}},
+            large,
+        )
+        self.assertEqual(
+            prepared["env"]["CLAUDE_CODE_DISABLE_1M_CONTEXT"],
+            "1",
+        )
+        # 1M window without an explicit value: the flag stays unset.
+        prepared = policy.prepare_provider_settings(
+            {"env": dict(base_env)},
+            large,
+        )
+        self.assertNotIn(
+            "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+            prepared["env"],
+        )
+        # Small window: an explicit user value is not overwritten.
+        prepared = policy.prepare_provider_settings(
+            {"env": {**base_env, "CLAUDE_CODE_DISABLE_1M_CONTEXT": "0"}},
+            small,
+        )
+        self.assertEqual(
+            prepared["env"]["CLAUDE_CODE_DISABLE_1M_CONTEXT"],
+            "0",
+        )
+        # Small window without an explicit value: fail-closed default stays.
+        prepared = policy.prepare_provider_settings(
+            {"env": dict(base_env)},
+            small,
+        )
+        self.assertEqual(
+            prepared["env"]["CLAUDE_CODE_DISABLE_1M_CONTEXT"],
+            "1",
+        )
+
     def test_unknown_context_rejects_direct_1m_model(self) -> None:
         with self.assertRaisesRegex(
             policy.ProviderPolicyError,

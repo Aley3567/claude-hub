@@ -15,6 +15,10 @@ CONTINUE_REASON = (
     "上一轮响应只产生了 thinking，未返回正文或工具调用。"
     "请从中断处继续完成原任务；已执行过的工具调用不要重复执行。"
 )
+BREAKER_MESSAGE = (
+    "claude1 守护：连续收到只含 thinking 的空结束，已停止自动续跑。"
+    "建议用同一模型 /resume 恢复本会话，或 fork 会话重试。"
+)
 MAX_LOG_BYTES = 256 * 1024
 
 
@@ -149,7 +153,18 @@ def _handle_stop(hook_input: dict) -> None:
         and "tool_use" not in content_types
     ):
         if hook_input.get("stop_hook_active") is True:
+            # 熔断上限刻意为 1：本守护逐轮无状态，只能靠 stop_hook_active
+            # 判断"本次 Stop 已被某个 Stop hook 拦截过"。其他 Stop hook 拦截后
+            # 也会落到这里，属于已知交互；方向是 fail-safe（宁可少续跑一次）。
             _record("LIVE_BROKEN", "repeated thinking-only end_turn")
+            # 放行本次停止（不再 block），但通过 systemMessage 给用户可见的
+            # 降级提示；不携带渠道名或 transcript 内容。
+            print(
+                json.dumps(
+                    {"systemMessage": BREAKER_MESSAGE},
+                    ensure_ascii=False,
+                )
+            )
             return
         _record("LIVE_EMPTY", "thinking-only end_turn")
         print(

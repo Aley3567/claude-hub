@@ -539,6 +539,118 @@ class ClaudeHubTests(unittest.TestCase):
         hub.apply_beta_policy(headers, mapped, "opaque-model")
         self.assertEqual(headers["anthropic-beta"], "upstream-beta")
 
+    def test_worker_unsafe_channel_is_rejected_with_redacted_400(self):
+        raw_config = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw_config["channels"]["fast"]["capabilities"][
+            "background_worker_safe"
+        ] = "unsafe"
+        self.config_file.write_text(json.dumps(raw_config), encoding="utf-8")
+        self.config_file.chmod(0o600)
+        hub.reset_caches()
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,claude-sonnet-4",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(session.calls, [])
+        self.assertIn("background workers unsafe", response.text)
+        self.assertNotIn("Fixture HTTPS", response.text)
+        self.assertNotIn("upstream.invalid", response.text)
+
+    def test_invalid_capability_declaration_degrades_only_that_channel(self):
+        connection = sqlite3.connect(self.db_file)
+        try:
+            connection.execute(
+                "INSERT INTO providers VALUES (?, 'claude', ?)",
+                (
+                    "Fixture Bad Caps",
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": (
+                                    "https://degraded.invalid/v1"
+                                ),
+                                "ANTHROPIC_AUTH_TOKEN": (
+                                    "fixture-upstream-token"
+                                ),
+                            },
+                            "claude1": {
+                                "capabilities": {"tool_search": "bogus"}
+                            },
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        raw_config = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw_config["channels"]["degraded"] = {
+            "provider": "Fixture Bad Caps",
+            "models": ["degraded-model"],
+        }
+        raw_config["channels"]["fast"]["capabilities"]["count_tokens"] = (
+            "estimated"
+        )
+        self.config_file.write_text(json.dumps(raw_config), encoding="utf-8")
+        self.config_file.chmod(0o600)
+        hub.reset_caches()
+
+        # 单渠道声明无效不再拖垮整库读取，健康渠道照常解析。
+        providers = hub.get_providers()
+        self.assertIn("Fixture HTTPS", providers)
+        broken = providers["Fixture Bad Caps"]
+        self.assertIsNone(broken["capability_profile"])
+        self.assertIn("tool_search", broken["capability_error"])
+        self.assertNotIn("bogus", broken["capability_error"])
+
+        healthy = self._request(
+            {
+                "model": "fast,claude-sonnet-4",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            path="/v1/messages/count_tokens",
+        )
+        healthy_response = asyncio.run(hub.handle_messages(healthy))
+        self.assertEqual(healthy_response.status, 200)
+
+        session = _NeverSession()
+        degraded = self._request(
+            {
+                "model": "degraded,degraded-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+        )
+        degraded_response = asyncio.run(hub.handle_messages(degraded))
+        self.assertEqual(degraded_response.status, 502)
+        self.assertEqual(session.calls, [])
+        self.assertIn("degraded", degraded_response.text)
+        self.assertIn("capability declaration", degraded_response.text)
+        self.assertNotIn("Fixture Bad Caps", degraded_response.text)
+        self.assertNotIn("bogus", degraded_response.text)
+
+        list_output = io.StringIO()
+        with redirect_stdout(list_output):
+            hub.cli_list()
+        self.assertIn("capability declaration invalid", list_output.getvalue())
+
+        doctor_output = io.StringIO()
+        with redirect_stdout(doctor_output):
+            hub.cli_doctor()
+        self.assertIn(
+            "capability declaration invalid",
+            doctor_output.getvalue(),
+        )
+        self.assertNotIn("bogus", doctor_output.getvalue())
+
     def test_health_payload_is_fixed_and_does_not_disclose_routing(self):
         response = asyncio.run(hub.handle_healthz(None))
         payload = json.loads(response.text)

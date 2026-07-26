@@ -1372,6 +1372,85 @@ class LauncherSafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "hub 本地凭证缺失"):
                     launcher.exec_hub([])
 
+    def test_hub_union_profile_takes_most_conservative_safety_values(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            channels = {
+                "safe": {
+                    "provider": "Fixture Safe",
+                    "models": ["model-a"],
+                    "capabilities": {
+                        "count_tokens": "exact",
+                        "thinking": "supported",
+                        "stream_terminal_usage": "supported",
+                        "background_worker_safe": "verified",
+                        "context_window": 200000,
+                    },
+                },
+                "cautious": {
+                    "provider": "Fixture Cautious",
+                    "models": ["model-b"],
+                    "capabilities": {
+                        "count_tokens": "estimated",
+                        "thinking": "unsupported",
+                        "stream_terminal_usage": "unsupported",
+                        "background_worker_safe": "unverified",
+                    },
+                },
+            }
+            with loaded_launcher(env) as launcher:
+                union = launcher._hub_union_profile(
+                    launcher._hub_channel_profiles(channels)
+                )
+
+        # 安全字段取各渠道中最保守的声明，不再乐观写死。
+        self.assertEqual(union.get("count_tokens"), "estimated")
+        self.assertEqual(union.get("stream_terminal_usage"), "unsupported")
+        self.assertEqual(union.get("background_worker_safe"), "unverified")
+        # 功能发现字段仍是并集，保证 /model 能切到支持它们的渠道。
+        self.assertEqual(union.get("thinking"), "supported")
+        self.assertEqual(union.get("context_window"), 200000)
+
+    def test_hub_refuses_launch_when_any_channel_is_worker_unsafe(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(
+                home,
+                CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+            )
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "port": 18787,
+                        "default_channel": "glm",
+                        "channels": {
+                            "glm": {
+                                "provider": "Fixture",
+                                "models": ["glm-fixture"],
+                            },
+                            "risky": {
+                                "provider": "Fixture Private Name",
+                                "models": ["model-x"],
+                                "capabilities": {
+                                    "background_worker_safe": "unsafe"
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with loaded_launcher(env) as launcher:
+                # 失败必须发生在 ensure_hub 之前：这里没有任何健康检查服务。
+                with self.assertRaisesRegex(RuntimeError, "risky") as caught:
+                    launcher.exec_hub([])
+            message = str(caught.exception)
+            self.assertIn("background_worker_safe=unsafe", message)
+            self.assertNotIn("Fixture Private Name", message)
+
 
 class ScriptedWindow:
     """A minimal curses window that replays a fixed key sequence."""

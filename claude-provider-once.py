@@ -2941,64 +2941,15 @@ def _normalize_hub_model(value: str, channels: dict) -> str:
     return f"{alias},{model}"
 
 
-def exec_hub(claude_args: list[str]) -> int:
-    """Launch one Claude session through the isolated multi-channel hub."""
-    requested_model, claude_args = _extract_hub_model(claude_args)
-    if not HUB_CONFIG.is_file():
-        raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
-    try:
-        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"hub 配置无法读取: {HUB_CONFIG}: {exc}") from exc
-    if not isinstance(hub_cfg, dict):
-        raise RuntimeError(f"hub 配置格式无效: {HUB_CONFIG}")
-
-    port = _hub_port(hub_cfg)
-    token = _hub_local_token(hub_cfg)
-    channels = hub_cfg.get("channels")
-    default_channel = hub_cfg.get("default_channel")
-    if not isinstance(channels, dict) or not channels:
-        raise RuntimeError("hub 配置缺少 channels")
-    channel = channels.get(default_channel)
-    models = channel.get("models") if isinstance(channel, dict) else None
-    if (
-        not isinstance(default_channel, str)
-        or not isinstance(models, list)
-        or not models
-        or not isinstance(models[0], str)
-        or not models[0]
-    ):
-        raise RuntimeError("hub 配置中的 default_channel 或默认模型无效")
-
-    main_model = (
-        _normalize_hub_model(requested_model, channels)
-        if requested_model is not None
-        else f"{default_channel},{models[0]}"
-    )
-    ensure_hub(port)
-    settings = {
-        "env": {
-            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
-            "ANTHROPIC_AUTH_TOKEN": token,
-            "ANTHROPIC_MODEL": main_model,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": main_model,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": main_model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": main_model,
-            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-            "NO_PROXY": "127.0.0.1,localhost",
-            "no_proxy": "127.0.0.1,localhost",
-        }
-    }
-    record_backend("hub")
-    aliases = ", ".join(str(alias) for alias in channels)
-    print(
-        f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})"
-    )
-    print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
-    channel_profiles: list[CapabilityProfile] = []
-    for raw_channel in channels.values():
+def _hub_channel_profiles(
+    channels: dict,
+) -> list[tuple[str, CapabilityProfile]]:
+    """Resolve each hub channel (and its model overlays) to a profile."""
+    channel_profiles: list[tuple[str, CapabilityProfile]] = []
+    for raw_alias, raw_channel in channels.items():
         if not isinstance(raw_channel, dict):
             continue
+        alias = str(raw_alias)
         try:
             provider_record = None
             provider_name = raw_channel.get("provider")
@@ -3033,7 +2984,7 @@ def exec_hub(claude_args: list[str]) -> int:
             )
         except ProviderPolicyError as exc:
             raise RuntimeError("hub 渠道 capability profile 无效") from exc
-        channel_profiles.append(base_profile)
+        channel_profiles.append((alias, base_profile))
         for configured_model in raw_channel.get("models", []):
             if isinstance(configured_model, str):
                 lookup = (
@@ -3041,40 +2992,84 @@ def exec_hub(claude_args: list[str]) -> int:
                     if configured_model.casefold().endswith("[1m]")
                     else configured_model
                 )
-                channel_profiles.append(base_profile.for_model(lookup))
+                channel_profiles.append(
+                    (alias, base_profile.for_model(lookup))
+                )
+    return channel_profiles
+
+
+def _hub_union_profile(
+    channel_profiles: list[tuple[str, CapabilityProfile]],
+) -> CapabilityProfile:
+    """Build the Claude-facing union profile from real channel declarations.
+
+    Feature discovery fields stay a feature union so /model can still reach a
+    channel that supports them, but safety fields take the most conservative
+    declaration across channels instead of a hard-coded optimistic value.
+    """
+    # 与直连策略一致：任何渠道声明后台任务不安全，都拒绝经 hub 启动。
+    # 错误里只出现渠道别名，绝不出现真实 provider 名称。
+    unsafe_aliases = sorted(
+        {
+            alias
+            for alias, item in channel_profiles
+            if item.get("background_worker_safe") == "unsafe"
+        }
+    )
+    if unsafe_aliases:
+        raise RuntimeError(
+            "hub 渠道 "
+            + ", ".join(unsafe_aliases)
+            + " 声明 background_worker_safe=unsafe；与直连策略一致，"
+            "拒绝通过 hub 启动。请先在 hub 配置中移除或修复该渠道"
+        )
+    profiles = [item for _alias, item in channel_profiles]
     any_tool_search = any(
         item.get("tool_search") == "supported"
-        for item in channel_profiles
+        for item in profiles
     )
     any_thinking = any(
         item.get("thinking") == "supported"
-        for item in channel_profiles
+        for item in profiles
     )
     any_reasoning_round_trip = any(
         item.get("reasoning_round_trip") == "supported"
-        for item in channel_profiles
+        for item in profiles
     )
     any_prompt_cache = any(
         item.get("prompt_cache") == "supported"
-        for item in channel_profiles
+        for item in profiles
     )
     max_context = max(
         (
             int(context)
-            for item in channel_profiles
+            for item in profiles
             if isinstance((context := item.get("context_window")), int)
         ),
         default=None,
     )
-    # Claude-facing feature discovery is the union of channel capabilities.
-    # Hub still enforces the selected channel's own profile on every request.
-    hub_profile = resolve_capability_profile(
+    count_values = {item.get("count_tokens") for item in profiles}
+    if not profiles or "unsupported" in count_values:
+        union_count_tokens = "unsupported"
+    elif "estimated" in count_values:
+        union_count_tokens = "estimated"
+    else:
+        union_count_tokens = "exact"
+    all_stream_terminal_usage = bool(profiles) and all(
+        item.get("stream_terminal_usage") == "supported"
+        for item in profiles
+    )
+    all_workers_verified = bool(profiles) and all(
+        item.get("background_worker_safe") == "verified"
+        for item in profiles
+    )
+    return resolve_capability_profile(
         override={
             "protocol": "anthropic",
             "tool_search": (
                 "supported" if any_tool_search else "unsupported"
             ),
-            "count_tokens": "exact",
+            "count_tokens": union_count_tokens,
             "context_window": max_context or "unknown",
             "thinking": "supported" if any_thinking else "unsupported",
             "reasoning_round_trip": (
@@ -3085,12 +3080,76 @@ def exec_hub(claude_args: list[str]) -> int:
             "prompt_cache": (
                 "supported" if any_prompt_cache else "unknown"
             ),
-            "stream_terminal_usage": "supported",
+            "stream_terminal_usage": (
+                "supported" if all_stream_terminal_usage else "unsupported"
+            ),
             "beta_policy": "passthrough",
-            "background_worker_safe": "verified",
+            "background_worker_safe": (
+                "verified" if all_workers_verified else "unverified"
+            ),
             "model_id_strategy": "mapped",
         }
     )
+
+
+def exec_hub(claude_args: list[str]) -> int:
+    """Launch one Claude session through the isolated multi-channel hub."""
+    requested_model, claude_args = _extract_hub_model(claude_args)
+    if not HUB_CONFIG.is_file():
+        raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
+    try:
+        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"hub 配置无法读取: {HUB_CONFIG}: {exc}") from exc
+    if not isinstance(hub_cfg, dict):
+        raise RuntimeError(f"hub 配置格式无效: {HUB_CONFIG}")
+
+    port = _hub_port(hub_cfg)
+    token = _hub_local_token(hub_cfg)
+    channels = hub_cfg.get("channels")
+    default_channel = hub_cfg.get("default_channel")
+    if not isinstance(channels, dict) or not channels:
+        raise RuntimeError("hub 配置缺少 channels")
+    channel = channels.get(default_channel)
+    models = channel.get("models") if isinstance(channel, dict) else None
+    if (
+        not isinstance(default_channel, str)
+        or not isinstance(models, list)
+        or not models
+        or not isinstance(models[0], str)
+        or not models[0]
+    ):
+        raise RuntimeError("hub 配置中的 default_channel 或默认模型无效")
+
+    main_model = (
+        _normalize_hub_model(requested_model, channels)
+        if requested_model is not None
+        else f"{default_channel},{models[0]}"
+    )
+    # Claude-facing feature discovery is the union of channel capabilities.
+    # Hub still enforces the selected channel's own profile on every request.
+    # Resolve before starting anything so an unsafe channel fails fast.
+    hub_profile = _hub_union_profile(_hub_channel_profiles(channels))
+    ensure_hub(port)
+    settings = {
+        "env": {
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": main_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": main_model,
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+        }
+    }
+    record_backend("hub")
+    aliases = ", ".join(str(alias) for alias in channels)
+    print(
+        f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})"
+    )
+    print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
     return launch_with_settings(settings, claude_args, profile=hub_profile)
 
 

@@ -8,6 +8,7 @@ auditable, and independently testable.
 from __future__ import annotations
 
 import copy
+import ipaddress
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlparse
@@ -44,6 +45,15 @@ CAPABILITY_FIELDS = (
     "beta_policy",
     "background_worker_safe",
     "model_id_strategy",
+)
+# Every env key whose value Claude Code treats as a model ID; a [1m] suffix on
+# any of them must pass the same context-window gate as ANTHROPIC_MODEL.
+MODEL_ENV_KEYS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
 )
 CAPABILITY_SOURCES = {
     "user-config",
@@ -461,6 +471,18 @@ def configured_credential(env: Mapping[str, object]) -> tuple[str, str] | None:
     return None
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    hostname = hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate_base_url(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProviderPolicyError(
@@ -483,6 +505,14 @@ def _validate_base_url(value: object) -> str:
         and not 1 <= port <= 65535
     ):
         raise ProviderPolicyError("Provider base URL is invalid")
+    # Match the Hub's loopback-or-HTTPS policy: credentials must never travel
+    # over cleartext HTTP to a remote host.  Never echo the URL itself because
+    # channel hosts are private.
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ProviderPolicyError(
+            "Provider base URL uses cleartext http to a non-loopback host; "
+            "only https or loopback http is allowed"
+        )
     return base_url
 
 
@@ -550,23 +580,24 @@ def prepare_provider_settings(
         "true" if tool_search == "supported" else "false"
     )
     context_window = profile.get("context_window")
-    initial_model = env.get("ANTHROPIC_MODEL", "")
-    if (
-        isinstance(initial_model, str)
-        and initial_model.casefold().endswith("[1m]")
-        and (
-            not isinstance(context_window, int)
-            or context_window < 1_000_000
-        )
-    ):
-        raise ProviderPolicyError(
-            "ANTHROPIC_MODEL requests [1m] but the Provider/model "
-            "context window is unknown or smaller than 1M"
-        )
-    if not isinstance(context_window, int) or context_window < 1_000_000:
+    has_1m_window = (
+        isinstance(context_window, int) and context_window >= 1_000_000
+    )
+    for model_key in MODEL_ENV_KEYS:
+        configured_model = env.get(model_key, "")
+        if (
+            isinstance(configured_model, str)
+            and configured_model.casefold().endswith("[1m]")
+            and not has_1m_window
+        ):
+            raise ProviderPolicyError(
+                f"{model_key} requests [1m] but the Provider/model "
+                "context window is unknown or smaller than 1M"
+            )
+    # An explicit user-provided CLAUDE_CODE_DISABLE_1M_CONTEXT always wins;
+    # only manage the flag when the Provider config did not set it.
+    if "CLAUDE_CODE_DISABLE_1M_CONTEXT" not in env and not has_1m_window:
         env["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = "1"
-    else:
-        env.pop("CLAUDE_CODE_DISABLE_1M_CONTEXT", None)
     if profile.get("thinking") != "supported":
         env["MAX_THINKING_TOKENS"] = "0"
     if profile.get("background_worker_safe") == "unsafe":
