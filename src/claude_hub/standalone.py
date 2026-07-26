@@ -10,11 +10,13 @@ import json
 import os
 import stat
 import tempfile
+import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import UUID
 
 from .domain import ModelMapping, StandaloneProfile
@@ -24,12 +26,80 @@ APPLICATION_DIRECTORY = "claude-hub"
 STORE_FILENAME = "standalone-profiles.json"
 SCHEMA_VERSION = 1
 MAX_STORE_BYTES = 4 * 1024 * 1024
+_LOCK_OPEN_ATTEMPTS = 8
 
 _MODEL_FIELDS = tuple(field.name for field in fields(ModelMapping))
+_STORE_FORK_GATE = threading.Lock()
+_STORE_THREAD_LOCK = threading.RLock()
+_STORE_THREAD_LOCK_PROCESS_ID = os.getpid()
+_ACTIVE_STORE_LOCK_DESCRIPTORS: set[int] = set()
+_STORE_FORK_CONTEXT = threading.local()
+_STORE_FORK_OVERLAPPED = False
+
+
+def _reinitialize_store_locks_after_fork(
+    *,
+    fork_overlapped: bool,
+) -> None:
+    global _STORE_FORK_CONTEXT
+    global _STORE_FORK_GATE
+    global _STORE_FORK_OVERLAPPED
+    global _STORE_THREAD_LOCK
+    global _STORE_THREAD_LOCK_PROCESS_ID
+
+    inherited_unsafe_state = _STORE_FORK_OVERLAPPED
+    for descriptor in tuple(_ACTIVE_STORE_LOCK_DESCRIPTORS):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    _ACTIVE_STORE_LOCK_DESCRIPTORS.clear()
+    _STORE_FORK_GATE = threading.Lock()
+    _STORE_FORK_CONTEXT = threading.local()
+    _STORE_THREAD_LOCK = threading.RLock()
+    _STORE_THREAD_LOCK_PROCESS_ID = os.getpid()
+    _STORE_FORK_OVERLAPPED = (
+        inherited_unsafe_state or fork_overlapped
+    )
+
+
+def _prepare_store_locks_for_fork() -> None:
+    _STORE_FORK_CONTEXT.gate_acquired = _STORE_FORK_GATE.acquire(
+        blocking=False
+    )
+
+
+def _restore_store_locks_after_fork_in_parent() -> None:
+    if getattr(_STORE_FORK_CONTEXT, "gate_acquired", False):
+        _STORE_FORK_GATE.release()
+    _STORE_FORK_CONTEXT.gate_acquired = False
+
+
+def _reinitialize_store_locks_after_fork_in_child() -> None:
+    gate_acquired = getattr(
+        _STORE_FORK_CONTEXT,
+        "gate_acquired",
+        False,
+    )
+    _reinitialize_store_locks_after_fork(
+        fork_overlapped=not gate_acquired,
+    )
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_prepare_store_locks_for_fork,
+        after_in_parent=_restore_store_locks_after_fork_in_parent,
+        after_in_child=_reinitialize_store_locks_after_fork_in_child,
+    )
 
 
 class StandaloneStoreError(RuntimeError):
     """Base class for sanitized standalone-store failures."""
+
+
+class StandaloneStoreForkSafetyError(StandaloneStoreError):
+    """Raised in a fork child that overlapped an active standalone writer."""
 
 
 class StandaloneStoreSecurityError(StandaloneStoreError):
@@ -349,10 +419,7 @@ def _read_bytes(path: Path) -> bytes | None:
                 pass
 
 
-def _load_document(path: Path) -> dict[str, Any]:
-    payload = _read_bytes(path)
-    if payload is None:
-        return _empty_document()
+def _decode_document(payload: bytes) -> dict[str, Any]:
     try:
         document = json.loads(
             payload.decode("utf-8"),
@@ -362,6 +429,17 @@ def _load_document(path: Path) -> dict[str, Any]:
     except (UnicodeError, ValueError):
         raise StandaloneStoreCorruptError("standalone store is invalid") from None
     return _validate_document(document)
+
+
+def _load_snapshot(path: Path) -> tuple[bytes | None, dict[str, Any]]:
+    payload = _read_bytes(path)
+    if payload is None:
+        return None, _empty_document()
+    return payload, _decode_document(payload)
+
+
+def _load_document(path: Path) -> dict[str, Any]:
+    return _load_snapshot(path)[1]
 
 
 def _ensure_parent_directory(parent: Path) -> None:
@@ -385,6 +463,174 @@ def _ensure_parent_directory(parent: Path) -> None:
             raise StandaloneStoreSecurityError(
                 "standalone store directory owner is unsafe"
             )
+
+
+def _lock_file_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def _lock_path_stat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StandaloneStoreError(
+            "standalone store lock is unavailable"
+        ) from None
+
+
+def _validate_opened_lock_identity(
+    *,
+    expected: os.stat_result | None,
+    opened: os.stat_result,
+    observed: os.stat_result | None,
+) -> None:
+    _validate_file_stat(opened)
+    if expected is not None:
+        _validate_file_stat(expected)
+        if (
+            expected.st_dev != opened.st_dev
+            or expected.st_ino != opened.st_ino
+        ):
+            raise StandaloneStoreSecurityError(
+                "standalone store lock changed during open"
+            )
+    if observed is None:
+        raise StandaloneStoreSecurityError(
+            "standalone store lock changed during open"
+        )
+    _validate_file_stat(observed)
+    if (
+        observed.st_dev != opened.st_dev
+        or observed.st_ino != opened.st_ino
+    ):
+        raise StandaloneStoreSecurityError(
+            "standalone store lock changed during open"
+        )
+
+
+def _open_lock_file(path: Path) -> int:
+    lock_path = _lock_file_path(path)
+    for attempt in range(_LOCK_OPEN_ATTEMPTS):
+        expected = _lock_path_stat(lock_path)
+        if expected is not None:
+            _validate_file_stat(expected)
+        flags = os.O_RDWR
+        if expected is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = -1
+        transferred = False
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+            opened = os.fstat(descriptor)
+            _validate_opened_lock_identity(
+                expected=expected,
+                opened=opened,
+                observed=_lock_path_stat(lock_path),
+            )
+            if opened.st_size == 0 and os.write(descriptor, b"\0") != 1:
+                raise OSError
+            _validate_opened_lock_identity(
+                expected=expected,
+                opened=os.fstat(descriptor),
+                observed=_lock_path_stat(lock_path),
+            )
+            transferred = True
+            return descriptor
+        except StandaloneStoreError:
+            raise
+        except (FileExistsError, FileNotFoundError):
+            if attempt + 1 == _LOCK_OPEN_ATTEMPTS:
+                raise StandaloneStoreError(
+                    "standalone store lock is unavailable"
+                ) from None
+        except OSError:
+            raise StandaloneStoreError(
+                "standalone store lock is unavailable"
+            ) from None
+        finally:
+            if descriptor >= 0 and not transferred:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+    raise StandaloneStoreError(
+        "standalone store lock is unavailable"
+    )
+
+
+def _acquire_file_lock(descriptor: int) -> None:
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        elif os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            raise OSError
+    except (ImportError, OSError):
+        raise StandaloneStoreError(
+            "standalone store lock is unavailable"
+        ) from None
+
+
+def _release_file_lock(descriptor: int) -> None:
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        elif os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    except (ImportError, OSError):
+        # Closing the descriptor also releases an OS advisory lock.  A failed
+        # explicit unlock must not turn an already-committed replace into a
+        # misleading pre-commit failure.
+        pass
+
+
+@contextmanager
+def _store_lock(path: Path) -> Iterator[None]:
+    """Serialize every standalone writer in this process and across processes."""
+
+    if os.getpid() != _STORE_THREAD_LOCK_PROCESS_ID:
+        # Without a successfully executed at-fork callback, overlap cannot be
+        # disproved.  The inherited process must fail closed until exec.
+        _reinitialize_store_locks_after_fork(fork_overlapped=True)
+    if _STORE_FORK_OVERLAPPED:
+        raise StandaloneStoreForkSafetyError(
+            "standalone store is unavailable after overlapping fork"
+        )
+    with _STORE_FORK_GATE:
+        with _STORE_THREAD_LOCK:
+            _ensure_parent_directory(path.parent)
+            descriptor = _open_lock_file(path)
+            _ACTIVE_STORE_LOCK_DESCRIPTORS.add(descriptor)
+            acquired = False
+            try:
+                _acquire_file_lock(descriptor)
+                acquired = True
+                yield
+            finally:
+                if acquired:
+                    _release_file_lock(descriptor)
+                _ACTIVE_STORE_LOCK_DESCRIPTORS.discard(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _fsync_directory(parent: Path) -> None:
@@ -489,13 +735,16 @@ class StandaloneProfileStore:
 
     def create(self, profile: StandaloneProfile) -> StandaloneProfile:
         profile = _require_profile(profile)
-        document = _load_document(self._path)
-        profiles = document["profiles"]
-        profile_key = str(profile.profile_id)
-        if profile_key in profiles:
-            raise StandaloneProfileExistsError("standalone profile already exists")
-        profiles[profile_key] = _encode_profile(profile)
-        _atomic_write(self._path, document)
+        with _store_lock(self._path):
+            document = _load_document(self._path)
+            profiles = document["profiles"]
+            profile_key = str(profile.profile_id)
+            if profile_key in profiles:
+                raise StandaloneProfileExistsError(
+                    "standalone profile already exists"
+                )
+            profiles[profile_key] = _encode_profile(profile)
+            _atomic_write(self._path, document)
         return profile
 
     def read(self, profile_id: UUID | str) -> StandaloneProfile:
@@ -511,29 +760,30 @@ class StandaloneProfileStore:
 
     def update(self, profile: StandaloneProfile) -> StandaloneProfile:
         profile = _require_profile(profile)
-        document = _load_document(self._path)
-        profiles = document["profiles"]
-        profile_key = str(profile.profile_id)
-        try:
-            raw_profile = profiles[profile_key]
-        except KeyError:
-            raise StandaloneProfileNotFoundError(
-                "standalone profile was not found"
-            ) from None
-        existing = _decode_profile(profile_key, raw_profile)
-        if profile.created_at != existing.created_at:
-            raise StandaloneProfileConflictError(
-                "standalone profile creation time is immutable"
+        with _store_lock(self._path):
+            document = _load_document(self._path)
+            profiles = document["profiles"]
+            profile_key = str(profile.profile_id)
+            try:
+                raw_profile = profiles[profile_key]
+            except KeyError:
+                raise StandaloneProfileNotFoundError(
+                    "standalone profile was not found"
+                ) from None
+            existing = _decode_profile(profile_key, raw_profile)
+            if profile.created_at != existing.created_at:
+                raise StandaloneProfileConflictError(
+                    "standalone profile creation time is immutable"
+                )
+            if profile.updated_at < existing.updated_at:
+                raise StandaloneProfileConflictError(
+                    "standalone profile update time regressed"
+                )
+            profiles[profile_key] = _encode_profile(
+                profile,
+                existing=raw_profile,
             )
-        if profile.updated_at < existing.updated_at:
-            raise StandaloneProfileConflictError(
-                "standalone profile update time regressed"
-            )
-        profiles[profile_key] = _encode_profile(
-            profile,
-            existing=raw_profile,
-        )
-        _atomic_write(self._path, document)
+            _atomic_write(self._path, document)
         return profile
 
     def __repr__(self) -> str:
@@ -556,6 +806,7 @@ __all__ = [
     "StandaloneStore",
     "StandaloneStoreCorruptError",
     "StandaloneStoreError",
+    "StandaloneStoreForkSafetyError",
     "StandaloneStoreSecurityError",
     "UnsupportedStandaloneSchemaError",
     "standalone_data_dir",
