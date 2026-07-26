@@ -701,6 +701,138 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertIn("默认启动只影响本次会话", rendered)
                 self.assertIn(f"claude1 {launcher.VERSION}", rendered)
 
+    def test_resume_forms_reach_fake_claude_unchanged_and_explicit_provider_wins(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    (
+                        "resume-fixture",
+                        "Resume Fixture",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                                    "ANTHROPIC_AUTH_TOKEN": "fixture-secret",
+                                }
+                            }
+                        ),
+                        1,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            fake_claude = home / "bin" / "claude"
+            capture = home / "capture.json"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                settings_index = sys.argv.index("--settings")
+                Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
+                    json.dumps(sys.argv[settings_index + 2:]),
+                    encoding="utf-8",
+                )
+                """,
+            )
+            env.update(
+                CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                FAKE_CLAUDE_CAPTURE=str(capture),
+            )
+            opaque_identifier = "opaque-session-alias"
+            implicit_cases = (
+                ("bare", ["--resume"]),
+                (
+                    "long-value",
+                    [
+                        "--resume",
+                        opaque_identifier,
+                        "--fork-session",
+                        "-p",
+                        "continued prompt",
+                    ],
+                ),
+                (
+                    "long-equals",
+                    [
+                        f"--resume={opaque_identifier}",
+                        "--fork-session",
+                        "-p",
+                        "continued prompt",
+                    ],
+                ),
+                (
+                    "short-value",
+                    [
+                        "-r",
+                        opaque_identifier,
+                        "--fork-session",
+                        "-p",
+                        "continued prompt",
+                    ],
+                ),
+            )
+
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher,
+                    "run_tui_launcher",
+                    return_value=("provider", "Resume Fixture"),
+                ) as run_tui:
+                    for label, claude_args in implicit_cases:
+                        with self.subTest(form=label):
+                            run_tui.reset_mock()
+                            self.assertEqual(launcher.main(claude_args), 0)
+                            self.assertEqual(
+                                json.loads(capture.read_text(encoding="utf-8")),
+                                claude_args,
+                            )
+                            run_tui.assert_called_once_with()
+
+                    explicit_args = [
+                        "Resume Fixture",
+                        "--fork-session",
+                        "--resume",
+                        opaque_identifier,
+                        "-p",
+                        "continued prompt",
+                    ]
+                    run_tui.reset_mock()
+                    self.assertEqual(launcher.main(explicit_args), 0)
+                    self.assertEqual(
+                        json.loads(capture.read_text(encoding="utf-8")),
+                        explicit_args[1:],
+                    )
+                    run_tui.assert_not_called()
+                    self.assertEqual(
+                        json.loads(
+                            Path(env["CLAUDE1_BACKEND_STATE"]).read_text(
+                                encoding="utf-8"
+                            )
+                        )["provider"],
+                        "Resume Fixture",
+                    )
+
     def test_tui_quit_prints_a_compact_farewell(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
