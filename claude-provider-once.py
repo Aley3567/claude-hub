@@ -2937,12 +2937,34 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     provider_hint: 匹配 CC-Switch provider 的子串（None => 弹菜单）
     claude_args: 展开后的 overlay + 其余原样透传给 claude
     """
+    # Claude Code's resume identifier is optional. A following non-option is
+    # its opaque value, not claude1's first positional provider selector; once
+    # resume starts, later positionals also remain Claude arguments.
+    claude_optional_value_options = {"--resume", "-r"}
     backend: str | None = None
     hint: str | None = None
     claude_args: list[str] = []
     first_positional = True
-    for arg in argv:
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
         low = arg.lower()
+        if (
+            low in claude_optional_value_options
+            or low.startswith("--resume=")
+        ):
+            first_positional = False
+            claude_args.append(arg)
+            if (
+                low in claude_optional_value_options
+                and index + 1 < len(argv)
+                and not argv[index + 1].startswith("-")
+            ):
+                claude_args.append(argv[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
         if not arg.startswith("-"):
             if first_positional:
                 first_positional = False
@@ -2952,8 +2974,10 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
                     hint = arg
                 else:
                     claude_args.append(arg)
+                index += 1
                 continue
             claude_args.append(arg)
+            index += 1
             continue
         # claude1 自己理解的 overlay 开关
         if low == "--notion":
@@ -2968,6 +2992,7 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
             backend = "hub"
         else:
             claude_args.append(arg)
+        index += 1
     return backend, hint, claude_args
 
 
