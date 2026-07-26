@@ -7,9 +7,18 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
+from .approval import (
+    ApprovalBindingError,
+    ApprovalExpiredError,
+    ApprovalHandle,
+    ApprovalRegistry,
+    ApprovalUnavailableError,
+)
 from .ccswitch import CCSwitchProviderStore
+from .change_plan import ChangePlan
 from .service import ProviderApplicationService
 from .store import ProviderConfigCorruptError, ProviderNotFoundError
+from .tui import request_terminal_approval
 
 
 SCHEMA_VERSION = 1
@@ -24,6 +33,7 @@ _HELP_USAGE = (
     "switchctl inspect <stable-id>",
     "switchctl mode [--store standalone]",
     "switchctl route [--store standalone]",
+    "switchctl apply",
 )
 _COMMAND_USAGE = {
     "detect": _USAGE,
@@ -31,6 +41,7 @@ _COMMAND_USAGE = {
     "inspect": "switchctl inspect <stable-id>",
     "mode": "switchctl mode [--store standalone]",
     "route": "switchctl route [--store standalone]",
+    "apply": "switchctl apply",
 }
 
 
@@ -89,19 +100,52 @@ def _usage_for(arguments: tuple[object, ...]) -> str:
     return _USAGE
 
 
+def _write_confirmation_required(
+    output: TextIO,
+    diagnostics: TextIO,
+) -> None:
+    _write_error(
+        output,
+        diagnostics,
+        code="confirmation_required",
+        message="in-process human confirmation is required",
+    )
+
+
+def _write_apply_runtime_error(
+    output: TextIO,
+    diagnostics: TextIO,
+) -> None:
+    _write_error(
+        output,
+        diagnostics,
+        code="runtime_error",
+        message="apply failed",
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     service: ProviderApplicationService | None = None,
+    stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
     standalone_exists: bool = False,
+    approval_registry: ApprovalRegistry | None = None,
+    approval_handle: ApprovalHandle | None = None,
+    apply_plan: ChangePlan | None = None,
 ) -> int:
-    """Run ``switchctl`` with injectable argv, service, and output streams."""
+    """Run ``switchctl``.
+
+    ``apply_plan`` is the trusted, in-process orchestration boundary.  It is
+    intentionally unavailable from command-line arguments.
+    """
 
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     output = sys.stdout if stdout is None else stdout
     diagnostics = sys.stderr if stderr is None else stderr
+    terminal_input = sys.stdin if stdin is None else stdin
 
     if arguments in {("-h",), ("--help",)}:
         _write_json(
@@ -124,6 +168,8 @@ def main(
     elif len(arguments) == 2 and arguments[0] == "inspect":
         command = "inspect"
         stable_id = arguments[1]
+    elif arguments == ("apply",):
+        command = "apply"
     elif arguments in {("mode",), ("route",)}:
         command = "mode"
     elif arguments in {
@@ -142,6 +188,61 @@ def main(
             message=f"usage: {_usage_for(arguments)}",
         )
         return EXIT_USAGE
+
+    if command == "apply":
+        selected_registry = approval_registry
+        selected_handle = approval_handle
+        if (
+            selected_registry is None
+            and selected_handle is None
+            and apply_plan is not None
+        ):
+            try:
+                interactive_terminal = (
+                    terminal_input.isatty() and diagnostics.isatty()
+                )
+            except Exception:
+                _write_apply_runtime_error(output, diagnostics)
+                return EXIT_RUNTIME_ERROR
+            if not interactive_terminal:
+                _write_confirmation_required(output, diagnostics)
+                return EXIT_RUNTIME_ERROR
+            try:
+                selected_registry = ApprovalRegistry()
+                selected_handle = request_terminal_approval(
+                    apply_plan,
+                    selected_registry,
+                    input_stream=terminal_input,
+                    output_stream=diagnostics,
+                )
+            except Exception:
+                _write_apply_runtime_error(output, diagnostics)
+                return EXIT_RUNTIME_ERROR
+        if (
+            type(selected_registry) is not ApprovalRegistry
+            or selected_handle is None
+        ):
+            _write_confirmation_required(output, diagnostics)
+            return EXIT_RUNTIME_ERROR
+        try:
+            selected_registry.consume(selected_handle, apply_plan)
+        except (
+            ApprovalBindingError,
+            ApprovalExpiredError,
+            ApprovalUnavailableError,
+        ):
+            _write_confirmation_required(output, diagnostics)
+            return EXIT_RUNTIME_ERROR
+        except Exception:
+            _write_apply_runtime_error(output, diagnostics)
+            return EXIT_RUNTIME_ERROR
+        _write_error(
+            output,
+            diagnostics,
+            code="apply_not_implemented",
+            message="Store apply is not implemented",
+        )
+        return EXIT_RUNTIME_ERROR
 
     try:
         application = build_default_service() if service is None else service
