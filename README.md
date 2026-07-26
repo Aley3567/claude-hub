@@ -57,10 +57,11 @@ claude1
 
 - `↑↓` 或 `j/k` 选择该 Provider 已存在的主模型、Opus、Fable、Sonnet、
   Haiku 或 Reasoning 字段；
-- `i` 进入 `INSERT`；直接输入会替换整个旧值，先按 `←→`、Home 或 End
-  定位则保留旧值并从光标处修改，`Ctrl+U` 可清空当前输入；
-- `Esc` 校验并自动保存到 CC Switch，然后回到 `NORMAL`；
-- `Ctrl+C` 取消本次输入；`NORMAL` 下按 `←` 返回 Provider 菜单。
+- `Enter` 或 `i` 进入 `INSERT`；直接输入会替换整个旧值，先按 `←→`、Home
+  或 End 定位则保留旧值并从光标处修改，`Ctrl+U` 可清空当前输入；
+- `Enter` 校验并保存到 CC Switch，然后回到 `NORMAL`；
+- `Esc`（或 `Ctrl+C`）取消本次输入不保存；`NORMAL` 下按 `Esc`、`←` 或
+  `q` 返回 Provider 菜单。
 
 保存只更新选中的模型字段。Token、Base URL、Provider 元数据和未知 JSON
 字段保持不变；Hub 的独立模型列表也不会被改写。写入前会在

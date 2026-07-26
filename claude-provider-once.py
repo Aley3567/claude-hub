@@ -1530,6 +1530,7 @@ def _init_colors() -> dict:
         "base": 0,
         "accent": 0,
         "warning": 0,
+        "error": 0,
         "brand": 0,
         "sel": curses.A_REVERSE,
         "orange": 0,
@@ -1570,11 +1571,13 @@ def _init_colors() -> dict:
     green = _pair(2, curses.COLOR_GREEN)
     yellow = _pair(3, curses.COLOR_YELLOW)
     magenta = _pair(4, curses.COLOR_MAGENTA)
+    red = _pair(5, curses.COLOR_RED)
     d.update(
         dim=curses.A_DIM,
         base=green,
         accent=cyan | curses.A_BOLD,
         warning=yellow,
+        error=red | curses.A_BOLD,
         brand=magenta | curses.A_BOLD,
         sel=cyan | curses.A_REVERSE | curses.A_BOLD,
     )
@@ -1862,7 +1865,7 @@ def _draw_launcher(
     *,
     show_brand: bool = True,
     help_open: bool = False,
-    notice: str | None = None,
+    notice: "str | tuple[str, str] | None" = None,
     logo_phase: int = 0,
     logo_breathing: bool = False,
     hub_status: "HubStatus | None" = None,
@@ -1902,11 +1905,10 @@ def _draw_launcher(
             "· 含隐藏项",
             C.get("dim", 0),
         )
-    guide = notice or "↑↓ / jk 移动 · → 编辑模型 · Enter 启动 · 数字直达"
-    if hub_status is not None and not notice:
-        guide = "↑↓ / jk 移动 · Enter 进入 Hub / 启动渠道 · 数字直达渠道"
-    guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
-    _addstr(win, head + 2, 2, guide, guide_attr)
+    guide = "↑↓ / jk 移动 · → 编辑模型 · Enter 启动 · 数字直达"
+    if hub_status is not None:
+        guide = "↑↓ / jk 移动 · → 编辑模型 · Enter 进入 Hub / 启动 · 数字直达"
+    _addstr(win, head + 2, 2, guide, C.get("dim", 0))
     row_cursor = head + 4
     if hub_status is not None:
         _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
@@ -1937,7 +1939,9 @@ def _draw_launcher(
         row_cursor += 1
     list_top = row_cursor
     footer_row = max(0, h - 1)
-    capacity = max(0, footer_row - list_top)
+    # Notice 独占 footer 上一行，不再挤掉键位提示。
+    notice_row = footer_row - 1 if notice and footer_row - 1 >= list_top else None
+    capacity = max(0, (notice_row if notice_row is not None else footer_row) - list_top)
     start, end = _visible_window(len(view), idx, capacity)
     recent = _recent_name(view, mru)
 
@@ -1984,8 +1988,21 @@ def _draw_launcher(
             )
             _addstr(win, row, 2, line, attr)
 
+    if notice_row is not None:
+        kind, text = notice if isinstance(notice, tuple) else ("warn", notice)
+        notice_attr = {
+            "ok": C.get("lime", 0),
+            "error": C.get("error", 0),
+        }.get(kind, C.get("warning", 0))
+        _addstr(
+            win,
+            notice_row,
+            2,
+            _truncate_display(text, max(0, w - 4)),
+            notice_attr | curses.A_BOLD,
+        )
     if help_open:
-        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · → 编辑模型 · Esc/q 退出 · ? 返回"
     else:
         visible_range = ""
         if start > 0 or end < len(view):
@@ -2125,7 +2142,7 @@ def _draw_model_editor(
     mode: str,
     buffer: str,
     cursor: int,
-    notice: str | None,
+    notice: "str | tuple[str, str] | None",
     replace_on_type: bool = False,
 ) -> None:
     win.erase()
@@ -2146,21 +2163,26 @@ def _draw_model_editor(
     _addstr(win, 2, 2, f"模式: {mode}", mode_attr | curses.A_BOLD)
     guide = (
         (
-            "直接输入替换原值 · ←→ 定位保留旧值 · Esc 保存 · Ctrl+C 取消"
+            "直接输入替换原值 · ←→ 定位保留旧值 · Enter 保存 · Esc 取消"
             if replace_on_type
-            else "编辑文本 · Esc 保存 · Ctrl+C 取消 · ←→ 移动光标"
+            else "编辑文本 · Enter 保存 · Esc 取消 · ←→ 移动光标"
         )
         if mode == "INSERT"
-        else "↑↓ / jk 选择 · i 快速编辑 · ← 返回"
+        else "↑↓ / jk 选择 · Enter/i 编辑 · Esc/← 返回"
     )
     _addstr(win, 3, 2, _truncate_display(guide, usable), C.get("dim", 0))
     if notice:
+        kind, text = notice if isinstance(notice, tuple) else ("warn", notice)
+        notice_attr = {
+            "ok": C.get("lime", 0),
+            "error": C.get("error", 0),
+        }.get(kind, C.get("warning", 0))
         _addstr(
             win,
             4,
             2,
-            _truncate_display(notice, usable),
-            C.get("warning", 0),
+            _truncate_display(text, usable),
+            notice_attr | curses.A_BOLD,
         )
 
     input_row = 6
@@ -2259,7 +2281,7 @@ def _model_editor(win, provider_name: str) -> None:
     buffer = ""
     cursor = 0
     replace_on_type = False
-    notice: str | None = None
+    notice: "str | tuple[str, str] | None" = None
     _safe_curs_set(0)
     while True:
         _draw_model_editor(
@@ -2283,7 +2305,10 @@ def _model_editor(win, provider_name: str) -> None:
                 idx = (idx - 1) % len(snapshot.fields)
             elif ch in (curses.KEY_DOWN, ord("j")) and snapshot.fields:
                 idx = (idx + 1) % len(snapshot.fields)
-            elif ch == ord("i") and snapshot.fields:
+            elif (
+                ch in (ord("i"), 10, 13, curses.KEY_ENTER)
+                and snapshot.fields
+            ):
                 mode = "INSERT"
                 buffer = snapshot.fields[idx].value
                 cursor = len(buffer)
@@ -2291,14 +2316,14 @@ def _model_editor(win, provider_name: str) -> None:
                 notice = None
                 _set_raw_input(True)
                 _safe_curs_set(1)
-            elif ch in (curses.KEY_LEFT, ord("q")):
+            elif ch in (curses.KEY_LEFT, ord("q"), 27):
                 _set_raw_input(False)
                 _safe_curs_set(0)
                 return
             continue
 
         # INSERT: direction keys edit the buffer and never leave this page.
-        if ch == 27:
+        if ch in (10, 13, curses.KEY_ENTER):
             try:
                 snapshot = save_provider_model(
                     snapshot,
@@ -2313,22 +2338,22 @@ def _model_editor(win, provider_name: str) -> None:
                     pass
                 mode = "NORMAL"
                 replace_on_type = False
-                notice = str(exc)
+                notice = ("error", str(exc))
                 _set_raw_input(False)
                 _safe_curs_set(0)
             except ModelValidationError as exc:
-                notice = str(exc)
+                notice = ("error", str(exc))
             except ModelEditorError as exc:
-                notice = str(exc)
+                notice = ("error", str(exc))
             else:
                 mode = "NORMAL"
-                notice = "已保存到 CC Switch"
+                notice = ("ok", "已保存到 CC Switch")
                 buffer = ""
                 cursor = 0
                 replace_on_type = False
                 _set_raw_input(False)
                 _safe_curs_set(0)
-        elif ch == 3:  # Ctrl+C: explicit cancel, no save.
+        elif ch in (27, 3):  # Esc / Ctrl+C: cancel, no save.
             mode = "NORMAL"
             notice = "已取消编辑"
             buffer = ""
@@ -2414,8 +2439,7 @@ def _hub_workspace(
             return ("back", None)
         elif ch == ord("q"):
             return ("quit", None)
-        else:
-            continue
+        # 其余按键（含 KEY_RESIZE）落到这里统一重绘，缩放终端不再花屏。
         _draw_hub_workspace(win, status, options, idx)
 
 
@@ -2436,13 +2460,15 @@ def _launcher_main(win, cfg, db_names):
     idx = _initial_index(view, mru)
     hub_view = _load_hub_view()
     hub_status, hub_options = hub_view if hub_view is not None else (None, [])
-    hub_focus = hub_view is not None
+    # 初始焦点跟随最近一次真实启动：只有上次走 hub 才聚焦 Hub 条目，
+    # 否则落在 MRU 渠道上，保住「claude1 + Enter 启动最近渠道」的肌肉记忆。
+    hub_focus = hub_view is not None and _last_backend_kind() == "hub"
     try:
         model_summaries = provider_model_summaries()
     except (ModelEditorError, RuntimeError, sqlite3.Error):
         model_summaries = {}
     help_open = False
-    notice: str | None = None
+    notice: "str | tuple[str, str] | None" = None
     rows, cols = win.getmaxyx()
     intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
     pending_key = _intro(win) if intro_animate else None
@@ -2472,7 +2498,7 @@ def _launcher_main(win, cfg, db_names):
         if direct_index is not None:
             if direct_index < len(view):
                 return view[direct_index]
-            notice = f"没有第 {direct_index + 1} 个渠道"
+            notice = ("warn", f"没有第 {direct_index + 1} 个渠道")
         if ch in (curses.KEY_UP, ord("k")):
             if hub_focus:
                 pass
@@ -2494,7 +2520,8 @@ def _launcher_main(win, cfg, db_names):
                 idx = (idx + 1) % len(view)
         elif ch == ord("a"):
             if not hub_focus and view:
-                changed, notice = _edit_alias(win, view[idx], meta)
+                changed, alias_msg = _edit_alias(win, view[idx], meta)
+                notice = ("ok" if changed else "warn", alias_msg)
                 if changed:
                     save_config(cfg)
         elif ch == ord("x"):
@@ -2521,7 +2548,7 @@ def _launcher_main(win, cfg, db_names):
                 try:
                     _model_editor(win, view[idx])
                 except ModelEditorError as exc:
-                    notice = str(exc)
+                    notice = ("error", str(exc))
                 try:
                     model_summaries = provider_model_summaries()
                 except (ModelEditorError, RuntimeError, sqlite3.Error):
@@ -2591,6 +2618,16 @@ def run_tui_launcher():
     if isinstance(result, HubLaunch):
         return ("hub", result.option.selector)
     return ("launch", result)
+
+
+def _last_backend_kind() -> str | None:
+    """读取最近一次真实启动的后端类型；文件缺失或损坏时返回 None。"""
+    try:
+        payload = json.loads(BACKEND_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    kind = payload.get("backend") if isinstance(payload, dict) else None
+    return kind if isinstance(kind, str) else None
 
 
 def record_backend(kind: str, provider: str | None = None) -> None:

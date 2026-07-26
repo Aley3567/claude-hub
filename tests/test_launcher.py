@@ -1916,7 +1916,7 @@ class ProviderModelEditorTests(unittest.TestCase):
                 "fable-new",
             )
 
-    def test_right_i_escape_left_edits_and_returns_to_provider_menu(self) -> None:
+    def test_right_i_enter_left_edits_and_returns_to_provider_menu(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
             db_path, _original = self._seed_provider(env)
@@ -1926,7 +1926,7 @@ class ProviderModelEditorTests(unittest.TestCase):
                 ord("i"),
                 21,  # Ctrl+U clears the INSERT buffer.
                 *map(ord, "opus-vim-new"),
-                27,
+                10,  # Enter 保存（Esc 现在是取消）。
                 curses.KEY_LEFT,
                 ord("q"),
             ]
@@ -1970,7 +1970,7 @@ class ProviderModelEditorTests(unittest.TestCase):
                     curses.KEY_RIGHT,
                     ord("i"),
                     *map(ord, "quick-main"),
-                    27,
+                    10,  # Enter 保存（Esc 现在是取消）。
                     curses.KEY_LEFT,
                     ord("q"),
                 ],
@@ -2170,6 +2170,47 @@ class ProviderModelEditorTests(unittest.TestCase):
             self.assertEqual(json.loads(raw), original)
             self.assertFalse(Path(env["CLAUDE1_MODEL_BACKUP_DIR"]).exists())
 
+    def test_insert_escape_cancels_without_saving(self) -> None:
+        # H1 键位契约：INSERT 下 Esc=取消（与 Ctrl+C 等价），Enter 才保存。
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
+            db_path, original = self._seed_provider(env)
+            window = ScriptedWindow(
+                [
+                    curses.KEY_RIGHT,
+                    ord("i"),
+                    21,
+                    *map(ord, "esc-discarded-model"),
+                    27,
+                    27,  # NORMAL 下 Esc 返回 Provider 菜单。
+                    ord("q"),
+                ],
+                size=(10, 32),
+            )
+            cfg = {"providers": {"Fixture Provider": {"hidden": False}}}
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    launcher._launcher_main(
+                        window,
+                        cfg,
+                        {"Fixture Provider"},
+                    )
+            connection = sqlite3.connect(db_path)
+            try:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(json.loads(raw), original)
+            self.assertFalse(Path(env["CLAUDE1_MODEL_BACKUP_DIR"]).exists())
+
 
 HUB_FIXTURE = {
     "port": 18787,
@@ -2255,8 +2296,14 @@ class HubWorkspaceTests(unittest.TestCase):
                 _status, options = view
                 self.assertEqual(len(options), 6)
 
-    def _run_home(self, launcher, keys):
+    def _run_home(self, launcher, keys, last_backend=None):
         cfg = {"providers": {"Alpha": {"hidden": False}}}
+        if last_backend is not None:
+            launcher.BACKEND_STATE.parent.mkdir(parents=True, exist_ok=True)
+            launcher.BACKEND_STATE.write_text(
+                json.dumps({"backend": last_backend, "at": 0.0}),
+                encoding="utf-8",
+            )
         window = ScriptedWindow(keys)
         launcher._logo_pairs[:] = [0]
         with (
@@ -2271,8 +2318,8 @@ class HubWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
-                # Enter (home -> hub workspace), Enter (launch default).
-                result = self._run_home(launcher, [10, 10])
+                # 上次走 hub：初始聚焦 Hub，Enter 进入，Enter 启动默认模型。
+                result = self._run_home(launcher, [10, 10], last_backend="hub")
                 self.assertIsInstance(result, launcher.HubLaunch)
                 self.assertEqual(result.option.selector, "glm,glm-5.2")
 
@@ -2281,7 +2328,9 @@ class HubWorkspaceTests(unittest.TestCase):
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 # Enter -> hub, j (down), Enter -> launch second option.
-                result = self._run_home(launcher, [10, ord("j"), 10])
+                result = self._run_home(
+                    launcher, [10, ord("j"), 10], last_backend="hub"
+                )
                 self.assertIsInstance(result, launcher.HubLaunch)
                 self.assertEqual(result.option.selector, "gpt,gpt-5.6-sol")
 
@@ -2290,8 +2339,21 @@ class HubWorkspaceTests(unittest.TestCase):
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 # Enter -> hub, Esc -> home, q -> quit launcher.
-                result = self._run_home(launcher, [10, 27, ord("q")])
+                result = self._run_home(
+                    launcher, [10, 27, ord("q")], last_backend="hub"
+                )
                 self.assertIsNone(result)
+
+    def test_initial_focus_follows_mru_provider_not_hub(self) -> None:
+        # 上次真实启动是 provider：即使配置了 hub，Enter 也直接启动
+        # MRU 渠道，不再被 Hub 条目劫持焦点。
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(
+                    launcher, [10], last_backend="provider"
+                )
+                self.assertEqual(result, "Alpha")
 
     def test_home_has_no_hub_entry_without_config(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
