@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from .domain import ProviderInspection, ProviderRef, StoreCapability
-from .store import ProviderStore
+from .routing import StartupRoute, resolve_startup_route
+from .store import ProviderNotFoundError, ProviderStore
 
 
 class ProviderApplicationService:
@@ -47,6 +48,38 @@ class ProviderApplicationService:
         """Descriptive alias for presentation adapters."""
 
         return self.inspect(reference)
+
+    def inspect_stable_id(self, provider_id: str) -> ProviderInspection:
+        """Resolve an opaque stable id without constructing a caller-chosen ref."""
+
+        if (
+            not isinstance(provider_id, str)
+            or not provider_id
+            or provider_id != provider_id.strip()
+        ):
+            raise ProviderNotFoundError("provider reference was not found")
+        matches = tuple(
+            reference
+            for reference in self.list()
+            if reference.provider_id == provider_id
+        )
+        if len(matches) != 1:
+            raise ProviderNotFoundError("provider reference was not found")
+        return self.inspect(matches[0])
+
+    def resolve_startup(
+        self,
+        *,
+        standalone_exists: bool,
+        store_override: str | None = None,
+    ) -> StartupRoute:
+        """Resolve the first surface through the shared pure resolver."""
+
+        return resolve_startup_route(
+            self.detect(),
+            standalone_exists=standalone_exists,
+            store_override=store_override,
+        )
 
 
 __all__ = ["ProviderApplicationService"]
