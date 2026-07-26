@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
+import select
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
 from unittest import mock
 
 
@@ -15,6 +19,7 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from claude_hub import ccswitch  # noqa: E402
 from claude_hub.ccswitch import (  # noqa: E402
     CC_SWITCH_DB_ENV,
     CCSwitchProviderStore,
@@ -57,7 +62,409 @@ def write_schema(path: pathlib.Path, *, user_version: int = 16) -> None:
         connection.close()
 
 
+@contextlib.contextmanager
+def hold_posix_exclusive_byte(
+    path: pathlib.Path,
+    offset: int,
+) -> Iterator[None]:
+    descriptor = os.open(path, os.O_RDWR)
+    holder: subprocess.Popen[bytes] | None = None
+    try:
+        script = r"""
+import fcntl
+import os
+import sys
+
+descriptor = int(sys.argv[1])
+offset = int(sys.argv[2])
+try:
+    fcntl.lockf(
+        descriptor,
+        fcntl.LOCK_EX | fcntl.LOCK_NB,
+        1,
+        offset,
+        os.SEEK_SET,
+    )
+except Exception:
+    sys.stdout.buffer.write(b"ERROR\n")
+    sys.stdout.buffer.flush()
+    raise
+sys.stdout.buffer.write(b"READY\n")
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read(1)
+"""
+        holder = subprocess.Popen(
+            (
+                sys.executable,
+                "-I",
+                "-c",
+                script,
+                str(descriptor),
+                str(offset),
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(descriptor,),
+            close_fds=True,
+        )
+        os.close(descriptor)
+        descriptor = -1
+        if holder.stdout is None:
+            raise RuntimeError("lock holder stdout was unavailable")
+        readable, _writable, _exceptional = select.select(
+            (holder.stdout,),
+            (),
+            (),
+            5,
+        )
+        if not readable or holder.stdout.readline() != b"READY\n":
+            raise RuntimeError("lock holder did not become ready")
+        yield
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if holder is not None:
+            if holder.stdin is not None:
+                try:
+                    holder.stdin.write(b"x")
+                    holder.stdin.flush()
+                    holder.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.terminate()
+                holder.wait(timeout=5)
+            if holder.stdout is not None:
+                holder.stdout.close()
+
+
 class CCSwitchDetectionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX record locks required")
+    def test_posix_rollback_begin_exclusive_blocks_source_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            before = database.read_bytes()
+            writer = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    writer.execute("PRAGMA journal_mode=DELETE").fetchone(),
+                    ("delete",),
+                )
+                writer.execute("BEGIN EXCLUSIVE")
+
+                capability = CCSwitchProviderStore(database).detect()
+                after = database.read_bytes()
+            finally:
+                writer.rollback()
+                writer.close()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+        self.assertEqual(after, before)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX record locks required")
+    def test_posix_shared_byte_writer_lock_blocks_source_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            with hold_posix_exclusive_byte(database, 0x40000002):
+                capability = CCSwitchProviderStore(database).detect()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX record locks required")
+    def test_posix_wal_checkpoint_lock_blocks_source_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO proxy_config VALUES (?, ?)",
+                    ("claude", 0),
+                )
+                writer.commit()
+                shm = database.with_name(database.name + "-shm")
+                self.assertTrue(shm.is_file())
+
+                with hold_posix_exclusive_byte(shm, 121):
+                    capability = CCSwitchProviderStore(database).detect()
+            finally:
+                writer.close()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+
+    def test_any_rollback_journal_sidecar_fails_before_copy(self) -> None:
+        for sidecar_kind in ("regular", "directory"):
+            with (
+                self.subTest(sidecar_kind=sidecar_kind),
+                tempfile.TemporaryDirectory() as raw_directory,
+            ):
+                database = pathlib.Path(raw_directory) / "fixture.db"
+                write_schema(database)
+                journal = database.with_name(database.name + "-journal")
+                if sidecar_kind == "regular":
+                    journal.write_bytes(b"")
+                else:
+                    journal.mkdir()
+                real_copyfile = ccswitch.shutil.copyfile
+                copied_sources: list[pathlib.Path] = []
+
+                def observing_copyfile(source, destination):
+                    copied_sources.append(pathlib.Path(source))
+                    return real_copyfile(source, destination)
+
+                with mock.patch.object(
+                    ccswitch.shutil,
+                    "copyfile",
+                    side_effect=observing_copyfile,
+                ):
+                    capability = CCSwitchProviderStore(database).detect()
+
+                self.assertIs(capability, StoreCapability.CORRUPT)
+                self.assertEqual(copied_sources, [])
+                self.assertTrue(journal.exists())
+
+    def test_rollback_journal_appearing_during_copy_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            journal = database.with_name(database.name + "-journal")
+            real_copyfile = ccswitch.shutil.copyfile
+            copied_sources: list[pathlib.Path] = []
+
+            def racing_copyfile(source, destination):
+                result = real_copyfile(source, destination)
+                copied_sources.append(pathlib.Path(source))
+                if pathlib.Path(source) == database:
+                    journal.write_bytes(b"new rollback sidecar")
+                return result
+
+            with mock.patch.object(
+                ccswitch.shutil,
+                "copyfile",
+                side_effect=racing_copyfile,
+            ):
+                capability = CCSwitchProviderStore(database).detect()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+        self.assertEqual(copied_sources, [database])
+
+    def test_observed_rollback_journal_cannot_disappear_into_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            journal = database.with_name(database.name + "-journal")
+            journal.write_bytes(b"transient rollback sidecar")
+            real_snapshot_state = ccswitch._database_snapshot_state
+            state_calls = 0
+
+            def disappearing_snapshot_state(path):
+                nonlocal state_calls
+                state_calls += 1
+                state = real_snapshot_state(path)
+                if state_calls == 1:
+                    journal.unlink()
+                return state
+
+            with mock.patch.object(
+                ccswitch,
+                "_database_snapshot_state",
+                side_effect=disappearing_snapshot_state,
+            ):
+                capability = CCSwitchProviderStore(database).detect()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+        self.assertEqual(state_calls, 1)
+
+    def test_source_change_during_copy_retries_a_bounded_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            real_copyfile = ccswitch.shutil.copyfile
+            main_copies = 0
+
+            def racing_copyfile(source, destination):
+                nonlocal main_copies
+                result = real_copyfile(source, destination)
+                if pathlib.Path(source) == database:
+                    main_copies += 1
+                    if main_copies == 1:
+                        metadata = database.stat()
+                        os.utime(
+                            database,
+                            ns=(
+                                metadata.st_atime_ns,
+                                metadata.st_mtime_ns + 1,
+                            ),
+                        )
+                return result
+
+            with mock.patch.object(
+                ccswitch.shutil,
+                "copyfile",
+                side_effect=racing_copyfile,
+            ):
+                capability = CCSwitchProviderStore(database).detect()
+
+        self.assertIs(capability, StoreCapability.COMPATIBLE)
+        self.assertEqual(main_copies, 2)
+
+    def test_repeated_wal_change_exhausts_exact_snapshot_retry_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO proxy_config VALUES (?, ?)",
+                    ("claude", 0),
+                )
+                writer.commit()
+                wal = database.with_name(database.name + "-wal")
+                self.assertTrue(wal.is_file())
+                real_copyfile = ccswitch.shutil.copyfile
+                wal_copies = 0
+
+                def racing_copyfile(source, destination):
+                    nonlocal wal_copies
+                    result = real_copyfile(source, destination)
+                    if pathlib.Path(source) == wal:
+                        wal_copies += 1
+                        metadata = wal.stat()
+                        os.utime(
+                            wal,
+                            ns=(
+                                metadata.st_atime_ns,
+                                metadata.st_mtime_ns + wal_copies,
+                            ),
+                        )
+                    return result
+
+                with mock.patch.object(
+                    ccswitch.shutil,
+                    "copyfile",
+                    side_effect=racing_copyfile,
+                ):
+                    capability = CCSwitchProviderStore(database).detect()
+            finally:
+                writer.close()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+        self.assertEqual(wal_copies, ccswitch.DB_SNAPSHOT_RETRIES)
+
+    def test_repeated_shm_change_is_fail_closed_without_copying_shm(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO proxy_config VALUES (?, ?)",
+                    ("claude", 0),
+                )
+                writer.commit()
+                wal = database.with_name(database.name + "-wal")
+                shm = database.with_name(database.name + "-shm")
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                real_copyfile = ccswitch.shutil.copyfile
+                copied_sources: list[pathlib.Path] = []
+                shm_changes = 0
+
+                def racing_copyfile(source, destination):
+                    nonlocal shm_changes
+                    result = real_copyfile(source, destination)
+                    copied_sources.append(pathlib.Path(source))
+                    if pathlib.Path(source) == wal:
+                        shm_changes += 1
+                        metadata = shm.stat()
+                        os.utime(
+                            shm,
+                            ns=(
+                                metadata.st_atime_ns,
+                                metadata.st_mtime_ns + shm_changes,
+                            ),
+                        )
+                    return result
+
+                with mock.patch.object(
+                    ccswitch.shutil,
+                    "copyfile",
+                    side_effect=racing_copyfile,
+                ):
+                    capability = CCSwitchProviderStore(database).detect()
+            finally:
+                writer.close()
+
+        self.assertIs(capability, StoreCapability.CORRUPT)
+        self.assertEqual(shm_changes, ccswitch.DB_SNAPSHOT_RETRIES)
+        self.assertNotIn(shm, copied_sources)
+
+    def test_private_snapshot_permissions_and_wal_copy_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            writer = sqlite3.connect(database)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO proxy_config VALUES (?, ?)",
+                    ("claude", 0),
+                )
+                writer.commit()
+                wal = database.with_name(database.name + "-wal")
+                shm = database.with_name(database.name + "-shm")
+                self.assertTrue(wal.is_file())
+                self.assertTrue(shm.is_file())
+                real_copyfile = ccswitch.shutil.copyfile
+                copied_sources: list[pathlib.Path] = []
+                observed_modes: list[tuple[int, int]] = []
+
+                def observing_copyfile(source, destination):
+                    result = real_copyfile(source, destination)
+                    copied_sources.append(pathlib.Path(source))
+                    snapshot = pathlib.Path(destination)
+                    observed_modes.append(
+                        (
+                            snapshot.stat().st_mode & 0o777,
+                            snapshot.parent.stat().st_mode & 0o777,
+                        )
+                    )
+                    return result
+
+                with mock.patch.object(
+                    ccswitch.shutil,
+                    "copyfile",
+                    side_effect=observing_copyfile,
+                ):
+                    capability = CCSwitchProviderStore(database).detect()
+            finally:
+                writer.close()
+
+        self.assertIs(capability, StoreCapability.COMPATIBLE)
+        self.assertEqual(copied_sources, [database, wal])
+        self.assertNotIn(shm, copied_sources)
+        self.assertEqual(observed_modes, [(0o600, 0o700), (0o600, 0o700)])
+
     def test_read_commands_leave_directory_snapshot_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = pathlib.Path(raw_directory)
@@ -410,6 +817,41 @@ class CCSwitchListTests(unittest.TestCase):
 
 
 class CCSwitchInspectTests(unittest.TestCase):
+    def test_missing_proxy_state_is_invalid_not_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            database = pathlib.Path(raw_directory) / "fixture.db"
+            write_schema(database)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "fixture-provider",
+                        "Fixture Private Name",
+                        "{}",
+                        "claude",
+                        1,
+                        0,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            before = database.read_bytes()
+
+            with self.assertRaisesRegex(
+                ProviderConfigCorruptError,
+                "^provider configuration is invalid$",
+            ):
+                CCSwitchProviderStore(database).inspect(
+                    ProviderRef(
+                        store="cc-switch",
+                        provider_id="fixture-provider",
+                    )
+                )
+
+            self.assertEqual(database.read_bytes(), before)
+
     def test_ambiguous_non_finite_and_oversized_json_use_stable_error(
         self,
     ) -> None:
@@ -456,6 +898,10 @@ class CCSwitchInspectTests(unittest.TestCase):
                             1,
                             0,
                         ),
+                    )
+                    connection.execute(
+                        "INSERT INTO proxy_config VALUES (?, ?)",
+                        ("claude", 0),
                     )
                     connection.commit()
                 finally:
@@ -580,6 +1026,10 @@ class CCSwitchInspectTests(unittest.TestCase):
                             0,
                         ),
                     ),
+                )
+                connection.execute(
+                    "INSERT INTO proxy_config VALUES (?, ?)",
+                    ("claude", 0),
                 )
                 connection.commit()
             finally:

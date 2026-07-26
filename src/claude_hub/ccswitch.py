@@ -10,10 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
-from collections.abc import Mapping
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import TypeVar
 
 from .claude_models import ClaudeModelAdapter, ClaudeModelDocumentError
 from .domain import ProviderInspection, ProviderRef, StoreCapability
@@ -32,6 +37,128 @@ MAX_READ_SCHEMA_VERSION = 16
 WRITE_SCHEMA_VERSIONS = frozenset({16})
 CC_SWITCH_STORE_ID = "cc-switch"
 MAX_SETTINGS_CONFIG_BYTES = 4 * 1024 * 1024
+DB_SNAPSHOT_RETRIES = 3
+DB_LOCK_PROBE_TIMEOUT_SECONDS = 2.0
+
+_LOCK_STATUS_UNLOCKED = b"UNLOCKED\n"
+_LOCK_STATUS_LOCKED = b"LOCKED\n"
+_LOCK_STATUS_UNKNOWN = b"UNKNOWN\n"
+_LOCK_PROBE_SCRIPT = r"""
+import errno
+import os
+import stat
+import sys
+
+LOCKED = "LOCKED\n"
+UNKNOWN = "UNKNOWN\n"
+UNLOCKED = "UNLOCKED\n"
+PENDING_BYTE = 0x40000000
+MAIN_LOCK_BYTES = 512
+WAL_WRITE_LOCK_OFFSET = 120
+WAL_LOCK_BYTES = 8
+MAX_PATH_BYTES = 32768
+
+def probe_posix(path, offset, length):
+    import fcntl
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        try:
+            fcntl.lockf(
+                descriptor,
+                fcntl.LOCK_SH | fcntl.LOCK_NB,
+                length,
+                offset,
+                os.SEEK_SET,
+            )
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return LOCKED
+            return UNKNOWN
+        try:
+            fcntl.lockf(
+                descriptor,
+                fcntl.LOCK_UN,
+                length,
+                offset,
+                os.SEEK_SET,
+            )
+        except OSError:
+            return UNKNOWN
+        return UNLOCKED
+    finally:
+        os.close(descriptor)
+
+def probe_windows(path, offset, length):
+    import msvcrt
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+    )
+    try:
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBRLCK, length)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return LOCKED
+            return UNKNOWN
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, length)
+        except OSError:
+            return UNKNOWN
+        return UNLOCKED
+    finally:
+        os.close(descriptor)
+
+def probe(path, offset, length):
+    if os.name == "posix":
+        return probe_posix(path, offset, length)
+    if os.name == "nt":
+        return probe_windows(path, offset, length)
+    return UNKNOWN
+
+def main():
+    raw_path = sys.stdin.buffer.read(MAX_PATH_BYTES + 1)
+    if (
+        not raw_path
+        or len(raw_path) > MAX_PATH_BYTES
+        or b"\0" in raw_path
+    ):
+        sys.stdout.write(UNKNOWN)
+        return
+    try:
+        path = os.fsdecode(raw_path)
+        statuses = [probe(path, PENDING_BYTE, MAIN_LOCK_BYTES)]
+        shm_path = path + "-shm"
+        try:
+            metadata = os.lstat(shm_path)
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            if not stat.S_ISREG(metadata.st_mode):
+                statuses.append(UNKNOWN)
+            else:
+                statuses.append(
+                    probe(shm_path, WAL_WRITE_LOCK_OFFSET, WAL_LOCK_BYTES)
+                )
+    except Exception:
+        sys.stdout.write(UNKNOWN)
+        return
+    if LOCKED in statuses:
+        sys.stdout.write(LOCKED)
+    elif UNKNOWN in statuses:
+        sys.stdout.write(UNKNOWN)
+    else:
+        sys.stdout.write(UNLOCKED)
+
+main()
+"""
+
+_T = TypeVar("_T")
 
 _REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "providers": frozenset(
@@ -69,7 +196,10 @@ def resolve_ccswitch_database_path(
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
     uri = path.resolve(strict=True).as_uri() + "?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
+    # Lifecycle gates must not wait out SQLite's five-second default when
+    # another owner holds the database.  A lock is uncertainty, so fail closed
+    # immediately and let the caller ask the user to retry.
+    connection = sqlite3.connect(uri, uri=True, timeout=0.0)
     try:
         connection.execute("PRAGMA query_only=ON")
     except Exception:
@@ -122,6 +252,160 @@ def _candidate_capability(path: Path) -> StoreCapability | None:
     return None
 
 
+class _SnapshotUnavailable(RuntimeError):
+    """Internal fixed failure for an unstable or locked source database."""
+
+
+def _snapshot_fingerprint(path: Path) -> tuple[int, ...] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        raise _SnapshotUnavailable(
+            "provider snapshot source is unavailable"
+        ) from None
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _database_snapshot_state(
+    path: Path,
+) -> tuple[
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+]:
+    wal_path = path.with_name(path.name + "-wal")
+    shm_path = path.with_name(path.name + "-shm")
+    journal_path = path.with_name(path.name + "-journal")
+    return (
+        _snapshot_fingerprint(path),
+        _snapshot_fingerprint(wal_path),
+        _snapshot_fingerprint(shm_path),
+        _snapshot_fingerprint(journal_path),
+    )
+
+
+def _require_snapshot_source(
+    path: Path,
+    fingerprint: tuple[int, ...] | None,
+) -> None:
+    if (
+        fingerprint is None
+        or not stat.S_ISREG(fingerprint[2])
+        or not os.access(path, os.R_OK)
+    ):
+        raise _SnapshotUnavailable(
+            "provider snapshot source is unavailable"
+        )
+
+
+def _source_lock_status(path: Path) -> bytes:
+    try:
+        resolved = path.resolve(strict=True)
+        completed = subprocess.run(
+            (sys.executable, "-I", "-c", _LOCK_PROBE_SCRIPT),
+            input=os.fsencode(resolved),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=DB_LOCK_PROBE_TIMEOUT_SECONDS,
+            close_fds=True,
+        )
+    except Exception:
+        return _LOCK_STATUS_UNKNOWN
+    if completed.returncode != 0:
+        return _LOCK_STATUS_UNKNOWN
+    if completed.stdout in {
+        _LOCK_STATUS_UNLOCKED,
+        _LOCK_STATUS_LOCKED,
+        _LOCK_STATUS_UNKNOWN,
+    }:
+        return completed.stdout
+    return _LOCK_STATUS_UNKNOWN
+
+
+def _copy_snapshot_file(source: Path, destination: Path) -> None:
+    destination.touch(mode=0o600, exist_ok=False)
+    destination.chmod(0o600)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+
+
+def _read_stable_snapshot(
+    path: Path,
+    reader: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    wal_path = path.with_name(path.name + "-wal")
+    shm_path = path.with_name(path.name + "-shm")
+    for _attempt in range(DB_SNAPSHOT_RETRIES):
+        try:
+            before = _database_snapshot_state(path)
+            _require_snapshot_source(path, before[0])
+            # Never open, copy, or recover a rollback journal.  Its mere
+            # existence means the main database may require source mutation
+            # before it can be interpreted safely.
+            if before[3] is not None:
+                raise _SnapshotUnavailable(
+                    "provider rollback journal state is uncertain"
+                )
+            if before[1] is not None:
+                _require_snapshot_source(wal_path, before[1])
+            if before[2] is not None:
+                _require_snapshot_source(shm_path, before[2])
+            # This is a bounded capture protocol, not a cross-return lock:
+            # main/WAL/shm/journal identity and metadata must stay fixed
+            # between two full lock probes.  A later writer must still
+            # re-check and CAS.
+            if _source_lock_status(path) != _LOCK_STATUS_UNLOCKED:
+                raise _SnapshotUnavailable(
+                    "provider snapshot source is locked"
+                )
+            with tempfile.TemporaryDirectory(
+                prefix="claude-hub-ccswitch-"
+            ) as raw_directory:
+                directory = Path(raw_directory)
+                directory.chmod(0o700)
+                snapshot = directory / "cc-switch.db"
+                _copy_snapshot_file(path, snapshot)
+                if before[1] is not None:
+                    snapshot_wal = snapshot.with_name(
+                        snapshot.name + "-wal"
+                    )
+                    _copy_snapshot_file(wal_path, snapshot_wal)
+                after = _database_snapshot_state(path)
+                if after[3] is not None:
+                    raise _SnapshotUnavailable(
+                        "provider rollback journal state is uncertain"
+                    )
+                if before != after:
+                    continue
+                if _source_lock_status(path) != _LOCK_STATUS_UNLOCKED:
+                    raise _SnapshotUnavailable(
+                        "provider snapshot source is locked"
+                    )
+                connection = _readonly_connection(snapshot)
+                try:
+                    return reader(connection)
+                finally:
+                    connection.close()
+        except _SnapshotUnavailable:
+            raise
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            continue
+    raise _SnapshotUnavailable(
+        "provider snapshot source changed during capture"
+    )
+
+
 def _schema_capability(connection: sqlite3.Connection) -> StoreCapability:
     version_row = connection.execute("PRAGMA user_version").fetchone()
     if version_row is None or not isinstance(version_row[0], int):
@@ -145,24 +429,26 @@ def _schema_capability(connection: sqlite3.Connection) -> StoreCapability:
     return StoreCapability.READ_ONLY
 
 
-def _open_probed(
+def _read_probed(
     path: Path,
-) -> tuple[StoreCapability, sqlite3.Connection | None]:
+    reader: Callable[[sqlite3.Connection], _T] | None = None,
+) -> tuple[StoreCapability, _T | None]:
     candidate = _candidate_capability(path)
     if candidate is not None:
         return candidate, None
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = _readonly_connection(path)
+
+    def probe(
+        connection: sqlite3.Connection,
+    ) -> tuple[StoreCapability, _T | None]:
         capability = _schema_capability(connection)
-    except (OSError, ValueError, sqlite3.DatabaseError):
-        if connection is not None:
-            connection.close()
+        if reader is None or not capability.can_read:
+            return capability, None
+        return capability, reader(connection)
+
+    try:
+        return _read_stable_snapshot(path, probe)
+    except _SnapshotUnavailable:
         return StoreCapability.CORRUPT, None
-    if not capability.can_read:
-        connection.close()
-        return capability, None
-    return capability, connection
 
 
 class CCSwitchProviderStore:
@@ -186,16 +472,10 @@ class CCSwitchProviderStore:
         self._local_interactive = local_interactive
 
     def detect(self) -> StoreCapability:
-        capability, connection = _open_probed(self._database_path)
-        if connection is not None:
-            connection.close()
+        capability, _payload = _read_probed(self._database_path)
         return capability
 
     def list(self) -> tuple[ProviderRef, ...]:
-        capability, connection = _open_probed(self._database_path)
-        if not capability.can_read or connection is None:
-            raise ProviderStoreUnavailableError("provider store is not readable")
-
         selected = ["id", "is_current"]
         if self._local_interactive:
             selected.append("name")
@@ -203,13 +483,15 @@ class CCSwitchProviderStore:
             f"SELECT {', '.join(selected)} FROM providers "
             "WHERE app_type=? ORDER BY sort_index, id"
         )
-        try:
-            try:
-                rows = connection.execute(query, ("claude",)).fetchall()
-            finally:
-                connection.close()
-        except (OSError, ValueError, sqlite3.DatabaseError):
-            raise ProviderStoreError("provider list could not be read") from None
+        capability, rows = _read_probed(
+            self._database_path,
+            lambda connection: connection.execute(
+                query,
+                ("claude",),
+            ).fetchall(),
+        )
+        if not capability.can_read or rows is None:
+            raise ProviderStoreUnavailableError("provider store is not readable")
 
         references: list[ProviderRef] = []
         try:
@@ -240,26 +522,29 @@ class CCSwitchProviderStore:
         if reference.store != CC_SWITCH_STORE_ID:
             raise ProviderNotFoundError("provider reference was not found")
 
-        capability, connection = _open_probed(self._database_path)
-        if not capability.can_read or connection is None:
-            raise ProviderStoreUnavailableError("provider store is not readable")
-
-        try:
-            try:
-                row = connection.execute(
+        def read_rows(
+            connection: sqlite3.Connection,
+        ) -> tuple[object, object]:
+            return (
+                connection.execute(
                     "SELECT settings_config, is_current FROM providers "
                     "WHERE id=? AND app_type=?",
                     (reference.provider_id, "claude"),
-                ).fetchone()
-                takeover_row = connection.execute(
+                ).fetchone(),
+                connection.execute(
                     "SELECT live_takeover_active FROM proxy_config "
                     "WHERE app_type=?",
                     ("claude",),
-                ).fetchone()
-            finally:
-                connection.close()
-        except (OSError, ValueError, sqlite3.DatabaseError):
-            raise ProviderStoreError("provider inspection could not be read") from None
+                ).fetchone(),
+            )
+
+        capability, payload = _read_probed(
+            self._database_path,
+            read_rows,
+        )
+        if not capability.can_read or payload is None:
+            raise ProviderStoreUnavailableError("provider store is not readable")
+        row, takeover_row = payload
 
         if row is None:
             raise ProviderNotFoundError("provider reference was not found")
@@ -267,10 +552,8 @@ class CCSwitchProviderStore:
         if (
             not isinstance(raw_settings, str)
             or not _is_sqlite_boolean(current_raw)
-            or (
-                takeover_row is not None
-                and not _is_sqlite_boolean(takeover_row[0])
-            )
+            or takeover_row is None
+            or not _is_sqlite_boolean(takeover_row[0])
         ):
             raise ProviderConfigCorruptError(
                 "provider configuration is invalid"
@@ -315,7 +598,7 @@ class CCSwitchProviderStore:
             models=models,
             is_current=bool(current_raw),
             fingerprint=fingerprint,
-            proxy_takeover=bool(takeover_row and takeover_row[0]),
+            proxy_takeover=bool(takeover_row[0]),
             schema_capability=capability,
             unknown_field_count=unknown.count,
             unknown_fingerprint=unknown.fingerprint,
