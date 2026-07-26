@@ -268,6 +268,19 @@ class ClaudeHubTests(unittest.TestCase):
                 "fast": {
                     "provider": "Fixture HTTPS",
                     "models": ["claude-sonnet-4", "claude-opus-4"],
+                    "capabilities": {
+                        "protocol": "anthropic",
+                        "tool_search": "supported",
+                        "count_tokens": "exact",
+                        "context_window": 1000000,
+                        "thinking": "supported",
+                        "reasoning_round_trip": "supported",
+                        "prompt_cache": "supported",
+                        "stream_terminal_usage": "supported",
+                        "beta_policy": "passthrough",
+                        "background_worker_safe": "verified",
+                        "model_id_strategy": "opaque",
+                    },
                 },
                 "blocked": {
                     "provider": "Fixture HTTP",
@@ -457,6 +470,75 @@ class ClaudeHubTests(unittest.TestCase):
         with self.assertRaisesRegex(hub.RouteError, "invalid upstream URL"):
             hub.validate_upstream_url("http://[::1", "broken", False)
 
+    def test_capability_policy_gates_tool_search_beta_cache_and_context(self):
+        safe = hub.resolve_capability_profile()
+        with self.assertRaisesRegex(hub.RouteError, "tool search is disabled"):
+            hub.apply_request_capabilities(
+                {
+                    "tools": [
+                        {
+                            "type": "tool_search_tool_regex_20251119",
+                            "name": "ToolSearch",
+                        }
+                    ]
+                },
+                safe,
+            )
+        with self.assertRaisesRegex(hub.RouteError, "server-side tool schema"):
+            hub.apply_request_capabilities(
+                {"tools": [{"type": "BatchTool", "name": "batch"}]},
+                hub.resolve_capability_profile(
+                    override={
+                        "protocol": "openai_chat",
+                        "tool_search": "supported",
+                    }
+                ),
+            )
+        payload = {
+            "thinking": {"type": "enabled"},
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private"},
+                        {
+                            "type": "text",
+                            "text": "kept",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ],
+                }
+            ],
+        }
+        degraded = hub.apply_request_capabilities(payload, safe)
+        self.assertNotIn("thinking", payload)
+        self.assertEqual(
+            payload["messages"][0]["content"],
+            [{"type": "text", "text": "kept"}],
+        )
+        self.assertEqual(
+            set(degraded),
+            {
+                "thinking-disabled",
+                "reasoning-history-disabled",
+                "prompt-cache-disabled",
+            },
+        )
+        with self.assertRaisesRegex(hub.RouteError, "1M context"):
+            hub.apply_model_capabilities("opaque-model[1m]", safe)
+
+        mapped = hub.resolve_capability_profile(
+            override={
+                "beta_policy": "mapped",
+                "beta_map": {"incoming-beta": "upstream-beta"},
+            }
+        )
+        headers = CIMultiDict(
+            [("anthropic-beta", "incoming-beta,unknown-beta")]
+        )
+        hub.apply_beta_policy(headers, mapped, "opaque-model")
+        self.assertEqual(headers["anthropic-beta"], "upstream-beta")
+
     def test_health_payload_is_fixed_and_does_not_disclose_routing(self):
         response = asyncio.run(hub.handle_healthz(None))
         payload = json.loads(response.text)
@@ -561,7 +643,7 @@ class ClaudeHubTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), contents)
                 self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
             self.assertIn("provider database opens read-only", rendered)
-            self.assertIn("channel 'fast' ready", rendered)
+            self.assertIn("channel #1 ready", rendered)
             self.assertNotIn("updated-wal-token", rendered)
             self.assertNotIn("https://updated.invalid", rendered)
         finally:
@@ -803,7 +885,7 @@ class ClaudeHubTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_real_loopback_gzip_response_bytes_and_encoding_are_preserved(self):
+    def test_real_loopback_upstream_error_body_is_redacted(self):
         async def scenario():
             upstream_runner = None
             hub_runner = None
@@ -889,15 +971,12 @@ class ClaudeHubTests(unittest.TestCase):
                     )
                     body = await response.read()
                     self.assertEqual(response.status, 429)
+                    self.assertNotIn("content-encoding", response.headers)
                     self.assertEqual(
-                        response.headers["content-encoding"],
-                        "gzip",
+                        json.loads(body)["error"]["message"],
+                        "upstream request failed (HTTP 429)",
                     )
-                    self.assertEqual(body, expected_body)
-                    self.assertEqual(
-                        json.loads(gzip.decompress(body)),
-                        expected_json,
-                    )
+                    self.assertNotIn(b"fixture", body)
             finally:
                 if hub_runner is not None:
                     await hub_runner.cleanup()
@@ -970,11 +1049,49 @@ class ClaudeHubTests(unittest.TestCase):
                     }
                 ).encode()
 
+        raw_config = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw_config["channels"]["fast"]["capabilities"]["count_tokens"] = (
+            "estimated"
+        )
+        self.config_file.write_text(json.dumps(raw_config), encoding="utf-8")
+        self.config_file.chmod(0o600)
+        hub.reset_caches()
         cfg = hub.get_config()
         session = FakeSession()
         request = FakeRequest(session, cfg["local_token"])
 
         response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(response.headers["x-hub-estimated"], "1")
+        self.assertEqual(response.headers["x-hub-context-window"], "1000000")
+
+        rejected_session = FakeSession()
+        rejected = FakeRequest(rejected_session, "wrong-token")
+        rejected_response = asyncio.run(hub.handle_messages(rejected))
+        self.assertEqual(rejected_response.status, 401)
+        self.assertEqual(rejected_session.calls, [])
+
+    def test_exact_count_tokens_forwards_and_strips_verified_1m_marker(self):
+        upstream = _FakeUpstream(
+            200,
+            {"content-type": "application/json"},
+            [b'{"input_tokens":42}'],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,upstream-sonnet[1m]",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+            path="/v1/messages/count_tokens",
+            query="?beta=true",
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
 
         self.assertEqual(response.status, 200)
         self.assertEqual(len(session.calls), 1)
@@ -984,20 +1101,16 @@ class ClaudeHubTests(unittest.TestCase):
             "https://upstream.invalid/v1/messages/count_tokens?beta=true",
         )
         self.assertIs(kwargs["allow_redirects"], False)
-        self.assertEqual(
-            kwargs["headers"]["anthropic-beta"],
+        self.assertIn(
             "context-1m-2025-08-07",
+            kwargs["headers"]["anthropic-beta"],
         )
-        forwarded = json.loads(kwargs["data"])
-        self.assertEqual(forwarded["model"], "upstream-sonnet[1m]")
+        self.assertEqual(
+            json.loads(kwargs["data"])["model"],
+            "upstream-sonnet",
+        )
 
-        rejected_session = FakeSession()
-        rejected = FakeRequest(rejected_session, "wrong-token")
-        rejected_response = asyncio.run(hub.handle_messages(rejected))
-        self.assertEqual(rejected_response.status, 401)
-        self.assertEqual(rejected_session.calls, [])
-
-    def test_forwarding_preserves_protocol_fields_headers_query_and_error_body(self):
+    def test_forwarding_preserves_request_fields_and_redacts_error_body(self):
         chunks = [b'{"type":"error",', b'"error":{"type":"rate_limit_error"}}']
         upstream = _FakeUpstream(
             429,
@@ -1091,18 +1204,171 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(forwarded["another_unknown_field"], [1, 2, 3])
 
         self.assertEqual(response.status, 429)
-        self.assertEqual(
-            response.headers["Content-Type"],
-            "application/json; charset=utf-8",
-        )
-        self.assertEqual(response.headers["Content-Encoding"], "identity")
-        self.assertEqual(
-            response.headers.getall("X-Upstream-Trace"),
-            ["fixture-trace-a", "fixture-trace-b"],
-        )
+        self.assertEqual(response.content_type, "application/json")
+        self.assertNotIn("Content-Encoding", response.headers)
+        self.assertNotIn("X-Upstream-Trace", response.headers)
         self.assertNotIn("X-Remove-Me", response.headers)
-        self.assertEqual(response.writes, chunks)
-        self.assertEqual(b"".join(response.writes), b"".join(chunks))
+        sanitized_error = json.loads(response.text)
+        self.assertEqual(
+            sanitized_error["error"]["message"],
+            "upstream request failed (HTTP 429)",
+        )
+        self.assertNotIn("fixture-trace", response.text)
+
+    def test_openai_bridge_preserves_tools_reasoning_and_cache_usage(self):
+        raw_config = json.loads(self.config_file.read_text(encoding="utf-8"))
+        capabilities = raw_config["channels"]["fast"]["capabilities"]
+        capabilities.update(
+            {
+                "protocol": "openai_chat",
+                "count_tokens": "estimated",
+                "context_window": 128000,
+            }
+        )
+        self.config_file.write_text(json.dumps(raw_config), encoding="utf-8")
+        self.config_file.chmod(0o600)
+        hub.reset_caches()
+
+        upstream = _FakeUpstream(
+            200,
+            {"content-type": "application/json"},
+            [
+                json.dumps(
+                    {
+                        "id": "chat-bridge",
+                        "model": "opaque-gpt-model",
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "reasoning_content": "summary",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call-1",
+                                            "function": {
+                                                "name": "lookup",
+                                                "arguments": '{"q":"x"}',
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 20,
+                            "completion_tokens": 3,
+                            "prompt_tokens_details": {
+                                "cached_tokens": 11
+                            },
+                        },
+                    }
+                ).encode()
+            ],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,opaque-gpt-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            },
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(session.calls), 1)
+        url, kwargs = session.calls[0]
+        self.assertEqual(
+            url,
+            "https://upstream.invalid/v1/chat/completions",
+        )
+        self.assertEqual(
+            kwargs["headers"]["authorization"],
+            "Bearer fixture-upstream-token",
+        )
+        self.assertNotIn("x-api-key", kwargs["headers"])
+        forwarded = json.loads(kwargs["data"])
+        self.assertEqual(
+            forwarded["tools"][0]["function"]["name"],
+            "lookup",
+        )
+        body = json.loads(response.text)
+        self.assertEqual(body["stop_reason"], "tool_use")
+        self.assertEqual(body["content"][0]["type"], "thinking")
+        self.assertEqual(body["content"][1]["type"], "tool_use")
+        self.assertEqual(body["usage"]["cache_read_input_tokens"], 11)
+        self.assertEqual(response.headers["x-hub-context-window"], "128000")
+
+    def test_route_auth_isolation_holds_for_internal_request_variants(self):
+        private_model = "private-model-id"
+        old_log = hub._log_fp
+        audit_log = io.StringIO()
+        hub._log_fp = audit_log
+        try:
+            for variant in ("resume", "compact", "subagent", "background"):
+                upstream = _FakeUpstream(
+                    200,
+                    {"content-type": "application/json"},
+                    [
+                        json.dumps(
+                            {
+                                "id": f"message-{variant}",
+                                "type": "message",
+                                "role": "assistant",
+                                "model": private_model,
+                                "content": [{"type": "text", "text": "ok"}],
+                                "stop_reason": "end_turn",
+                                "stop_sequence": None,
+                                "usage": {
+                                    "input_tokens": 2,
+                                    "output_tokens": 1,
+                                },
+                            }
+                        ).encode()
+                    ],
+                )
+                session = _FakeSession(upstream)
+                request = self._request(
+                    {
+                        "model": f"fast,{private_model}",
+                        "metadata": {"request_variant": variant},
+                        "messages": [{"role": "user", "content": "fixture"}],
+                    },
+                    session=session,
+                )
+                with mock.patch.object(
+                    hub.web,
+                    "StreamResponse",
+                    _FakeDownstream,
+                ):
+                    response = asyncio.run(hub.handle_messages(request))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(session.calls), 1)
+                url, kwargs = session.calls[0]
+                self.assertTrue(url.startswith("https://upstream.invalid/"))
+                self.assertNotIn("api.anthropic.com", url)
+                self.assertEqual(
+                    kwargs["headers"]["authorization"],
+                    "Bearer fixture-upstream-token",
+                )
+                self.assertEqual(
+                    kwargs["headers"]["x-api-key"],
+                    "fixture-upstream-token",
+                )
+            rendered_log = audit_log.getvalue()
+            self.assertNotIn(private_model, rendered_log)
+            self.assertNotIn("Fixture HTTPS", rendered_log)
+            self.assertNotIn("fixture-upstream-token", rendered_log)
+        finally:
+            hub._log_fp = old_log
         self.assertTrue(response.eof)
 
     def test_ambiguous_upstream_representation_headers_fail_before_prepare(self):

@@ -380,11 +380,30 @@ def transform_request(
     return "/v1/messages", payload
 
 
-def _usage(input_tokens: object = 0, output_tokens: object = 0) -> dict:
-    return {
+def _usage(
+    input_tokens: object = 0,
+    output_tokens: object = 0,
+    *,
+    cache_creation_input_tokens: object = 0,
+    cache_read_input_tokens: object = 0,
+) -> dict:
+    usage = {
         "input_tokens": input_tokens if isinstance(input_tokens, int) else 0,
         "output_tokens": output_tokens if isinstance(output_tokens, int) else 0,
     }
+    if isinstance(cache_creation_input_tokens, int) and cache_creation_input_tokens:
+        usage["cache_creation_input_tokens"] = cache_creation_input_tokens
+    if isinstance(cache_read_input_tokens, int) and cache_read_input_tokens:
+        usage["cache_read_input_tokens"] = cache_read_input_tokens
+    return usage
+
+
+def _cached_tokens(raw_usage: dict, detail_key: str) -> int:
+    details = raw_usage.get(detail_key)
+    if not isinstance(details, dict):
+        return 0
+    value = details.get("cached_tokens")
+    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def _stop_reason(reason: object, *, has_tool: bool = False) -> str:
@@ -450,7 +469,11 @@ def chat_to_anthropic(body: dict) -> dict:
         "stop_reason": _stop_reason(choice.get("finish_reason"), has_tool=has_tool),
         "stop_sequence": None,
         "usage": _usage(
-            raw_usage.get("prompt_tokens"), raw_usage.get("completion_tokens")
+            raw_usage.get("prompt_tokens"),
+            raw_usage.get("completion_tokens"),
+            cache_read_input_tokens=_cached_tokens(
+                raw_usage, "prompt_tokens_details"
+            ),
         ),
     }
 
@@ -488,6 +511,11 @@ def responses_to_anthropic(body: dict) -> dict:
             )
             has_tool = True
         elif kind == "reasoning":
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted:
+                content.append(
+                    {"type": "redacted_thinking", "data": encrypted}
+                )
             summary = item.get("summary")
             if isinstance(summary, list):
                 text = "\n".join(
@@ -514,7 +542,11 @@ def responses_to_anthropic(body: dict) -> dict:
         ),
         "stop_sequence": None,
         "usage": _usage(
-            raw_usage.get("input_tokens"), raw_usage.get("output_tokens")
+            raw_usage.get("input_tokens"),
+            raw_usage.get("output_tokens"),
+            cache_read_input_tokens=_cached_tokens(
+                raw_usage, "input_tokens_details"
+            ),
         ),
     }
 
@@ -528,13 +560,6 @@ def transform_response(body: dict, api_format: str) -> dict:
 
 
 def transform_error(body: object, status: int) -> dict:
-    error = body.get("error") if isinstance(body, dict) else None
-    if isinstance(error, dict):
-        message = error.get("message") or error.get("code") or f"upstream HTTP {status}"
-        source_type = error.get("type")
-    else:
-        message = body if isinstance(body, str) and body else f"upstream HTTP {status}"
-        source_type = None
     if status in {401, 403}:
         kind = "authentication_error" if status == 401 else "permission_error"
     elif status == 429:
@@ -542,8 +567,17 @@ def transform_error(body: object, status: int) -> dict:
     elif status >= 500:
         kind = "api_error"
     else:
-        kind = str(source_type or "invalid_request_error")
-    return {"type": "error", "error": {"type": kind, "message": str(message)}}
+        kind = "invalid_request_error"
+    # Third-party error text frequently echoes request URLs, headers or account
+    # identifiers.  Preserve the stable HTTP classification, never the raw
+    # upstream message.
+    return {
+        "type": "error",
+        "error": {
+            "type": kind,
+            "message": f"upstream request failed (HTTP {status})",
+        },
+    }
 
 
 def sse_event(event: str, payload: dict) -> bytes:
@@ -604,6 +638,8 @@ class AnthropicStreamBridge:
     stop: str = "end_turn"
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
     def _start(self) -> list[bytes]:
         if self.started:
@@ -743,6 +779,9 @@ class AnthropicStreamBridge:
         if isinstance(usage, dict):
             self.input_tokens = int(usage.get("prompt_tokens") or self.input_tokens)
             self.output_tokens = int(usage.get("completion_tokens") or self.output_tokens)
+            self.cache_read_input_tokens = _cached_tokens(
+                usage, "prompt_tokens_details"
+            )
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
             return []
@@ -789,6 +828,9 @@ class AnthropicStreamBridge:
         if usage:
             self.input_tokens = int(usage.get("input_tokens") or self.input_tokens)
             self.output_tokens = int(usage.get("output_tokens") or self.output_tokens)
+            self.cache_read_input_tokens = _cached_tokens(
+                usage, "input_tokens_details"
+            )
         if kind in {"response.output_text.delta", "response.refusal.delta"}:
             delta = payload.get("delta")
             return self._text(delta) if isinstance(delta, str) and delta else []
@@ -819,14 +861,15 @@ class AnthropicStreamBridge:
                 has_tool=self.has_tool,
             )
         if kind in {"response.failed", "error"}:
-            error = payload.get("error") or response.get("error") or {}
-            message = error.get("message") if isinstance(error, dict) else str(error)
             return [
                 sse_event(
                     "error",
                     {
                         "type": "error",
-                        "error": {"type": "api_error", "message": message or "upstream failed"},
+                        "error": {
+                            "type": "api_error",
+                            "message": "upstream streaming request failed",
+                        },
                     },
                 )
             ]
@@ -851,7 +894,17 @@ class AnthropicStreamBridge:
                             ),
                             "stop_sequence": None,
                         },
-                        "usage": {"output_tokens": self.output_tokens},
+                        # Only terminal usage is a stable anchor.  Interim usage
+                        # updates are retained internally and never overwrite a
+                        # previously completed response.
+                        "usage": _usage(
+                            self.input_tokens,
+                            self.output_tokens,
+                            cache_creation_input_tokens=(
+                                self.cache_creation_input_tokens
+                            ),
+                            cache_read_input_tokens=self.cache_read_input_tokens,
+                        ),
                     },
                 ),
                 sse_event("message_stop", {"type": "message_stop"}),

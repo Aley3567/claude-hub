@@ -45,6 +45,8 @@ jobs:
           claude-provider-once.py
           claude-hub.py
           claude1_protocol.py
+          claude1_provider.py
+          claude1-turn-guard.py
           scripts/secret_guard.py
 
       - name: Scan repository for leaked secrets

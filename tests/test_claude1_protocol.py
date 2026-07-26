@@ -128,6 +128,56 @@ class ResponseTransformTests(unittest.TestCase):
         self.assertEqual(body["content"][0]["input"], {"q": "x"})
         self.assertEqual(body["usage"], {"input_tokens": 7, "output_tokens": 3})
 
+    def test_cache_aware_usage_and_encrypted_reasoning_are_preserved(self) -> None:
+        chat = protocol.transform_response(
+            {
+                "id": "chat-cache",
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {"content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 4,
+                    "prompt_tokens_details": {"cached_tokens": 12},
+                },
+            },
+            "openai_chat",
+        )
+        self.assertEqual(chat["usage"]["cache_read_input_tokens"], 12)
+
+        responses = protocol.transform_response(
+            {
+                "id": "response-cache",
+                "model": "fixture-model",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "encrypted-fixture",
+                        "summary": [{"text": "summary"}],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 30,
+                    "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 18},
+                },
+            },
+            "openai_responses",
+        )
+        self.assertEqual(
+            responses["content"][0],
+            {"type": "redacted_thinking", "data": "encrypted-fixture"},
+        )
+        self.assertEqual(
+            responses["usage"]["cache_read_input_tokens"],
+            18,
+        )
+
     def test_upstream_error_is_redacted_to_anthropic_shape(self) -> None:
         body = protocol.transform_error(
             {"error": {"message": "rate limited", "type": "quota"}},
@@ -135,6 +185,11 @@ class ResponseTransformTests(unittest.TestCase):
         )
         self.assertEqual(body["type"], "error")
         self.assertEqual(body["error"]["type"], "rate_limit_error")
+        self.assertEqual(
+            body["error"]["message"],
+            "upstream request failed (HTTP 429)",
+        )
+        self.assertNotIn("rate limited", body["error"]["message"])
 
 
 class StreamingTransformTests(unittest.TestCase):
@@ -158,6 +213,40 @@ class StreamingTransformTests(unittest.TestCase):
             if line.startswith("data: ")
         ]
         self.assertTrue(any(item.get("type") == "message_stop" for item in payloads))
+        terminal = next(
+            item for item in payloads if item.get("type") == "message_delta"
+        )
+        self.assertEqual(terminal["usage"]["input_tokens"], 2)
+        self.assertEqual(terminal["usage"]["output_tokens"], 1)
+
+    def test_interim_usage_never_emits_a_second_stable_anchor(self) -> None:
+        upstream = [
+            b'data: {"id":"chat_2","choices":[{"delta":{"content":"A"},'
+            b'"finish_reason":null}],"usage":{"prompt_tokens":180,'
+            b'"completion_tokens":1}}\n\n',
+            b'data: {"choices":[{"delta":{"content":"B"},'
+            b'"finish_reason":"stop"}],"usage":{"prompt_tokens":120,'
+            b'"completion_tokens":2,"prompt_tokens_details":'
+            b'{"cached_tokens":40}}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        translated = b"".join(
+            protocol.translate_sse_chunks("openai_chat", upstream)
+        ).decode()
+        payloads = [
+            json.loads(line[6:])
+            for line in translated.splitlines()
+            if line.startswith("data: ")
+        ]
+        terminal = [
+            item for item in payloads if item.get("type") == "message_delta"
+        ]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["usage"]["input_tokens"], 120)
+        self.assertEqual(
+            terminal[0]["usage"]["cache_read_input_tokens"],
+            40,
+        )
 
 
 if __name__ == "__main__":

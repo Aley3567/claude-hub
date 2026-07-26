@@ -84,6 +84,12 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude1_protocol.py" \
     "$home/install root/scripts/claude1_protocol.py" ||
     fail "protocol bridge was not installed"
+  command cmp -s "$REPO_ROOT/claude1_provider.py" \
+    "$home/install root/scripts/claude1_provider.py" ||
+    fail "provider policy was not installed"
+  command cmp -s "$REPO_ROOT/claude1-turn-guard.py" \
+    "$home/install root/scripts/claude1-turn-guard.py" ||
+    fail "turn guard was not installed"
   command cmp -s "$REPO_ROOT/zsh-functions.sh" \
     "$home/install root/claude1/zsh-functions.sh" ||
     fail "safe shell integration was not installed"
@@ -141,6 +147,7 @@ test_existing_files_are_backed_up() {
   print -r -- 'old launcher' > "$home/install root/scripts/claude-provider-once.py"
   print -r -- 'old hub' > "$home/install root/scripts/claude-hub.py"
   print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
+  print -r -- 'old provider policy' > "$home/install root/scripts/claude1_provider.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
   command mkdir -p -- "$home/dotfiles"
   print -r -- 'old zshrc' > "$home/dotfiles/zshrc"
@@ -155,6 +162,7 @@ test_existing_files_are_backed_up() {
   assert_file_content "old launcher" "$backup/claude-provider-once.py"
   assert_file_content "old hub" "$backup/claude-hub.py"
   assert_file_content "old protocol" "$backup/claude1_protocol.py"
+  assert_file_content "old provider policy" "$backup/claude1_provider.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
   assert_file_content "old zshrc" "$backup/zshrc"
 

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -33,7 +34,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
-from claude1_protocol import provider_api_format
+from claude1_provider import (
+    CapabilityProfile,
+    ProviderPolicyError,
+    capability_summary,
+    configured_credential,
+    prepare_provider_settings,
+    resolve_capability_profile,
+)
 
 
 VERSION = "0.1.0"
@@ -53,6 +61,18 @@ MRU_PATH = _env_path("CLAUDE1_MRU_PATH", HOME / ".cc-switch" / "claude1-mru.json
 CONFIG_PATH = _env_path(
     "CLAUDE1_CONFIG_PATH", HOME / ".cc-switch" / "claude1-config.json"
 )
+CC_SETTINGS_PATH = _env_path(
+    "CLAUDE1_CC_SETTINGS_PATH", HOME / ".cc-switch" / "settings.json"
+)
+LIVE_SETTINGS_PATH_OVERRIDE = (
+    _env_path("CLAUDE1_LIVE_SETTINGS_PATH", HOME / ".claude" / "settings.json")
+    if os.environ.get("CLAUDE1_LIVE_SETTINGS_PATH")
+    else None
+)
+MODEL_BACKUP_DIR = _env_path(
+    "CLAUDE1_MODEL_BACKUP_DIR",
+    DB_PATH.parent / "backups" / "claude1-model-editor",
+)
 # 最近一次实际启动记录；普通启动只能写这里，不能改变粘性入口。
 BACKEND_STATE = _env_path(
     "CLAUDE1_BACKEND_STATE", HOME / ".cc-switch" / "claude1-backend.json"
@@ -63,6 +83,10 @@ BACKEND_STICKY = _env_path(
 )
 ANYROUTER_OBSERVER = _env_path(
     "CLAUDE1_ANYROUTER_OBSERVER", HOME / "anyrouter-tools" / "observe-claude1.sh"
+)
+TURN_GUARD_SCRIPT = _env_path(
+    "CLAUDE1_TURN_GUARD_SCRIPT",
+    Path(__file__).resolve().with_name("claude1-turn-guard.py"),
 )
 
 # Composable backends & overlays (claude1 [backend] [overlay...] -- <claude args>)
@@ -299,6 +323,13 @@ MANAGED_ENV_KEYS = {
 CLAUDE_CHILD_PASSTHROUGH = {
     "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN",
 }
+THIRD_PARTY_AMBIENT_CREDENTIAL_PREFIXES = (
+    "OPENAI_",
+    "GEMINI_",
+    "GOOGLE_",
+    "AZURE_",
+    "AWS_",
+)
 
 
 def managed_key(key: str) -> bool:
@@ -310,17 +341,27 @@ def managed_key(key: str) -> bool:
 
 def claude_child_env(settings: dict | None = None) -> dict[str, str]:
     """Build a Claude process environment without inherited routing state."""
+    settings_env = settings.get("env") if isinstance(settings, dict) else None
+    third_party = (
+        isinstance(settings_env, dict)
+        and bool(settings_env.get("ANTHROPIC_BASE_URL"))
+    )
     child = {
         key: value
         for key, value in os.environ.items()
         if not managed_key(key)
+        and not (
+            third_party
+            and key.upper().startswith(
+                THIRD_PARTY_AMBIENT_CREDENTIAL_PREFIXES
+            )
+        )
     }
     for key in CLAUDE_CHILD_PASSTHROUGH:
         value = os.environ.get(key)
         if value:
             child[key] = value
 
-    settings_env = settings.get("env") if isinstance(settings, dict) else None
     if isinstance(settings_env, dict):
         for key, value in settings_env.items():
             if isinstance(key, str) and value is not None:
@@ -362,6 +403,10 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
 
 
 def selected_provider_api_format(provider: dict) -> str:
+    return str(selected_provider_capabilities(provider).get("protocol"))
+
+
+def selected_provider_capabilities(provider: dict) -> CapabilityProfile:
     try:
         settings = json.loads(provider.get("settings_config") or "{}")
     except (json.JSONDecodeError, TypeError):
@@ -370,10 +415,17 @@ def selected_provider_api_format(provider: dict) -> str:
         meta = json.loads(provider.get("meta") or "{}")
     except (json.JSONDecodeError, TypeError):
         meta = {}
-    return provider_api_format(
+    provider_meta = load_config().get("providers", {}).get(provider.get("name"))
+    capabilities = (
+        provider_meta.get("capabilities")
+        if isinstance(provider_meta, dict)
+        else None
+    )
+    return resolve_capability_profile(
         meta=meta,
         settings=settings,
         provider_type=provider.get("provider_type"),
+        override=capabilities,
     )
 
 
@@ -400,18 +452,459 @@ def list_providers() -> list[dict]:
     return ordered
 
 
+MODEL_ENV_FIELDS: tuple[tuple[str, str], ...] = (
+    ("ANTHROPIC_MODEL", "主模型"),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", "Opus"),
+    ("ANTHROPIC_DEFAULT_FABLE_MODEL", "Fable"),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", "Sonnet"),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "Haiku"),
+    ("ANTHROPIC_REASONING_MODEL", "Reasoning"),
+)
+MODEL_VALUE_MAX_LENGTH = 200
+MODEL_LABEL_WIDTH = 10
+MODEL_FIELD_COLORS = {
+    "ANTHROPIC_MODEL": "orange",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "violet",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "pink",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "teal",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "lime",
+    "ANTHROPIC_REASONING_MODEL": "gold",
+}
+
+
+class ModelEditorError(RuntimeError):
+    """Base error for safe, user-facing model editor failures."""
+
+
+class ModelConflictError(ModelEditorError):
+    """The provider changed after the editor loaded its snapshot."""
+
+
+class ModelValidationError(ModelEditorError):
+    """The proposed model value is unsafe or invalid."""
+
+
+@dataclass(frozen=True)
+class ProviderModelField:
+    key: str
+    label: str
+    value: str
+
+
+@dataclass(frozen=True)
+class ProviderModelSnapshot:
+    provider_id: str
+    provider_name: str
+    raw_settings_config: str
+    fields: tuple[ProviderModelField, ...]
+
+    def value_for(self, key: str) -> str:
+        for field in self.fields:
+            if field.key == key:
+                return field.value
+        raise KeyError(key)
+
+
+def _model_snapshot_from_raw(
+    provider_id: str,
+    provider_name: str,
+    raw_settings_config: str,
+) -> ProviderModelSnapshot:
+    try:
+        settings = json.loads(raw_settings_config)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ModelEditorError("Provider 配置 JSON 损坏，已停止编辑") from exc
+    if not isinstance(settings, dict):
+        raise ModelEditorError("Provider 配置不是 JSON object，已停止编辑")
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    fields = tuple(
+        ProviderModelField(key=key, label=label, value=value)
+        for key, label in MODEL_ENV_FIELDS
+        if isinstance((value := env.get(key)), str)
+    )
+    return ProviderModelSnapshot(
+        provider_id=provider_id,
+        provider_name=provider_name,
+        raw_settings_config=raw_settings_config,
+        fields=fields,
+    )
+
+
+def load_provider_model_snapshot(provider_name: str) -> ProviderModelSnapshot:
+    """Load one editable CC Switch Claude provider without exposing credentials."""
+    if not DB_PATH.exists():
+        raise ModelEditorError("CC Switch DB 不存在")
+    db_uri = DB_PATH.resolve(strict=False).as_uri() + "?mode=ro"
+    connection = sqlite3.connect(db_uri, uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT id, name, settings_config FROM providers "
+            "WHERE app_type='claude' AND name=?",
+            (provider_name,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ModelEditorError("无法读取 CC Switch Provider") from exc
+    finally:
+        connection.close()
+    if not rows:
+        raise ModelEditorError("Provider 已不存在，请返回后重新加载")
+    if len(rows) != 1:
+        raise ModelEditorError("Provider 名称重复，无法安全定位目标记录")
+    provider_id, name, raw_settings_config = rows[0]
+    return _model_snapshot_from_raw(provider_id, name, raw_settings_config)
+
+
+def _safe_model_summary(value: str) -> str:
+    folded = value.casefold()
+    if (
+        "://" in value
+        or folded.startswith(("sk-", "bearer ", "token "))
+        or any(unicodedata.category(char).startswith("C") for char in value)
+    ):
+        return "已配置"
+    return _truncate_display(value, 28)
+
+
+def provider_model_summaries() -> dict[str, str]:
+    """Return only display-safe primary model values, never credentials."""
+    summaries: dict[str, str] = {}
+    for row in db_claude_rows():
+        provider = _provider_from_row(row)
+        try:
+            snapshot = _model_snapshot_from_raw(
+                provider["id"],
+                provider["name"],
+                provider["settings_config"],
+            )
+        except ModelEditorError:
+            continue
+        if snapshot.fields:
+            primary = next(
+                (
+                    field.value
+                    for field in snapshot.fields
+                    if field.key == "ANTHROPIC_MODEL"
+                ),
+                snapshot.fields[0].value,
+            )
+            summaries[provider["name"]] = _safe_model_summary(primary)
+    return summaries
+
+
+def validate_model_value(value: str) -> str:
+    if not isinstance(value, str):
+        raise ModelValidationError("模型值必须是文本")
+    if not value:
+        raise ModelValidationError("模型值不能为空")
+    if value != value.strip():
+        raise ModelValidationError("模型值首尾不能包含空白")
+    if len(value) > MODEL_VALUE_MAX_LENGTH:
+        raise ModelValidationError(
+            f"模型值不能超过 {MODEL_VALUE_MAX_LENGTH} 个字符"
+        )
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ModelValidationError("模型值不能包含控制字符")
+    return value
+
+
+def _create_private_db_backup() -> Path:
+    try:
+        source_info = DB_PATH.lstat()
+    except OSError as exc:
+        raise ModelEditorError("无法读取 CC Switch DB") from exc
+    if not stat.S_ISREG(source_info.st_mode):
+        raise ModelEditorError("CC Switch DB 路径不是普通文件")
+    backup_path: Path | None = None
+    try:
+        MODEL_BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory_info = MODEL_BACKUP_DIR.lstat()
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise OSError("backup path is not a directory")
+        if os.name == "posix":
+            os.chmod(MODEL_BACKUP_DIR, 0o700)
+        backup_path = MODEL_BACKUP_DIR / (
+            f"cc-switch-before-model-edit-{time.time_ns()}-"
+            f"{secrets.token_hex(4)}.db"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(backup_path, flags, 0o600)
+        os.close(fd)
+        source_uri = DB_PATH.resolve(strict=True).as_uri() + "?mode=ro"
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(source_uri, uri=True)
+            destination = sqlite3.connect(backup_path)
+            source.backup(destination)
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        if os.name == "posix":
+            os.chmod(backup_path, 0o600)
+        return backup_path
+    except (OSError, sqlite3.Error) as exc:
+        if backup_path is not None:
+            try:
+                backup_path.unlink()
+            except OSError:
+                pass
+        raise ModelEditorError("创建 CC Switch 备份失败，未执行保存") from exc
+
+
+def _read_regular_text(path: Path, label: str) -> str:
+    fd: int | None = None
+    try:
+        expected = path.lstat()
+        if not stat.S_ISREG(expected.st_mode):
+            raise OSError("path is not a regular file")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("opened path is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("path changed while opening")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            return handle.read()
+    except (OSError, UnicodeError) as exc:
+        raise ModelEditorError(f"{label}无法安全读取，未执行保存") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _load_cc_switch_settings() -> dict:
+    if not CC_SETTINGS_PATH.exists():
+        return {}
+    raw = _read_regular_text(CC_SETTINGS_PATH, "CC Switch 本地设置")
+    try:
+        settings = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ModelEditorError("CC Switch 本地设置 JSON 损坏，未执行保存") from exc
+    if not isinstance(settings, dict):
+        raise ModelEditorError("CC Switch 本地设置格式无效，未执行保存")
+    return settings
+
+
+def _effective_current_provider_id(
+    connection: sqlite3.Connection,
+    cc_settings: dict,
+) -> str | None:
+    local_id = cc_settings.get("currentProviderClaude")
+    if isinstance(local_id, str) and local_id:
+        exists = connection.execute(
+            "SELECT 1 FROM providers WHERE id=? AND app_type='claude'",
+            (local_id,),
+        ).fetchone()
+        if exists is not None:
+            return local_id
+    row = connection.execute(
+        "SELECT id FROM providers "
+        "WHERE app_type='claude' AND is_current=1 LIMIT 1"
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _claude_live_settings_path(cc_settings: dict) -> Path:
+    if LIVE_SETTINGS_PATH_OVERRIDE is not None:
+        return LIVE_SETTINGS_PATH_OVERRIDE
+    configured = cc_settings.get("claudeConfigDir")
+    config_dir = (
+        Path(configured).expanduser()
+        if isinstance(configured, str) and configured.strip()
+        else HOME / ".claude"
+    )
+    settings_path = config_dir / "settings.json"
+    legacy_path = config_dir / "claude.json"
+    if settings_path.exists() or not legacy_path.exists():
+        return settings_path
+    return legacy_path
+
+
+def _patch_model_in_json(
+    raw: str,
+    field_key: str,
+    old_value: str,
+    new_value: str,
+    *,
+    label: str,
+) -> str:
+    try:
+        settings = json.loads(raw)
+        env = settings["env"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ModelConflictError(f"{label}结构已变化，请重新加载") from exc
+    if not isinstance(env, dict) or env.get(field_key) != old_value:
+        raise ModelConflictError(f"{label}模型值已变化，请重新加载")
+    env[field_key] = new_value
+    return json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+
+
+def save_provider_model(
+    snapshot: ProviderModelSnapshot,
+    field_key: str,
+    new_value: str,
+) -> ProviderModelSnapshot:
+    """Compare-and-swap one model field in CC Switch's SQLite source of truth."""
+    value = validate_model_value(new_value)
+    if field_key not in {field.key for field in snapshot.fields}:
+        raise ModelValidationError("该模型字段已不存在，请重新加载")
+    if value == snapshot.value_for(field_key):
+        return snapshot
+    _create_private_db_backup()
+
+    connection = sqlite3.connect(DB_PATH, timeout=3, isolation_level=None)
+    live_restore: tuple[Path, str] | None = None
+    live_written = False
+    proxy_backup_update: tuple[str, str] | None = None
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT name, settings_config FROM providers "
+            "WHERE id=? AND app_type='claude'",
+            (snapshot.provider_id,),
+        ).fetchone()
+        if row is None:
+            raise ModelConflictError("Provider 已被删除，请重新加载")
+        current_name, current_raw = row
+        if (
+            current_name != snapshot.provider_name
+            or current_raw != snapshot.raw_settings_config
+        ):
+            raise ModelConflictError(
+                "CC Switch 中的 Provider 已被其他进程修改，请重新加载"
+            )
+        try:
+            updated = json.loads(current_raw)
+            env = updated["env"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ModelConflictError("Provider 配置结构已变化，请重新加载") from exc
+        if not isinstance(env, dict) or field_key not in env:
+            raise ModelConflictError("模型字段已变化，请重新加载")
+        env[field_key] = value
+        updated_raw = json.dumps(
+            updated,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        cc_settings = _load_cc_switch_settings()
+        is_current = (
+            _effective_current_provider_id(connection, cc_settings)
+            == snapshot.provider_id
+        )
+        if is_current:
+            takeover_row = connection.execute(
+                "SELECT live_takeover_active FROM proxy_config "
+                "WHERE app_type='claude'"
+            ).fetchone()
+            takeover_active = bool(takeover_row and takeover_row[0])
+            backup_row = connection.execute(
+                "SELECT original_config FROM proxy_live_backup "
+                "WHERE app_type='claude'"
+            ).fetchone()
+            if takeover_active or backup_row is not None:
+                if backup_row is None:
+                    raise ModelEditorError(
+                        "当前 Provider 正由 CC Switch 代理接管，"
+                        "但恢复备份缺失，未执行保存"
+                    )
+                backup_raw = str(backup_row[0])
+                backup_updated = _patch_model_in_json(
+                    backup_raw,
+                    field_key,
+                    snapshot.value_for(field_key),
+                    value,
+                    label="CC Switch 代理恢复备份",
+                )
+                proxy_backup_update = (backup_raw, backup_updated)
+            else:
+                live_path = _claude_live_settings_path(cc_settings)
+                live_raw = _read_regular_text(live_path, "Claude live 配置")
+                live_updated = _patch_model_in_json(
+                    live_raw,
+                    field_key,
+                    snapshot.value_for(field_key),
+                    value,
+                    label="Claude live 配置",
+                )
+                live_restore = (live_path, live_raw)
+
+        changed = connection.execute(
+            "UPDATE providers SET settings_config=? "
+            "WHERE id=? AND app_type='claude' AND settings_config=?",
+            (updated_raw, snapshot.provider_id, snapshot.raw_settings_config),
+        ).rowcount
+        if changed != 1:
+            raise ModelConflictError(
+                "CC Switch 中的 Provider 已被其他进程修改，请重新加载"
+            )
+        if proxy_backup_update is not None:
+            backup_raw, backup_updated = proxy_backup_update
+            backup_changed = connection.execute(
+                "UPDATE proxy_live_backup "
+                "SET original_config=?, backed_up_at=? "
+                "WHERE app_type='claude' AND original_config=?",
+                (
+                    backup_updated,
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    backup_raw,
+                ),
+            ).rowcount
+            if backup_changed != 1:
+                raise ModelConflictError(
+                    "CC Switch 代理恢复备份已变化，请重新加载"
+                )
+        if live_restore is not None:
+            _atomic_private_write(live_restore[0], live_updated)
+            live_written = True
+        connection.commit()
+    except ModelEditorError:
+        connection.rollback()
+        if live_written and live_restore is not None:
+            try:
+                _atomic_private_write(live_restore[0], live_restore[1])
+            except OSError as restore_exc:
+                raise ModelEditorError(
+                    "保存失败且 Claude live 配置回滚失败；"
+                    "请从刚创建的私有备份恢复并重新打开 CC Switch"
+                ) from restore_exc
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        connection.rollback()
+        if live_written and live_restore is not None:
+            try:
+                _atomic_private_write(live_restore[0], live_restore[1])
+            except OSError as restore_exc:
+                raise ModelEditorError(
+                    "保存失败且 Claude live 配置回滚失败；"
+                    "请从刚创建的私有备份恢复并重新打开 CC Switch"
+                ) from restore_exc
+        raise ModelEditorError("无法保存到 CC Switch，原配置保持不变") from exc
+    finally:
+        connection.close()
+    return _model_snapshot_from_raw(
+        snapshot.provider_id,
+        snapshot.provider_name,
+        updated_raw,
+    )
+
+
 def build_settings(provider: dict) -> dict:
     """Return the provider settings_config from CC Switch DB with NO_PROXY applied."""
     cfg = json.loads(provider["settings_config"] or "{}")
     env = {k: str(v) for k, v in (cfg.get("env") or {}).items()}
 
-    if not any(k.startswith("ANTHROPIC_AUTH") or k.startswith("ANTHROPIC_API") for k in env):
-        # A credential-less entry falls back to the currently stored Claude
-        # login for this one session.
-        print(
-            f"[claude1] 注意: provider {provider['name']} 没有独立凭证，将使用当前已登录的凭证",
-            file=sys.stderr,
-        )
     host = urlparse(env.get("ANTHROPIC_BASE_URL", "")).hostname
     if host:
         for key in ("NO_PROXY", "no_proxy"):
@@ -429,15 +922,18 @@ def build_settings(provider: dict) -> dict:
     return cfg
 
 
-def add_anyrouter_observer(settings: dict, provider_name: str) -> None:
-    """Observe real Any router turn outcomes without reading conversation content."""
-    if provider_name != "Any router" or not ANYROUTER_OBSERVER.is_file():
-        return
-
+def add_turn_guard_hooks(settings: dict) -> None:
+    """Inject the private Stop guard into one in-memory settings object."""
+    if not TURN_GUARD_SCRIPT.is_file():
+        raise RuntimeError("Turn Guard 已启用，但脚本不存在")
     hooks = settings.setdefault("hooks", {})
+    command_prefix = (
+        f"{shlex.quote(sys.executable)} "
+        f"{shlex.quote(str(TURN_GUARD_SCRIPT))}"
+    )
     commands = {
-        "Stop": f"{ANYROUTER_OBSERVER} success",
-        "StopFailure": f"{ANYROUTER_OBSERVER} failure",
+        "Stop": f"{command_prefix} stop",
+        "StopFailure": f"{command_prefix} failure",
     }
     for event, command in commands.items():
         groups = hooks.setdefault(event, [])
@@ -456,6 +952,24 @@ def add_anyrouter_observer(settings: dict, provider_name: str) -> None:
                     "timeout": 5,
                 }]
             })
+
+
+def add_provider_turn_guard(settings: dict, provider_name: str) -> None:
+    """Inject the Stop guard only for a locally opted-in provider."""
+    provider_meta = load_config().get("providers", {}).get(provider_name)
+    if (
+        isinstance(provider_meta, dict)
+        and provider_meta.get("turn_guard") is True
+    ):
+        add_turn_guard_hooks(settings)
+
+
+def settings_backend_turn_guard_enabled(label: str) -> bool:
+    backend_meta = load_config().get("backends", {}).get(label)
+    return (
+        isinstance(backend_meta, dict)
+        and backend_meta.get("turn_guard") is True
+    )
 
 
 def gateway_healthy() -> bool:
@@ -999,6 +1513,17 @@ def _safe_curs_set(visibility: int) -> None:
         pass
 
 
+def _set_raw_input(enabled: bool) -> None:
+    """Let INSERT receive Ctrl+C as a key, then restore normal cbreak mode."""
+    try:
+        if enabled:
+            curses.raw()
+        else:
+            curses.cbreak()
+    except (AttributeError, curses.error):
+        pass
+
+
 def _init_colors() -> dict:
     d = {
         "dim": 0,
@@ -1342,8 +1867,10 @@ def _draw_launcher(
     logo_breathing: bool = False,
     hub_status: "HubStatus | None" = None,
     hub_focus: bool = False,
+    model_summaries: dict[str, str] | None = None,
 ) -> None:
     meta = cfg["providers"]
+    model_summaries = model_summaries or {}
     win.erase()
     h, w = win.getmaxyx()
     big = _large_logo_supported(h, w)
@@ -1375,7 +1902,7 @@ def _draw_launcher(
             "· 含隐藏项",
             C.get("dim", 0),
         )
-    guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
+    guide = notice or "↑↓ / jk 移动 · → 编辑模型 · Enter 启动 · 数字直达"
     if hub_status is not None and not notice:
         guide = "↑↓ / jk 移动 · Enter 进入 Hub / 启动渠道 · 数字直达渠道"
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
@@ -1432,6 +1959,8 @@ def _draw_launcher(
             status.append("最近")
         if hidden:
             status.append("已隐藏")
+        if model_summaries.get(name):
+            status.append(f"模型 {model_summaries[name]}")
         line = _compose_row(label, " · ".join(status), row_width)
         row = list_top + row_offset
         if selected:
@@ -1540,6 +2069,320 @@ def _draw_hub_workspace(
     win.refresh()
 
 
+def _model_input_view(
+    value: str,
+    cursor: int,
+    width: int,
+) -> tuple[str, int]:
+    """Return a horizontally scrolling input viewport and cursor column."""
+    if width <= 0:
+        return ("", 0)
+    cursor = max(0, min(cursor, len(value)))
+    if width < 3:
+        return (_truncate_display(value[cursor:], width), 0)
+
+    inner_width = width - 2
+    left_budget = max(1, inner_width // 2)
+    start = cursor
+    used = 0
+    while start > 0:
+        char_width = _char_width(value[start - 1])
+        if used + char_width > left_budget:
+            break
+        start -= 1
+        used += char_width
+
+    end = cursor
+    remaining = inner_width - used
+    while end < len(value):
+        char_width = _char_width(value[end])
+        if char_width > remaining:
+            break
+        remaining -= char_width
+        end += 1
+
+    # Near the end, spend unused right-side space on more left-side context.
+    while end == len(value) and start > 0 and remaining > 0:
+        char_width = _char_width(value[start - 1])
+        if char_width > remaining:
+            break
+        start -= 1
+        used += char_width
+        remaining -= char_width
+
+    content = value[start:end]
+    left = "‹" if start > 0 else " "
+    right = "›" if end < len(value) else " "
+    rendered = left + _pad_display(content, inner_width) + right
+    cursor_column = 1 + _dwidth(value[start:cursor])
+    return (rendered, min(cursor_column, max(0, width - 1)))
+
+
+def _draw_model_editor(
+    win,
+    snapshot: ProviderModelSnapshot,
+    idx: int,
+    mode: str,
+    buffer: str,
+    cursor: int,
+    notice: str | None,
+    replace_on_type: bool = False,
+) -> None:
+    win.erase()
+    h, w = win.getmaxyx()
+    usable = max(0, w - 4)
+    _addstr(
+        win,
+        0,
+        2,
+        _truncate_display(f"Provider 模型 · {snapshot.provider_name}", usable),
+        C.get("pink", 0) | curses.A_BOLD,
+    )
+    mode_attr = (
+        C.get("warning", 0)
+        if mode == "INSERT"
+        else C.get("lime", 0)
+    )
+    _addstr(win, 2, 2, f"模式: {mode}", mode_attr | curses.A_BOLD)
+    guide = (
+        (
+            "直接输入替换原值 · ←→ 定位保留旧值 · Esc 保存 · Ctrl+C 取消"
+            if replace_on_type
+            else "编辑文本 · Esc 保存 · Ctrl+C 取消 · ←→ 移动光标"
+        )
+        if mode == "INSERT"
+        else "↑↓ / jk 选择 · i 快速编辑 · ← 返回"
+    )
+    _addstr(win, 3, 2, _truncate_display(guide, usable), C.get("dim", 0))
+    if notice:
+        _addstr(
+            win,
+            4,
+            2,
+            _truncate_display(notice, usable),
+            C.get("warning", 0),
+        )
+
+    input_row = 6
+    if mode == "INSERT" and snapshot.fields:
+        field = snapshot.fields[idx]
+        edit_hint = f"编辑值 · {field.label}"
+        if replace_on_type:
+            edit_hint += " · 已选中原值"
+        _addstr(
+            win,
+            5,
+            2,
+            _truncate_display(edit_hint, usable),
+            C.get(MODEL_FIELD_COLORS.get(field.key, "accent"), 0)
+            | curses.A_BOLD,
+        )
+        input_text, _cursor_column = _model_input_view(
+            buffer,
+            cursor,
+            usable,
+        )
+        _addstr(
+            win,
+            input_row,
+            2,
+            _pad_display(input_text, usable),
+            C.get(MODEL_FIELD_COLORS.get(field.key, "sel"), 0)
+            | curses.A_REVERSE
+            | curses.A_BOLD,
+        )
+
+    list_top = 8 if mode == "INSERT" else 6
+    footer_row = max(0, h - 1)
+    capacity = max(0, footer_row - list_top)
+    start, end = _visible_window(len(snapshot.fields), idx, capacity)
+    if not snapshot.fields:
+        _addstr(
+            win,
+            list_top,
+            2,
+            _truncate_display(
+                "此 Provider 没有可编辑的模型字段；Token 与地址不会显示。",
+                usable,
+            ),
+            C.get("dim", 0),
+        )
+    for offset, field_index in enumerate(range(start, end)):
+        field = snapshot.fields[field_index]
+        selected = field_index == idx
+        value = field.value
+        label = (
+            f"{'▸' if selected else ' '} "
+            f"{_pad_display(field.label, MODEL_LABEL_WIDTH)}  {value}"
+        )
+        row = list_top + offset
+        _addstr(
+            win,
+            row,
+            2,
+            _pad_display(_truncate_display(label, usable), usable),
+            C.get("sel", curses.A_REVERSE)
+            if selected and mode == "NORMAL"
+            else (
+                C.get(MODEL_FIELD_COLORS.get(field.key, "base"), 0)
+                | curses.A_BOLD
+            ),
+        )
+
+    footer = (
+        f"{len(snapshot.fields)} 个模型字段 · 不显示 Token / 地址"
+        if snapshot.fields
+        else "← 返回 · q 返回"
+    )
+    _addstr(win, footer_row, 2, _truncate_display(footer, usable), C.get("dim", 0))
+
+    if mode == "INSERT" and snapshot.fields and h > input_row:
+        _input_text, cursor_column = _model_input_view(
+            buffer,
+            cursor,
+            usable,
+        )
+        cursor_x = min(max(2, 2 + cursor_column), max(2, w - 2))
+        if hasattr(win, "move"):
+            try:
+                win.move(input_row, cursor_x)
+            except curses.error:
+                pass
+    win.refresh()
+
+
+def _model_editor(win, provider_name: str) -> None:
+    """Vim-style model editor for one CC Switch provider."""
+    snapshot = load_provider_model_snapshot(provider_name)
+    idx = 0
+    mode = "NORMAL"
+    buffer = ""
+    cursor = 0
+    replace_on_type = False
+    notice: str | None = None
+    _safe_curs_set(0)
+    while True:
+        _draw_model_editor(
+            win,
+            snapshot,
+            idx,
+            mode,
+            buffer,
+            cursor,
+            notice,
+            replace_on_type,
+        )
+        ch = win.getch()
+        if ch == -1:
+            _set_raw_input(False)
+            _safe_curs_set(0)
+            return
+
+        if mode == "NORMAL":
+            if ch in (curses.KEY_UP, ord("k")) and snapshot.fields:
+                idx = (idx - 1) % len(snapshot.fields)
+            elif ch in (curses.KEY_DOWN, ord("j")) and snapshot.fields:
+                idx = (idx + 1) % len(snapshot.fields)
+            elif ch == ord("i") and snapshot.fields:
+                mode = "INSERT"
+                buffer = snapshot.fields[idx].value
+                cursor = len(buffer)
+                replace_on_type = True
+                notice = None
+                _set_raw_input(True)
+                _safe_curs_set(1)
+            elif ch in (curses.KEY_LEFT, ord("q")):
+                _set_raw_input(False)
+                _safe_curs_set(0)
+                return
+            continue
+
+        # INSERT: direction keys edit the buffer and never leave this page.
+        if ch == 27:
+            try:
+                snapshot = save_provider_model(
+                    snapshot,
+                    snapshot.fields[idx].key,
+                    buffer,
+                )
+            except ModelConflictError as exc:
+                try:
+                    snapshot = load_provider_model_snapshot(provider_name)
+                    idx = min(idx, max(0, len(snapshot.fields) - 1))
+                except ModelEditorError:
+                    pass
+                mode = "NORMAL"
+                replace_on_type = False
+                notice = str(exc)
+                _set_raw_input(False)
+                _safe_curs_set(0)
+            except ModelValidationError as exc:
+                notice = str(exc)
+            except ModelEditorError as exc:
+                notice = str(exc)
+            else:
+                mode = "NORMAL"
+                notice = "已保存到 CC Switch"
+                buffer = ""
+                cursor = 0
+                replace_on_type = False
+                _set_raw_input(False)
+                _safe_curs_set(0)
+        elif ch == 3:  # Ctrl+C: explicit cancel, no save.
+            mode = "NORMAL"
+            notice = "已取消编辑"
+            buffer = ""
+            cursor = 0
+            replace_on_type = False
+            _set_raw_input(False)
+            _safe_curs_set(0)
+        elif ch == 21:  # Ctrl+U: clear the whole input buffer.
+            buffer = ""
+            cursor = 0
+            replace_on_type = False
+        elif ch in (curses.KEY_BACKSPACE, 8, 127):
+            if replace_on_type:
+                buffer = ""
+                cursor = 0
+                replace_on_type = False
+            elif cursor > 0:
+                buffer = buffer[: cursor - 1] + buffer[cursor:]
+                cursor -= 1
+        elif ch == curses.KEY_DC:
+            if replace_on_type:
+                buffer = ""
+                cursor = 0
+                replace_on_type = False
+            elif cursor < len(buffer):
+                buffer = buffer[:cursor] + buffer[cursor + 1 :]
+        elif ch == curses.KEY_LEFT:
+            replace_on_type = False
+            cursor = max(0, cursor - 1)
+        elif ch == curses.KEY_RIGHT:
+            replace_on_type = False
+            cursor = min(len(buffer), cursor + 1)
+        elif ch == curses.KEY_HOME:
+            replace_on_type = False
+            cursor = 0
+        elif ch == curses.KEY_END:
+            replace_on_type = False
+            cursor = len(buffer)
+        elif isinstance(ch, int) and 32 <= ch < 127:
+            char = chr(ch)
+            if replace_on_type:
+                buffer = char
+                cursor = 1
+                replace_on_type = False
+                notice = None
+            elif len(buffer) >= MODEL_VALUE_MAX_LENGTH:
+                notice = (
+                    f"模型值不能超过 {MODEL_VALUE_MAX_LENGTH} 个字符"
+                )
+            else:
+                buffer = buffer[:cursor] + char + buffer[cursor:]
+                cursor += 1
+
+
 def _hub_workspace(
     win,
     status: "HubStatus",
@@ -1594,6 +2437,10 @@ def _launcher_main(win, cfg, db_names):
     hub_view = _load_hub_view()
     hub_status, hub_options = hub_view if hub_view is not None else (None, [])
     hub_focus = hub_view is not None
+    try:
+        model_summaries = provider_model_summaries()
+    except (ModelEditorError, RuntimeError, sqlite3.Error):
+        model_summaries = {}
     help_open = False
     notice: str | None = None
     rows, cols = win.getmaxyx()
@@ -1612,6 +2459,7 @@ def _launcher_main(win, cfg, db_names):
         show_brand=True,
         hub_status=hub_status,
         hub_focus=hub_focus,
+        model_summaries=model_summaries,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -1668,6 +2516,16 @@ def _launcher_main(win, cfg, db_names):
             idx = _initial_index(view, mru, preferred)
         elif ch == ord("?"):
             help_open = not help_open
+        elif ch == curses.KEY_RIGHT:
+            if not hub_focus and view:
+                try:
+                    _model_editor(win, view[idx])
+                except ModelEditorError as exc:
+                    notice = str(exc)
+                try:
+                    model_summaries = provider_model_summaries()
+                except (ModelEditorError, RuntimeError, sqlite3.Error):
+                    pass
         elif ch in (10, 13, curses.KEY_ENTER):
             if hub_focus and hub_status is not None:
                 outcome, option = _hub_workspace(win, hub_status, hub_options)
@@ -1693,6 +2551,7 @@ def _launcher_main(win, cfg, db_names):
             notice=notice,
             hub_status=hub_status,
             hub_focus=hub_focus,
+            model_summaries=model_summaries,
         )
 
 
@@ -1823,13 +2682,28 @@ def exec_settings_backend(settings_path: Path, label: str, claude_args: list[str
         raise RuntimeError(f"{label} 配置不存在: {settings_path}")
     record_backend(label)
     print(f"[claude1] 后端: {label} ({settings_path.name})")
-    claude_bin = resolve_claude_bin()
-    return int(
-        subprocess.run(
-            [str(claude_bin), "--settings", str(settings_path), *claude_args],
-            env=claude_child_env(),
-        ).returncode
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{label} 配置无法读取") from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"{label} 配置必须是 JSON object")
+    backend_meta = load_config().get("backends", {}).get(label)
+    capabilities = (
+        backend_meta.get("capabilities")
+        if isinstance(backend_meta, dict)
+        else None
     )
+    profile = resolve_capability_profile(
+        settings=settings,
+        override=capabilities,
+    )
+    if settings_backend_turn_guard_enabled(label):
+        add_turn_guard_hooks(settings)
+    # Always detach settings backends into a private temporary file.  Passing
+    # the original file would let a missing third-party credential fall back to
+    # the user's persisted Claude.ai login.
+    return launch_with_settings(settings, claude_args, profile=profile)
 
 
 def exec_plain_claude(label: str, claude_args: list[str]) -> int:
@@ -1845,8 +2719,23 @@ def exec_plain_claude(label: str, claude_args: list[str]) -> int:
     )
 
 
-def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
+def launch_with_settings(
+    settings: dict,
+    claude_args: list[str],
+    *,
+    profile: CapabilityProfile | None = None,
+) -> int:
     """Launch Claude with a private settings file and always remove it."""
+    profile = profile or resolve_capability_profile(settings=settings)
+    env = settings.get("env") if isinstance(settings, dict) else None
+    require_base_url = isinstance(env, dict) and bool(
+        env.get("ANTHROPIC_BASE_URL")
+    )
+    settings = prepare_provider_settings(
+        settings,
+        profile,
+        require_base_url=require_base_url,
+    )
     if TEMP_DIR is not None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
@@ -1915,7 +2804,7 @@ def _bridge_child_env(
 def launch_with_protocol_bridge(
     provider: dict,
     settings: dict,
-    api_format: str,
+    profile: CapabilityProfile,
     claude_args: list[str],
 ) -> int:
     """Run one isolated Hub for a non-Anthropic provider, then remove it.
@@ -1924,6 +2813,7 @@ def launch_with_protocol_bridge(
     provider and its shared proxy are never changed, so concurrent sessions can
     select different wire formats safely.
     """
+    api_format = str(profile.get("protocol"))
     if not HUB_SCRIPT.is_file():
         raise RuntimeError(
             f"{api_format} 渠道需要协议桥，但 Hub 脚本不存在: {HUB_SCRIPT}"
@@ -1949,6 +2839,7 @@ def launch_with_protocol_bridge(
                     "provider": provider["name"],
                     "api_format": api_format,
                     "models": _provider_models(settings),
+                    "capabilities": profile.as_dict(),
                 }
             },
         }
@@ -1996,7 +2887,11 @@ def launch_with_protocol_bridge(
                 f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
                 f"(隔离端口 {port})"
             )
-            return launch_with_settings(bridged, claude_args)
+            return launch_with_settings(
+                bridged,
+                claude_args,
+                profile=profile,
+            )
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -2100,7 +2995,103 @@ def exec_hub(claude_args: list[str]) -> int:
         f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})"
     )
     print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
-    return launch_with_settings(settings, claude_args)
+    channel_profiles: list[CapabilityProfile] = []
+    for raw_channel in channels.values():
+        if not isinstance(raw_channel, dict):
+            continue
+        try:
+            provider_record = None
+            provider_name = raw_channel.get("provider")
+            if isinstance(provider_name, str) and DB_PATH.exists():
+                try:
+                    provider_record = provider_by_name(provider_name)
+                except (RuntimeError, sqlite3.Error, OSError):
+                    provider_record = None
+            provider_settings = {}
+            provider_meta = {}
+            provider_type = None
+            if provider_record is not None:
+                try:
+                    provider_settings = json.loads(
+                        provider_record.get("settings_config") or "{}"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    provider_settings = {}
+                try:
+                    provider_meta = json.loads(
+                        provider_record.get("meta") or "{}"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    provider_meta = {}
+                provider_type = provider_record.get("provider_type")
+            base_profile = resolve_capability_profile(
+                meta=provider_meta,
+                settings=provider_settings,
+                provider_type=provider_type,
+                override=raw_channel.get("capabilities"),
+                protocol_override=raw_channel.get("api_format"),
+            )
+        except ProviderPolicyError as exc:
+            raise RuntimeError("hub 渠道 capability profile 无效") from exc
+        channel_profiles.append(base_profile)
+        for configured_model in raw_channel.get("models", []):
+            if isinstance(configured_model, str):
+                lookup = (
+                    configured_model[:-4]
+                    if configured_model.casefold().endswith("[1m]")
+                    else configured_model
+                )
+                channel_profiles.append(base_profile.for_model(lookup))
+    any_tool_search = any(
+        item.get("tool_search") == "supported"
+        for item in channel_profiles
+    )
+    any_thinking = any(
+        item.get("thinking") == "supported"
+        for item in channel_profiles
+    )
+    any_reasoning_round_trip = any(
+        item.get("reasoning_round_trip") == "supported"
+        for item in channel_profiles
+    )
+    any_prompt_cache = any(
+        item.get("prompt_cache") == "supported"
+        for item in channel_profiles
+    )
+    max_context = max(
+        (
+            int(context)
+            for item in channel_profiles
+            if isinstance((context := item.get("context_window")), int)
+        ),
+        default=None,
+    )
+    # Claude-facing feature discovery is the union of channel capabilities.
+    # Hub still enforces the selected channel's own profile on every request.
+    hub_profile = resolve_capability_profile(
+        override={
+            "protocol": "anthropic",
+            "tool_search": (
+                "supported" if any_tool_search else "unsupported"
+            ),
+            "count_tokens": "exact",
+            "context_window": max_context or "unknown",
+            "thinking": "supported" if any_thinking else "unsupported",
+            "reasoning_round_trip": (
+                "supported"
+                if any_reasoning_round_trip
+                else "unsupported"
+            ),
+            "prompt_cache": (
+                "supported" if any_prompt_cache else "unknown"
+            ),
+            "stream_terminal_usage": "supported",
+            "beta_policy": "passthrough",
+            "background_worker_safe": "verified",
+            "model_id_strategy": "mapped",
+        }
+    )
+    return launch_with_settings(settings, claude_args, profile=hub_profile)
 
 
 CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠道
@@ -2191,6 +3182,51 @@ def cli_doctor() -> int:
         report("OK", f"CC Switch 数据库只读打开，发现 {len(rows)} 个 Claude 渠道")
         if os.name == "posix" and (DB_PATH.stat().st_mode & 0o077):
             report("FAIL", "CC Switch 数据库含凭证，文件权限应为 0600")
+        for index, row in enumerate(rows, 1):
+            try:
+                raw_settings = json.loads(row["settings_config"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                raw_settings = {}
+            raw_env = (
+                raw_settings.get("env")
+                if isinstance(raw_settings, dict)
+                else {}
+            )
+            credential = (
+                configured_credential(raw_env)
+                if isinstance(raw_env, dict)
+                else None
+            )
+            report(
+                "INFO",
+                (
+                    f"Provider #{index} credential_source="
+                    f"{credential[0] if credential else 'missing'}"
+                ),
+            )
+            try:
+                profile = selected_provider_capabilities(
+                    _provider_from_row(row)
+                )
+            except ProviderPolicyError:
+                report("FAIL", f"Provider #{index} capability profile 无效")
+                continue
+            if isinstance(raw_env, dict) and raw_env.get(
+                "ANTHROPIC_BASE_URL"
+            ):
+                try:
+                    prepare_provider_settings(
+                        raw_settings,
+                        profile,
+                        require_base_url=True,
+                    )
+                except ProviderPolicyError:
+                    report(
+                        "FAIL",
+                        f"Provider #{index} credential/isolation policy 拒绝",
+                    )
+            for line in capability_summary(profile):
+                report("INFO", f"Provider #{index} capabilities: {line}")
 
     if CONFIG_PATH.exists():
         try:
@@ -2289,20 +3325,29 @@ def main(argv: list[str]) -> int:
                 return 1
 
     settings = build_settings(selected)
-    add_anyrouter_observer(settings, selected["name"])
+    profile = selected_provider_capabilities(selected)
+    initial_model = settings.get("env", {}).get("ANTHROPIC_MODEL")
+    if isinstance(initial_model, str) and initial_model:
+        profile = profile.for_model(
+            initial_model[:-4]
+            if initial_model.casefold().endswith("[1m]")
+            else initial_model
+        )
+    settings = prepare_provider_settings(settings, profile)
+    add_provider_turn_guard(settings, selected["name"])
     record_use(selected["name"])
     record_backend("provider", selected["name"])
     print(f"[claude1] 本次使用 provider: {selected['name']}")
-    api_format = selected_provider_api_format(selected)
+    api_format = str(profile.get("protocol"))
     if api_format != "anthropic":
         return launch_with_protocol_bridge(
             selected,
             settings,
-            api_format,
+            profile,
             claude_args,
         )
     ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
-    return launch_with_settings(settings, claude_args)
+    return launch_with_settings(settings, claude_args, profile=profile)
 
 
 if __name__ == "__main__":

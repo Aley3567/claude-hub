@@ -121,6 +121,10 @@ ENV/
 .env.local
 config.local.json
 settings.local.json
+
+# 本地 AI 指导文件（给 Claude Code 用，不进仓库）
+CLAUDE.md
+
 claude-hub.json
 claude-hub-token
 cc-switch.db

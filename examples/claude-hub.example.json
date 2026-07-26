@@ -5,6 +5,19 @@
   "channels": {
     "primary": {
       "provider": "CC Switch provider name",
+      "capabilities": {
+        "protocol": "anthropic",
+        "tool_search": "probe",
+        "count_tokens": "estimated",
+        "context_window": "unknown",
+        "thinking": "unsupported",
+        "reasoning_round_trip": "unsupported",
+        "prompt_cache": "unknown",
+        "stream_terminal_usage": "unsupported",
+        "beta_policy": "filtered",
+        "background_worker_safe": "unverified",
+        "model_id_strategy": "opaque"
+      },
       "models": [
         "claude-sonnet-4-20250514",
         "claude-opus-4-20250514"
@@ -13,6 +26,19 @@
     "proxy-channel": {
       "provider": "Another CC Switch provider",
       "api_format": "openai_chat",
+      "capabilities": {
+        "protocol": "openai_chat",
+        "tool_search": "unsupported",
+        "count_tokens": "estimated",
+        "context_window": "unknown",
+        "thinking": "unsupported",
+        "reasoning_round_trip": "unsupported",
+        "prompt_cache": "unknown",
+        "stream_terminal_usage": "unsupported",
+        "beta_policy": "filtered",
+        "background_worker_safe": "unverified",
+        "model_id_strategy": "opaque"
+      },
       "models": [
         "claude-sonnet-4-20250514"
       ],

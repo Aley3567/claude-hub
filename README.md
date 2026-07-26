@@ -37,7 +37,8 @@ source ~/.zshrc
 
 安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub 和共享协议桥三份 Python 文件。已有目标文件和
+安装器实际复制启动器、Hub、共享协议桥、Provider capability/隔离策略和可选
+Turn Guard 五份 Python 文件。已有目标文件和
 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
@@ -49,7 +50,24 @@ claude1
 ```
 
 使用 `↑↓` 或 `j/k` 移动，按 Enter 启动；前 10 项也可以用 `1–9` 和 `0`
-直接选择。最近使用的渠道会成为默认光标，但列表顺序和数字编号保持稳定。
+直接选择。列表会显示每个 Provider 的主模型摘要；最近使用的渠道会成为默认
+光标，但列表顺序和数字编号保持稳定。
+
+选中普通 Provider 后按 `→` 可进入模型页。模型页默认是 `NORMAL`：
+
+- `↑↓` 或 `j/k` 选择该 Provider 已存在的主模型、Opus、Fable、Sonnet、
+  Haiku 或 Reasoning 字段；
+- `i` 进入 `INSERT`；直接输入会替换整个旧值，先按 `←→`、Home 或 End
+  定位则保留旧值并从光标处修改，`Ctrl+U` 可清空当前输入；
+- `Esc` 校验并自动保存到 CC Switch，然后回到 `NORMAL`；
+- `Ctrl+C` 取消本次输入；`NORMAL` 下按 `←` 返回 Provider 菜单。
+
+保存只更新选中的模型字段。Token、Base URL、Provider 元数据和未知 JSON
+字段保持不变；Hub 的独立模型列表也不会被改写。写入前会在
+`~/.cc-switch/backups/claude1-model-editor/` 创建权限为 `0600` 的 SQLite
+备份，并使用事务和原始配置对比检测 CC Switch 的并发修改。当前 Provider
+会同步对应的 Claude live 模型字段；代理接管时只同步 CC Switch 的恢复备份，
+不会把模型写进代理占位配置。
 
 ## 高频使用速查
 
@@ -75,6 +93,40 @@ CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 Provider 名称匹配不区分大小写；如果多个名称都匹配，会要求再次选择，避免
 静默走错渠道。别名不能与 `hub`、`list`、`doctor` 等保留命令冲突。
 
+## 可选：指定 Provider 的空结束保护
+
+Turn Guard 默认关闭。只在本机
+`~/.cc-switch/claude1-config.json` 中为某一个 Provider 显式设置
+`"turn_guard": true` 后启用，例如：
+
+```json
+{
+  "version": 2,
+  "providers": {
+    "Provider Display Name": {
+      "hidden": false,
+      "turn_guard": true
+    }
+  },
+  "backends": {
+    "target-settings-backend": {
+      "turn_guard": true
+    }
+  }
+}
+```
+
+`providers` 项控制菜单 Provider；如果同一目标还有独立 settings backend，可
+在 `backends` 中对它单独 opt-in。claude1 只会把 Guard 注入这些目标本次进程
+使用的临时 settings，不修改原 settings 文件或 `~/.claude/settings.json`，
+也不影响普通 `claude`、`current`、`direct`、其他 Provider 或其他 backend。
+Guard 仅在响应以 `end_turn` 结束、包含 `thinking` 且没有 `text`/`tool_use`
+时续跑一次；如果续跑仍为空，则熔断并正常停止，避免循环。
+
+状态日志默认写入 `~/.claude/claude1/turn-guard/watch.log`，权限为 `0600`。
+日志只包含时间和固定状态，不记录 prompt、thinking、正文、工具参数、Provider
+名称、地址或凭证；达到 256 KiB 后轮转为一个同权限备份。
+
 ## 默认隔离边界
 
 - `claude1` 的普通启动只影响本次 Claude Code 会话；
@@ -82,8 +134,59 @@ Provider 名称匹配不区分大小写；如果多个名称都匹配，会要�
 - 不接管普通 `claude`；
 - provider 凭证只进入本次 Claude Code 子进程使用的临时 settings；临时文件
   权限为 `0600`，进程结束后删除；
+- custom `ANTHROPIC_BASE_URL` 必须同时带有该 Provider 明确配置的
+  `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`；缺少时直接拒绝启动，不回退
+  本机 Claude.ai OAuth 或其他官方凭证；
+- 每次启动都会清除继承的 Anthropic/Claude 路由状态，只注入当前 Provider
+  的 URL、凭证和模型字段，并设置 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`，
+  避免 Bash、hooks 和 MCP stdio 子进程继承 Provider 凭证；
+- 模型编辑器是唯一会写 CC Switch 的交互；它只写选中的模型字段，并在写入前
+  创建私有数据库备份和执行并发冲突检测；
 - Hub 以只读方式从 CC Switch DB 获取上游地址和凭证，配置示例中不保存上游
   token。
+
+## Provider Capability Profile
+
+Provider 不再只由 `api_format` 描述。普通 Provider、一次性 OpenAI 协议桥和
+多渠道 Hub 共用 `claude1_provider.py` 中的同一份 schema：
+
+```json
+{
+  "protocol": "anthropic",
+  "tool_search": "unsupported",
+  "count_tokens": "estimated",
+  "context_window": "unknown",
+  "thinking": "unsupported",
+  "reasoning_round_trip": "unsupported",
+  "prompt_cache": "unknown",
+  "stream_terminal_usage": "unsupported",
+  "beta_policy": "filtered",
+  "background_worker_safe": "unverified",
+  "model_id_strategy": "opaque"
+}
+```
+
+可在 `~/.cc-switch/claude1-config.json` 的单个
+`providers.<Provider 名>.capabilities`，或 Hub 的单个
+`channels.<别名>.capabilities` 中覆盖。Hub 渠道配置优先于 CC Switch
+Provider settings/metadata；未声明项使用安全默认值，不会借用其他 Provider
+的探测结果。`context_window` 只接受正整数或 `"unknown"`，未知上限不会显示为
+已验证的 200K；`[1m]` 只有在声明至少 `1000000` 后才允许路由。
+同一 Provider 的模型能力不同时，可增加
+`capabilities.models.<精确模型 ID>` 覆盖；匹配区分大小写且不按模型名称猜测。
+
+`beta_policy=filtered` 默认移除额外 beta；需要保留特定值时配置
+`beta_allowlist`。`mapped` 必须同时提供 `beta_map`。OpenAI Chat/Responses
+没有标准精确 token-count endpoint，因此只能声明 `estimated` 或
+`unsupported`，不能伪装成 `exact`。`claude1 doctor` 和
+`claude-hub.py doctor` 会离线、脱敏显示每个字段的来源与
+verified/declared/unverified 状态。
+
+Claude Code 官方产品控制面与第三方 API 兼容能力是两回事：Claude.ai OAuth、
+Remote Control、Fast Mode 和 Claude.ai connectors 不属于普通 Messages API
+capability，Claude1 不会为第三方 Provider 宣称或模拟这些能力。Claude Code
+官方文档也说明 custom `ANTHROPIC_BASE_URL` 默认关闭 Tool Search，只有网关
+明确支持 `tool_reference` 时才应显式开启 `ENABLE_TOOL_SEARCH=true`。
 
 仓库中的 `zsh-sticky-integration.sh` 是显式 opt-in 功能，默认安装器不会复制
 或 source 它。只有手动接入该文件后，`claude1 use <backend>` 写入的
@@ -134,7 +237,9 @@ provider 或 current 状态。
 ├── scripts/
 │   ├── claude-provider-once.py
 │   ├── claude-hub.py
-│   └── claude1_protocol.py
+│   ├── claude1_protocol.py
+│   ├── claude1_provider.py
+│   └── claude1-turn-guard.py
 ├── claude1/
 │   └── zsh-functions.sh
 └── backups/
@@ -158,6 +263,8 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `claude-provider-once.py` | 一次性 provider 选择、TUI 与 Claude Code 启动 |
 | `claude-hub.py` | 可选的本地 Anthropic gateway |
 | `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
+| `claude1_provider.py` | 统一 Provider capability profile、来源审计与凭证隔离 |
+| `claude1-turn-guard.py` | 指定 Provider opt-in 的 thinking-only Stop Guard |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |

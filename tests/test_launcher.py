@@ -4,6 +4,8 @@ import importlib.util
 import io
 import json
 import os
+import curses
+import shlex
 import socket
 import sqlite3
 import stat
@@ -57,9 +59,13 @@ def isolated_env(home: Path, **overrides: str) -> dict[str, str]:
         "CLAUDE1_DB_PATH": str(state / "cc-switch.db"),
         "CLAUDE1_MRU_PATH": str(state / "mru.json"),
         "CLAUDE1_CONFIG_PATH": str(state / "config.json"),
+        "CLAUDE1_CC_SETTINGS_PATH": str(state / "cc-switch-settings.json"),
+        "CLAUDE1_LIVE_SETTINGS_PATH": str(state / "claude-settings.json"),
+        "CLAUDE1_MODEL_BACKUP_DIR": str(state / "model-backups"),
         "CLAUDE1_BACKEND_STATE": str(state / "last-session.json"),
         "CLAUDE1_BACKEND_STICKY": str(state / "sticky"),
         "CLAUDE1_ANYROUTER_OBSERVER": str(home / "bin" / "observer"),
+        "CLAUDE1_TURN_GUARD_SCRIPT": str(home / "bin" / "turn-guard.py"),
         "CLAUDE1_ANYROUTER_SETTINGS": str(home / "settings" / "anyrouter.json"),
         "CLAUDE1_NOTION_MCP": str(home / "settings" / "notion.json"),
         "CLAUDE1_GATEWAY_BIN": str(home / "bin" / "gateway"),
@@ -642,6 +648,247 @@ class LauncherTuiLogicTests(unittest.TestCase):
 
 
 class LauncherSafetyTests(unittest.TestCase):
+    def test_custom_provider_without_explicit_credential_fails_before_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(
+                home,
+                CLAUDE_CODE_OAUTH_TOKEN="ambient-oauth-must-not-be-used",  # secret-guard: allow
+                ANTHROPIC_API_KEY="ambient-key-must-not-be-used",  # secret-guard: allow
+            )
+            fake_claude = home / "bin" / "claude"
+            marker = home / "claude-ran"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(
+                fake_claude,
+                (
+                    "#!/bin/sh\n"
+                    f"touch {shlex.quote(str(marker))}\n"
+                ),
+            )
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(
+                    launcher.ProviderPolicyError,
+                    "refusing official credential fallback",
+                ):
+                    launcher.launch_with_settings(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": (
+                                    "https://third-party.invalid"
+                                )
+                            }
+                        },
+                        ["-p", "fixture"],
+                    )
+
+            self.assertFalse(marker.exists())
+
+    def test_opted_in_settings_backend_uses_guarded_temporary_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            guard = Path(env["CLAUDE1_TURN_GUARD_SCRIPT"])
+            guard.parent.mkdir(parents=True)
+            write_executable(guard, "#!/usr/bin/env python3\n")
+            backend_settings = Path(env["CLAUDE1_ANYROUTER_SETTINGS"])
+            backend_settings.parent.mkdir(parents=True)
+            original = {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": "fixture-secret",
+                }
+            }
+            backend_settings.write_text(json.dumps(original), encoding="utf-8")
+            config_path = Path(env["CLAUDE1_CONFIG_PATH"])
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "providers": {},
+                        "backends": {"anyrouter": {"turn_guard": True}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_claude = home / "bin" / "claude"
+            capture = home / "capture.json"
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                idx = sys.argv.index("--settings")
+                settings_path = Path(sys.argv[idx + 1])
+                Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
+                    json.dumps({
+                        "settings_path": str(settings_path),
+                        "settings": json.loads(
+                            settings_path.read_text(encoding="utf-8")
+                        ),
+                    }),
+                    encoding="utf-8",
+                )
+                """,
+            )
+            env.update(
+                CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                FAKE_CLAUDE_CAPTURE=str(capture),
+            )
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(launcher.main(["any", "-p", "hello"]), 0)
+
+            observed = json.loads(capture.read_text(encoding="utf-8"))
+            stop_command = observed["settings"]["hooks"]["Stop"][0]["hooks"][0][
+                "command"
+            ]
+            self.assertIn(str(guard), stop_command)
+            self.assertNotEqual(observed["settings_path"], str(backend_settings))
+            self.assertFalse(Path(observed["settings_path"]).exists())
+            self.assertEqual(
+                json.loads(backend_settings.read_text(encoding="utf-8")),
+                original,
+            )
+
+    def test_opted_in_provider_injects_guard_only_into_temporary_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    (
+                        "guarded",
+                        "Guarded Fixture",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                                    "ANTHROPIC_AUTH_TOKEN": "fixture-secret",
+                                }
+                            }
+                        ),
+                        1,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    (
+                        "unguarded",
+                        "Other Fixture",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "https://other.invalid",
+                                    "ANTHROPIC_AUTH_TOKEN": "other-fixture-secret",
+                                }
+                            }
+                        ),
+                        2,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            config_path = Path(env["CLAUDE1_CONFIG_PATH"])
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "providers": {
+                            "Guarded Fixture": {
+                                "hidden": False,
+                                "turn_guard": True,
+                            },
+                            "Other Fixture": {"hidden": False},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            guard = Path(env["CLAUDE1_TURN_GUARD_SCRIPT"])
+            guard.parent.mkdir(parents=True)
+            write_executable(guard, "#!/usr/bin/env python3\n")
+            fake_claude = home / "bin" / "claude"
+            capture = home / "capture.json"
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                idx = sys.argv.index("--settings")
+                settings_path = Path(sys.argv[idx + 1])
+                Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
+                    json.dumps(
+                        json.loads(settings_path.read_text(encoding="utf-8"))
+                    ),
+                    encoding="utf-8",
+                )
+                """,
+            )
+            env.update(
+                CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                FAKE_CLAUDE_CAPTURE=str(capture),
+            )
+            user_settings = home / ".claude" / "settings.json"
+            user_settings.parent.mkdir(parents=True)
+            user_settings.write_text('{"sentinel":"unchanged"}\n', encoding="utf-8")
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.main(["Guarded Fixture", "-p", "hello"]),
+                    0,
+                )
+
+            settings = json.loads(capture.read_text(encoding="utf-8"))
+            stop_command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            failure_command = settings["hooks"]["StopFailure"][0]["hooks"][0][
+                "command"
+            ]
+            self.assertIn(str(guard), stop_command)
+            self.assertTrue(stop_command.endswith(" stop"))
+            self.assertIn(str(guard), failure_command)
+            self.assertTrue(failure_command.endswith(" failure"))
+            self.assertEqual(
+                user_settings.read_text(encoding="utf-8"),
+                '{"sentinel":"unchanged"}\n',
+            )
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.main(["Other Fixture", "-p", "hello"]),
+                    0,
+                )
+
+            other_settings = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertNotIn("hooks", other_settings)
+            self.assertEqual(
+                user_settings.read_text(encoding="utf-8"),
+                '{"sentinel":"unchanged"}\n',
+            )
+
     def test_recent_provider_state_is_written_atomically_and_privately(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -696,6 +943,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 "BACKEND_STATE": "CLAUDE1_BACKEND_STATE",
                 "BACKEND_STICKY": "CLAUDE1_BACKEND_STICKY",
                 "ANYROUTER_OBSERVER": "CLAUDE1_ANYROUTER_OBSERVER",
+                "TURN_GUARD_SCRIPT": "CLAUDE1_TURN_GUARD_SCRIPT",
                 "ANYROUTER_SETTINGS": "CLAUDE1_ANYROUTER_SETTINGS",
                 "NOTION_MCP": "CLAUDE1_NOTION_MCP",
                 "GATEWAY_BIN": "CLAUDE1_GATEWAY_BIN",
@@ -821,6 +1069,8 @@ class LauncherSafetyTests(unittest.TestCase):
                 https_proxy="http://must-not-leak.invalid",
                 CLAUDE_CONFIG_DIR=str(home / "untrusted-config"),
                 CLAUDE_CODE_PARENT_SESSION_ID="must-not-leak",
+                OPENAI_API_KEY="must-not-leak",  # secret-guard: allow
+                AWS_SECRET_ACCESS_KEY="must-not-leak",  # secret-guard: allow
                 CLAUDE_HUB_LOCAL_TOKEN="must-not-leak",
                 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="1",
             )
@@ -839,7 +1089,22 @@ class LauncherSafetyTests(unittest.TestCase):
 
             observed = json.loads(capture.read_text(encoding="utf-8"))
             self.assertEqual(observed["mode"], 0o600)
-            self.assertEqual(observed["settings"], settings)
+            self.assertEqual(
+                observed["settings"]["env"]["ANTHROPIC_BASE_URL"],
+                settings["env"]["ANTHROPIC_BASE_URL"],
+            )
+            self.assertEqual(
+                observed["settings"]["env"]["ANTHROPIC_AUTH_TOKEN"],
+                settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+            )
+            self.assertEqual(
+                observed["settings"]["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"],
+                "1",
+            )
+            self.assertEqual(
+                observed["settings"]["env"]["ENABLE_TOOL_SEARCH"],
+                "false",
+            )
             self.assertNotIn("fixture-secret", observed["argv"])
             self.assertFalse(Path(observed["settings_path"]).exists())
             child_env = observed["env"]
@@ -854,6 +1119,8 @@ class LauncherSafetyTests(unittest.TestCase):
                 "https_proxy",
                 "CLAUDE_CONFIG_DIR",
                 "CLAUDE_CODE_PARENT_SESSION_ID",
+                "OPENAI_API_KEY",
+                "AWS_SECRET_ACCESS_KEY",
                 "CLAUDE_HUB_LOCAL_TOKEN",
             ):
                 self.assertNotIn(key, child_env)
@@ -1137,6 +1404,692 @@ class ScriptedWindow:
 
     def getch(self):
         return self._keys.pop(0) if self._keys else -1
+
+
+class ProviderModelEditorTests(unittest.TestCase):
+    def _seed_provider(
+        self,
+        env: dict[str, str],
+        *,
+        is_current: bool = False,
+    ) -> tuple[Path, dict]:
+        db_path = Path(env["CLAUDE1_DB_PATH"])
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        original = {
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "fixture-token-must-stay",
+                "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                "ANTHROPIC_MODEL": "main-old",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-old",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "fable-old",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-old",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-old",
+                "UNRELATED_ENV": "preserve-me",
+            },
+            "unknown": {"nested": [1, 2, 3]},
+        }
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                "CREATE TABLE providers ("
+                "id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL, "
+                "settings_config TEXT NOT NULL, sort_index INTEGER, "
+                "is_current INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (id, app_type))"
+            )
+            connection.execute(
+                "CREATE TABLE proxy_config ("
+                "app_type TEXT PRIMARY KEY, live_takeover_active INTEGER NOT NULL DEFAULT 0)"
+            )
+            connection.execute(
+                "CREATE TABLE proxy_live_backup ("
+                "app_type TEXT PRIMARY KEY, original_config TEXT NOT NULL, "
+                "backed_up_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO providers "
+                "(id, app_type, name, settings_config, sort_index, is_current) "
+                "VALUES (?, 'claude', ?, ?, 1, ?)",
+                (
+                    "provider-fixture",
+                    "Fixture Provider",
+                    json.dumps(original),
+                    int(is_current),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO proxy_config VALUES ('claude', 0)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        db_path.chmod(0o600)
+        return db_path, original
+
+    def test_inactive_provider_save_changes_only_selected_model_field(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            db_path, original = self._seed_provider(env)
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+                self.assertEqual(
+                    [field.key for field in snapshot.fields],
+                    [
+                        "ANTHROPIC_MODEL",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    ],
+                )
+                saved = launcher.save_provider_model(
+                    snapshot,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "opus-new",
+                )
+
+            connection = sqlite3.connect(db_path)
+            try:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            updated = json.loads(raw)
+            expected = json.loads(json.dumps(original))
+            expected["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "opus-new"
+            self.assertEqual(updated, expected)
+            self.assertEqual(saved.value_for("ANTHROPIC_DEFAULT_OPUS_MODEL"), "opus-new")
+            backups = list(Path(env["CLAUDE1_MODEL_BACKUP_DIR"]).glob("*.db"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(backups[0].parent.stat().st_mode),
+                0o700,
+            )
+
+    def test_provider_with_only_main_model_shows_no_invented_role_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            db_path, _original = self._seed_provider(env)
+            reduced = {
+                "env": {
+                    "ANTHROPIC_MODEL": "only-main",
+                    "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                },
+                "unknown": {"keep": True},
+            }
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "UPDATE providers SET settings_config=? "
+                    "WHERE id='provider-fixture' AND app_type='claude'",
+                    (json.dumps(reduced),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+            self.assertEqual(
+                [(field.key, field.value) for field in snapshot.fields],
+                [("ANTHROPIC_MODEL", "only-main")],
+            )
+
+    def test_model_rows_align_values_after_cjk_and_ascii_labels(self) -> None:
+        class CapturingWindow:
+            def __init__(self) -> None:
+                self.writes: list[tuple[int, int, str, int]] = []
+
+            def getmaxyx(self):
+                return (18, 80)
+
+            def erase(self):
+                self.writes.clear()
+
+            def addstr(self, y, x, text, attr):
+                self.writes.append((y, x, text, attr))
+
+            def refresh(self):
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                launcher.C = {
+                    "pink": 1,
+                    "lime": 2,
+                    "dim": 3,
+                    "warning": 4,
+                    "base": 5,
+                    "sel": 6,
+                }
+                snapshot = launcher.ProviderModelSnapshot(
+                    provider_id="fixture",
+                    provider_name="Fixture Provider",
+                    raw_settings_config="{}",
+                    fields=(
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_MODEL", "主模型", "main-value"
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "Opus", "opus-value"
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                            "Sonnet",
+                            "sonnet-value",
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL", "Haiku", "haiku-value"
+                        ),
+                    ),
+                )
+                window = CapturingWindow()
+                launcher._draw_model_editor(
+                    window,
+                    snapshot,
+                    0,
+                    "NORMAL",
+                    "",
+                    0,
+                    None,
+                )
+
+                value_columns = []
+                for value in (
+                    "main-value",
+                    "opus-value",
+                    "sonnet-value",
+                    "haiku-value",
+                ):
+                    _y, x, text, _attr = next(
+                        write for write in window.writes if value in write[2]
+                    )
+                    value_columns.append(
+                        x + launcher._dwidth(text[: text.index(value)])
+                    )
+                self.assertEqual(len(set(value_columns)), 1)
+
+    def test_model_roles_use_distinct_palette_colors(self) -> None:
+        class CapturingWindow:
+            def __init__(self) -> None:
+                self.writes: list[tuple[int, int, str, int]] = []
+
+            def getmaxyx(self):
+                return (18, 80)
+
+            def erase(self):
+                self.writes.clear()
+
+            def addstr(self, y, x, text, attr):
+                self.writes.append((y, x, text, attr))
+
+            def refresh(self):
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                launcher.C = {
+                    "pink": 1,
+                    "lime": 2,
+                    "teal": 4,
+                    "violet": 8,
+                    "orange": 16,
+                    "gold": 32,
+                    "dim": 64,
+                    "warning": 128,
+                    "base": 256,
+                    "sel": 512,
+                }
+                snapshot = launcher.ProviderModelSnapshot(
+                    provider_id="fixture",
+                    provider_name="Fixture Provider",
+                    raw_settings_config="{}",
+                    fields=(
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_MODEL", "主模型", "main-value"
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "Opus", "opus-value"
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                            "Sonnet",
+                            "sonnet-value",
+                        ),
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL", "Haiku", "haiku-value"
+                        ),
+                    ),
+                )
+                window = CapturingWindow()
+                launcher._draw_model_editor(
+                    window,
+                    snapshot,
+                    0,
+                    "NORMAL",
+                    "",
+                    0,
+                    None,
+                )
+                role_attrs = [
+                    next(write[3] for write in window.writes if value in write[2])
+                    for value in ("opus-value", "sonnet-value", "haiku-value")
+                ]
+                self.assertEqual(len(set(role_attrs)), 3)
+
+    def test_insert_mode_has_a_scrolling_input_line_and_visible_cursor(self) -> None:
+        class CapturingWindow:
+            def __init__(self) -> None:
+                self.writes: list[tuple[int, int, str, int]] = []
+                self.moves: list[tuple[int, int]] = []
+
+            def getmaxyx(self):
+                return (14, 32)
+
+            def erase(self):
+                self.writes.clear()
+
+            def addstr(self, y, x, text, attr):
+                self.writes.append((y, x, text, attr))
+
+            def move(self, y, x):
+                self.moves.append((y, x))
+
+            def refresh(self):
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                launcher.C = {
+                    "pink": 1,
+                    "lime": 2,
+                    "teal": 4,
+                    "violet": 8,
+                    "orange": 16,
+                    "gold": 32,
+                    "dim": 64,
+                    "warning": 128,
+                    "base": 256,
+                    "sel": 512,
+                }
+                snapshot = launcher.ProviderModelSnapshot(
+                    provider_id="fixture",
+                    provider_name="Fixture Provider",
+                    raw_settings_config="{}",
+                    fields=(
+                        launcher.ProviderModelField(
+                            "ANTHROPIC_MODEL", "主模型", "main-old"
+                        ),
+                    ),
+                )
+                window = CapturingWindow()
+                long_value = "model-" + ("x" * 80)
+                launcher._draw_model_editor(
+                    window,
+                    snapshot,
+                    0,
+                    "INSERT",
+                    long_value,
+                    len(long_value),
+                    None,
+                )
+                rendered = "\n".join(write[2] for write in window.writes)
+                self.assertIn("编辑值", rendered)
+                self.assertIn("‹", rendered)
+                self.assertTrue(window.moves)
+                self.assertEqual(window.moves[-1][0], 6)
+
+    def test_current_provider_save_updates_live_settings_without_touching_other_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            _db_path, original = self._seed_provider(env, is_current=True)
+            cc_settings = Path(env["CLAUDE1_CC_SETTINGS_PATH"])
+            cc_settings.write_text(
+                json.dumps({"currentProviderClaude": "provider-fixture"}),
+                encoding="utf-8",
+            )
+            live_path = Path(env["CLAUDE1_LIVE_SETTINGS_PATH"])
+            live_original = json.loads(json.dumps(original))
+            live_original["permissions"] = {"allow": ["Read(fixture/**)"]}
+            live_path.write_text(json.dumps(live_original), encoding="utf-8")
+            live_path.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+                launcher.save_provider_model(
+                    snapshot,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "haiku-new",
+                )
+
+            live_updated = json.loads(live_path.read_text(encoding="utf-8"))
+            expected = json.loads(json.dumps(live_original))
+            expected["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "haiku-new"
+            self.assertEqual(live_updated, expected)
+            self.assertEqual(stat.S_IMODE(live_path.stat().st_mode), 0o600)
+
+    def test_proxy_managed_current_provider_updates_restore_backup_not_live_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            db_path, original = self._seed_provider(env, is_current=True)
+            Path(env["CLAUDE1_CC_SETTINGS_PATH"]).write_text(
+                json.dumps({"currentProviderClaude": "provider-fixture"}),
+                encoding="utf-8",
+            )
+            live_path = Path(env["CLAUDE1_LIVE_SETTINGS_PATH"])
+            live_placeholder = {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:19999",
+                    "ANTHROPIC_API_KEY": "fixture-proxy-placeholder",
+                },
+                "permissions": {"allow": ["Read(fixture/**)"]},
+            }
+            live_path.write_text(json.dumps(live_placeholder), encoding="utf-8")
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "UPDATE proxy_config SET live_takeover_active=1 "
+                    "WHERE app_type='claude'"
+                )
+                connection.execute(
+                    "INSERT INTO proxy_live_backup VALUES ('claude', ?, ?)",
+                    (json.dumps(original), "fixture-time"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+                launcher.save_provider_model(
+                    snapshot,
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                    "fable-new",
+                )
+
+            self.assertEqual(
+                json.loads(live_path.read_text(encoding="utf-8")),
+                live_placeholder,
+            )
+            connection = sqlite3.connect(db_path)
+            try:
+                provider_raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+                backup_raw = connection.execute(
+                    "SELECT original_config FROM proxy_live_backup "
+                    "WHERE app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(
+                json.loads(provider_raw)["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"],
+                "fable-new",
+            )
+            self.assertEqual(
+                json.loads(backup_raw)["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"],
+                "fable-new",
+            )
+
+    def test_right_i_escape_left_edits_and_returns_to_provider_menu(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
+            db_path, _original = self._seed_provider(env)
+            keys = [
+                curses.KEY_RIGHT,
+                curses.KEY_DOWN,
+                ord("i"),
+                21,  # Ctrl+U clears the INSERT buffer.
+                *map(ord, "opus-vim-new"),
+                27,
+                curses.KEY_LEFT,
+                ord("q"),
+            ]
+            window = ScriptedWindow(keys, size=(18, 72))
+            cfg = {"providers": {"Fixture Provider": {"hidden": False}}}
+
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(
+                            window,
+                            cfg,
+                            {"Fixture Provider"},
+                        )
+                    )
+
+            connection = sqlite3.connect(db_path)
+            try:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(
+                json.loads(raw)["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+                "opus-vim-new",
+            )
+
+    def test_insert_typing_replaces_the_old_value_without_manual_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
+            db_path, _original = self._seed_provider(env)
+            window = ScriptedWindow(
+                [
+                    curses.KEY_RIGHT,
+                    ord("i"),
+                    *map(ord, "quick-main"),
+                    27,
+                    curses.KEY_LEFT,
+                    ord("q"),
+                ],
+                size=(18, 72),
+            )
+            cfg = {"providers": {"Fixture Provider": {"hidden": False}}}
+
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    launcher._launcher_main(
+                        window,
+                        cfg,
+                        {"Fixture Provider"},
+                    )
+
+            connection = sqlite3.connect(db_path)
+            try:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(
+                json.loads(raw)["env"]["ANTHROPIC_MODEL"],
+                "quick-main",
+            )
+
+    def test_provider_menu_shows_model_summary_without_credentials_or_url(self) -> None:
+        class CapturingWindow:
+            def __init__(self) -> None:
+                self.writes: list[str] = []
+
+            def getmaxyx(self):
+                return (18, 90)
+
+            def erase(self):
+                self.writes.clear()
+
+            def addstr(self, _y, _x, text, _attr):
+                self.writes.append(text)
+
+            def refresh(self):
+                return
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            self._seed_provider(env)
+            with loaded_launcher(env) as launcher:
+                launcher.C = {
+                    "pink": 0,
+                    "lime": 0,
+                    "dim": 0,
+                    "warning": 0,
+                    "base": 0,
+                    "sel": 0,
+                }
+                launcher._logo_pairs[:] = [0]
+                summaries = launcher.provider_model_summaries()
+                window = CapturingWindow()
+                launcher._draw_launcher(
+                    window,
+                    {"providers": {"Fixture Provider": {"hidden": False}}},
+                    ["Fixture Provider"],
+                    0,
+                    False,
+                    {},
+                    model_summaries=summaries,
+                )
+            rendered = "\n".join(window.writes)
+            self.assertIn("main-old", rendered)
+            self.assertNotIn("fixture-token-must-stay", rendered)
+            self.assertNotIn("fixture.invalid", rendered)
+
+    def test_concurrent_cc_switch_change_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            db_path, _original = self._seed_provider(env)
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+                connection = sqlite3.connect(db_path)
+                try:
+                    raw = connection.execute(
+                        "SELECT settings_config FROM providers "
+                        "WHERE id='provider-fixture' AND app_type='claude'"
+                    ).fetchone()[0]
+                    concurrent = json.loads(raw)
+                    concurrent["unknown"]["newer"] = True
+                    concurrent_raw = json.dumps(concurrent)
+                    connection.execute(
+                        "UPDATE providers SET settings_config=? "
+                        "WHERE id='provider-fixture' AND app_type='claude'",
+                        (concurrent_raw,),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with self.assertRaisesRegex(
+                    launcher.ModelConflictError,
+                    "其他进程修改",
+                ):
+                    launcher.save_provider_model(
+                        snapshot,
+                        "ANTHROPIC_MODEL",
+                        "must-not-win",
+                    )
+
+            connection = sqlite3.connect(db_path)
+            try:
+                final_raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(final_raw, concurrent_raw)
+
+    def test_invalid_values_and_corrupt_provider_json_fail_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            db_path, _original = self._seed_provider(env)
+            with loaded_launcher(env) as launcher:
+                snapshot = launcher.load_provider_model_snapshot("Fixture Provider")
+                invalid_values = [
+                    "",
+                    " leading",
+                    "trailing ",
+                    "line\nbreak",
+                    "x" * (launcher.MODEL_VALUE_MAX_LENGTH + 1),
+                ]
+                for invalid in invalid_values:
+                    with self.assertRaises(launcher.ModelValidationError):
+                        launcher.save_provider_model(
+                            snapshot,
+                            "ANTHROPIC_MODEL",
+                            invalid,
+                        )
+
+                connection = sqlite3.connect(db_path)
+                try:
+                    connection.execute(
+                        "UPDATE providers SET settings_config='not-json' "
+                        "WHERE id='provider-fixture' AND app_type='claude'"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(
+                    launcher.ModelEditorError,
+                    "JSON 损坏",
+                ):
+                    launcher.load_provider_model_snapshot("Fixture Provider")
+
+    def test_insert_ctrl_c_cancels_without_saving_or_creating_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="1")
+            db_path, original = self._seed_provider(env)
+            window = ScriptedWindow(
+                [
+                    curses.KEY_RIGHT,
+                    ord("i"),
+                    21,
+                    *map(ord, "cancelled-model"),
+                    3,
+                    curses.KEY_LEFT,
+                    ord("q"),
+                ],
+                size=(10, 32),
+            )
+            cfg = {"providers": {"Fixture Provider": {"hidden": False}}}
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    launcher._launcher_main(
+                        window,
+                        cfg,
+                        {"Fixture Provider"},
+                    )
+            connection = sqlite3.connect(db_path)
+            try:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers "
+                    "WHERE id='provider-fixture' AND app_type='claude'"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(json.loads(raw), original)
+            self.assertFalse(Path(env["CLAUDE1_MODEL_BACKUP_DIR"]).exists())
 
 
 HUB_FIXTURE = {

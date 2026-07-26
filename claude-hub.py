@@ -43,6 +43,12 @@ from claude1_protocol import (
     transform_request,
     transform_response,
 )
+from claude1_provider import (
+    CapabilityProfile,
+    ProviderPolicyError,
+    capability_summary,
+    resolve_capability_profile,
+)
 
 
 SERVICE_NAME = "claude-hub"
@@ -314,6 +320,33 @@ def validate_config(raw: object) -> dict:
                     "openai_chat, or openai_responses"
                 )
             channel["api_format"] = api_format
+        capabilities = channel_raw.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, dict):
+                raise ConfigError(
+                    f"channels.{alias}.capabilities must be an object"
+                )
+            if (
+                isinstance(api_format, str)
+                and isinstance(capabilities.get("protocol"), str)
+                and capabilities["protocol"] != api_format
+            ):
+                raise ConfigError(
+                    f"channels.{alias}.api_format conflicts with "
+                    "capabilities.protocol"
+                )
+            try:
+                # Normalize once for validation.  Provider-derived values are
+                # merged later when the channel is resolved.
+                resolve_capability_profile(
+                    override=capabilities,
+                    protocol_override=api_format,
+                )
+            except ProviderPolicyError as exc:
+                raise ConfigError(
+                    f"channels.{alias}.{exc}"
+                ) from exc
+            channel["capabilities"] = json.loads(json.dumps(capabilities))
         if "proxy" in channel_raw:
             proxy = channel_raw["proxy"]
             if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
@@ -426,16 +459,29 @@ def _read_provider_rows(path: Path) -> dict:
             )
             if not base:
                 continue
-            token = (
-                env.get("ANTHROPIC_AUTH_TOKEN")
-                or env.get("ANTHROPIC_API_KEY")
-                or ""
+            auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
+            api_key = env.get("ANTHROPIC_API_KEY")
+            credential_ambiguous = (
+                isinstance(auth_token, str)
+                and auth_token.strip()
+                and isinstance(api_key, str)
+                and api_key.strip()
+                and auth_token != api_key
             )
+            token = auth_token or api_key or ""
             if not isinstance(token, str):
                 token = ""
             rows[name] = {
                 "base_url": base,
                 "token": token,
+                "credential_source": (
+                    "ANTHROPIC_AUTH_TOKEN"
+                    if isinstance(auth_token, str) and auth_token.strip()
+                    else "ANTHROPIC_API_KEY"
+                    if isinstance(api_key, str) and api_key.strip()
+                    else "missing"
+                ),
+                "credential_ambiguous": bool(credential_ambiguous),
                 "api_format": provider_api_format(
                     meta=meta,
                     settings=settings,
@@ -444,6 +490,13 @@ def _read_provider_rows(path: Path) -> dict:
                 "provider_type": (
                     values.get("provider_type") or meta.get("providerType")
                 ),
+                "capability_profile": resolve_capability_profile(
+                    meta=meta,
+                    settings=settings,
+                    provider_type=values.get("provider_type"),
+                ),
+                "_capability_meta": meta,
+                "_capability_settings": settings,
                 "is_full_url": is_full_url,
                 "model_map": {
                     tier: (
@@ -549,7 +602,7 @@ def get_providers() -> dict:
         # Recheck because a writer can create WAL sidecars while the read is open.
         _require_private_database(path)
         return providers
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, ProviderPolicyError) as exc:
         raise ProviderDatabaseError(
             "provider database could not be read"
         ) from exc
@@ -617,16 +670,16 @@ def route(
         alias, upstream_model = alias.strip().lower(), upstream_model.strip()
         if alias not in cfg["channels"]:
             raise RouteError(
-                400, f"unknown channel alias '{alias}'; known: {sorted(cfg['channels'])}"
+                400, "unknown channel alias"
             )
         if not upstream_model:
-            raise RouteError(400, f"empty model after channel alias '{alias}'")
+            raise RouteError(400, "empty model after channel alias")
         return alias, upstream_model
 
     alias = cfg["default_channel"]
     channel = cfg["channels"].get(alias)
     if not channel:
-        raise RouteError(500, f"default_channel '{alias}' not in channels config")
+        raise RouteError(500, "default channel is not present in config")
     if providers is None:
         providers = get_providers()
     provider = providers.get(channel["provider"])
@@ -657,7 +710,7 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
         parsed = urlparse(base_url)
         parsed_port = parsed.port
     except ValueError as exc:
-        raise RouteError(502, f"channel '{alias}' has an invalid upstream URL") from exc
+        raise RouteError(502, "selected channel has an invalid upstream URL") from exc
     if (
         not parsed.hostname
         or parsed_port is not None
@@ -667,7 +720,7 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
         or parsed.query
         or parsed.fragment
     ):
-        raise RouteError(502, f"channel '{alias}' has an invalid upstream URL")
+        raise RouteError(502, "selected channel has an invalid upstream URL")
     if parsed.scheme == "https":
         return
     if parsed.scheme == "http" and (
@@ -677,10 +730,10 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
     if parsed.scheme == "http":
         raise RouteError(
             502,
-            f"channel '{alias}' uses remote HTTP; set allow_insecure_http=true "
-            "for this channel only if it is intentional",
+            "selected channel uses remote HTTP; set allow_insecure_http=true "
+            "only if it is intentional",
         )
-    raise RouteError(502, f"channel '{alias}' upstream must use http or https")
+    raise RouteError(502, "selected channel upstream must use http or https")
 
 
 def resolve_provider(
@@ -690,20 +743,25 @@ def resolve_provider(
 ) -> dict:
     channel = cfg["channels"].get(alias)
     if not channel:
-        raise RouteError(400, f"unknown channel alias '{alias}'")
+        raise RouteError(400, "unknown channel alias")
     if providers is None:
         providers = get_providers()
     provider = providers.get(channel["provider"])
     if not provider:
         raise RouteError(
             502,
-            f"channel '{alias}' provider was not found in the CC Switch database "
+            "selected channel provider was not found in the CC Switch database "
             f"(check {config_path().name})",
         )
     if not provider.get("token"):
         raise RouteError(
             502,
-            f"channel '{alias}' provider has no Anthropic credential",
+            "selected channel provider has no explicit credential",
+        )
+    if provider.get("credential_ambiguous"):
+        raise RouteError(
+            502,
+            "selected channel provider has ambiguous credential sources",
         )
     validate_upstream_url(
         provider["base_url"],
@@ -711,8 +769,21 @@ def resolve_provider(
         channel.get("allow_insecure_http", False),
     )
     resolved = dict(provider)
-    if channel.get("api_format"):
-        resolved["api_format"] = channel["api_format"]
+    try:
+        profile = resolve_capability_profile(
+            meta=provider.get("_capability_meta"),
+            settings=provider.get("_capability_settings"),
+            provider_type=provider.get("provider_type"),
+            override=channel.get("capabilities"),
+            protocol_override=channel.get("api_format"),
+        )
+    except ProviderPolicyError as exc:
+        raise RouteError(
+            502,
+            "selected channel has an invalid capability profile",
+        ) from exc
+    resolved["capability_profile"] = profile
+    resolved["api_format"] = str(profile.get("protocol"))
     return resolved
 
 
@@ -804,6 +875,183 @@ def ensure_1m_beta(headers, model_out: str) -> None:
             if key.casefold() == "anthropic-beta":
                 headers.pop(key, None)
     headers["anthropic-beta"] = ",".join(unique_values)
+
+
+def apply_beta_policy(
+    headers,
+    profile: CapabilityProfile,
+    model_out: str,
+) -> None:
+    """Apply one Provider's beta policy without leaking another route's result."""
+    values = [
+        part.strip()
+        for value in _header_values(headers, "anthropic-beta")
+        for part in value.split(",")
+        if part.strip()
+    ]
+    policy = profile.get("beta_policy")
+    context_window = profile.get("context_window")
+    has_1m = (
+        "[1m]" in model_out.casefold()
+        and isinstance(context_window, int)
+        and context_window >= 1_000_000
+    )
+    if policy == "passthrough":
+        if has_1m:
+            ensure_1m_beta(headers, model_out)
+        return
+    if policy == "filtered":
+        allowed = {item.casefold() for item in profile.beta_allowlist}
+        values = [item for item in values if item.casefold() in allowed]
+    elif policy == "mapped":
+        mapping = {key.casefold(): value for key, value in profile.beta_map}
+        values = [
+            mapping[item.casefold()]
+            for item in values
+            if item.casefold() in mapping
+        ]
+
+    if hasattr(headers, "popall"):
+        headers.popall("anthropic-beta", None)
+    else:
+        for key in list(headers):
+            if key.casefold() == "anthropic-beta":
+                headers.pop(key, None)
+    if values:
+        headers["anthropic-beta"] = ",".join(dict.fromkeys(values))
+
+    if has_1m:
+        ensure_1m_beta(headers, model_out)
+
+
+def _contains_tool_search(value: object) -> bool:
+    if isinstance(value, list):
+        return any(_contains_tool_search(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("type")
+    if isinstance(kind, str) and (
+        kind.casefold().startswith("tool_search")
+        or kind.casefold() == "tool_reference"
+    ):
+        return True
+    name = value.get("name")
+    if isinstance(name, str) and name.casefold() == "toolsearch":
+        return True
+    return any(_contains_tool_search(item) for item in value.values())
+
+
+def _remove_cache_controls(value: object) -> bool:
+    removed = False
+    if isinstance(value, list):
+        for item in value:
+            removed |= _remove_cache_controls(item)
+    elif isinstance(value, dict):
+        if "cache_control" in value:
+            value.pop("cache_control", None)
+            removed = True
+        for item in value.values():
+            removed |= _remove_cache_controls(item)
+    return removed
+
+
+def _remove_reasoning_history(value: object) -> bool:
+    removed = False
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            if (
+                isinstance(item, dict)
+                and item.get("type") in {"thinking", "redacted_thinking"}
+            ):
+                removed = True
+                continue
+            removed |= _remove_reasoning_history(item)
+            kept.append(item)
+        if removed:
+            value[:] = kept
+    elif isinstance(value, dict):
+        for item in value.values():
+            removed |= _remove_reasoning_history(item)
+    return removed
+
+
+def apply_request_capabilities(
+    payload: dict,
+    profile: CapabilityProfile,
+) -> list[str]:
+    """Apply safe request degradation and return non-sensitive reason codes."""
+    tools = payload.get("tools")
+    if (
+        profile.get("protocol") != "anthropic"
+        and isinstance(tools, list)
+        and any(
+            isinstance(tool, dict) and tool.get("type") == "BatchTool"
+            for tool in tools
+        )
+    ):
+        raise RouteError(
+            400,
+            "the selected protocol bridge does not support this "
+            "server-side tool schema",
+        )
+    if (
+        profile.get("tool_search") != "supported"
+        and _contains_tool_search(payload)
+    ):
+        raise RouteError(
+            400,
+            "tool search is disabled for this channel capability profile",
+        )
+
+    degraded: list[str] = []
+    if profile.get("thinking") != "supported" and "thinking" in payload:
+        payload.pop("thinking", None)
+        degraded.append("thinking-disabled")
+    if (
+        profile.get("reasoning_round_trip") != "supported"
+        and _remove_reasoning_history(payload.get("messages"))
+    ):
+        degraded.append("reasoning-history-disabled")
+    if (
+        profile.get("prompt_cache") != "supported"
+        and _remove_cache_controls(payload)
+    ):
+        degraded.append("prompt-cache-disabled")
+    return degraded
+
+
+def apply_model_capabilities(
+    model: str,
+    profile: CapabilityProfile,
+) -> str:
+    if not model.casefold().endswith("[1m]"):
+        return model
+    context_window = profile.get("context_window")
+    if not isinstance(context_window, int) or context_window < 1_000_000:
+        raise RouteError(
+            400,
+            "the selected channel does not declare a verified 1M context window",
+        )
+    # Claude Code normally strips this marker.  Hub also strips it so opaque
+    # third-party model IDs never receive a Claude-specific suffix.
+    return model[:-4]
+
+
+def capability_response_headers(
+    profile: CapabilityProfile,
+    degraded: list[str] | None = None,
+) -> dict[str, str]:
+    context = profile.get("context_window")
+    headers = {
+        "x-hub-context-window": (
+            str(context) if isinstance(context, int) else "unknown"
+        ),
+        "x-hub-context-source": profile.source("context_window"),
+    }
+    if degraded:
+        headers["x-hub-capability-degraded"] = ",".join(sorted(set(degraded)))
+    return headers
 
 
 def upstream_headers(request: web.Request, token: str) -> CIMultiDict:
@@ -1085,17 +1333,27 @@ async def _handle_transformed_messages(
     model_out: str,
     is_count: bool,
     started: float,
+    degraded: list[str],
 ) -> web.StreamResponse:
     api_format = provider["api_format"]
+    profile = provider["capability_profile"]
     if is_count:
+        if profile.get("count_tokens") == "unsupported":
+            return anthropic_error(
+                501,
+                "count_tokens is unsupported for this channel",
+                "not_found_error",
+            )
         estimate = _estimated_input_tokens(payload)
         log(
-            f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"{api_format} locally estimated {estimate} tokens"
+            f"{request.path} {api_format} locally estimated input tokens"
         )
         return web.json_response(
             {"input_tokens": estimate},
-            headers={"x-hub-estimated": "1"},
+            headers={
+                "x-hub-estimated": "1",
+                **capability_response_headers(profile, degraded),
+            },
         )
 
     endpoint, upstream_payload = transform_request(
@@ -1149,8 +1407,8 @@ async def _handle_transformed_messages(
                 if upstream.status >= 400:
                     body = transform_error(decoded, upstream.status)
                     log(
-                        f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                        f"{api_format} upstream {upstream.status}"
+                        f"{request.path} {api_format} upstream "
+                        f"{upstream.status}"
                     )
                     return web.json_response(body, status=upstream.status)
                 if not isinstance(decoded, dict):
@@ -1159,8 +1417,7 @@ async def _handle_transformed_messages(
                     )
                 body = transform_response(decoded, api_format)
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"{api_format} {upstream.status} json "
+                    f"{request.path} {api_format} {upstream.status} json "
                     f"{time.monotonic() - started:.1f}s {len(raw)}B"
                 )
                 return web.json_response(
@@ -1170,6 +1427,7 @@ async def _handle_transformed_messages(
                         "x-hub-channel": alias,
                         "x-hub-model": model_out,
                         "x-hub-upstream-format": api_format,
+                        **capability_response_headers(profile, degraded),
                     },
                 )
 
@@ -1189,6 +1447,7 @@ async def _handle_transformed_messages(
                     "x-hub-channel": alias,
                     "x-hub-model": model_out,
                     "x-hub-upstream-format": api_format,
+                    **capability_response_headers(profile, degraded),
                 },
             )
             await response.prepare(request)
@@ -1216,8 +1475,8 @@ async def _handle_transformed_messages(
                 zlib.error,
             ) as exc:
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"{api_format} stream failed after {byte_count}B: "
+                    f"{request.path} {api_format} stream failed after "
+                    f"{byte_count}B: "
                     f"{type(exc).__name__}"
                 )
                 transport = request.transport
@@ -1227,8 +1486,8 @@ async def _handle_transformed_messages(
                     "translated upstream stream ended after response started"
                 ) from exc
             log(
-                f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                f"{api_format} 200 stream {time.monotonic() - started:.1f}s "
+                f"{request.path} {api_format} 200 stream "
+                f"{time.monotonic() - started:.1f}s "
                 f"{byte_count}B"
             )
             return response
@@ -1236,22 +1495,22 @@ async def _handle_transformed_messages(
         raise
     except ProtocolTransformError as exc:
         log(
-            f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"{api_format} TRANSFORM FAIL: {exc}"
+            f"{request.path} {api_format} TRANSFORM FAIL: "
+            f"{type(exc).__name__}"
         )
         return anthropic_error(
             502,
-            f"hub: channel '{alias}' returned an incompatible {api_format} response",
+            f"hub: selected channel returned an incompatible {api_format} response",
             "api_error",
         )
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         log(
-            f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"{api_format} CONNECT FAIL: {type(exc).__name__}"
+            f"{request.path} {api_format} CONNECT FAIL: "
+            f"{type(exc).__name__}"
         )
         return anthropic_error(
             502,
-            f"hub: cannot reach channel '{alias}'",
+            "hub: cannot reach selected channel",
             "api_error",
         )
 
@@ -1306,15 +1565,26 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         providers = await asyncio.to_thread(get_providers)
         alias, model_out = route(model_in, cfg, providers)
         provider = resolve_provider(alias, cfg, providers)
+        profile = provider["capability_profile"]
+        model_with_context_marker = model_out
+        model_lookup = (
+            model_out[:-4]
+            if model_out.casefold().endswith("[1m]")
+            else model_out
+        )
+        profile = profile.for_model(model_lookup)
+        provider["capability_profile"] = profile
+        model_out = apply_model_capabilities(model_out, profile)
+        payload["model"] = model_out
+        degraded = apply_request_capabilities(payload, profile)
     except RouteError as exc:
-        log(f"{request.path} '{model_in}' -> ROUTE ERROR {exc.status}: {exc.message}")
+        log(f"{request.path} ROUTE ERROR {exc.status}")
         return anthropic_error(
             exc.status,
             exc.message,
             "api_error" if exc.status >= 500 else "invalid_request_error",
         )
 
-    payload["model"] = model_out
     if provider.get("api_format", "anthropic") != "anthropic":
         return await _handle_transformed_messages(
             request,
@@ -1326,6 +1596,23 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             model_out=model_out,
             is_count=is_count,
             started=started,
+            degraded=degraded,
+        )
+    count_mode = profile.get("count_tokens")
+    if is_count and count_mode == "unsupported":
+        return anthropic_error(
+            501,
+            "count_tokens is unsupported for this channel",
+            "not_found_error",
+        )
+    if is_count and count_mode == "estimated":
+        estimate = _estimated_input_tokens(payload)
+        return web.json_response(
+            {"input_tokens": estimate},
+            headers={
+                "x-hub-estimated": "1",
+                **capability_response_headers(profile, degraded),
+            },
         )
     try:
         data = json.dumps(
@@ -1339,7 +1626,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     path_and_query = request.path_qs
     url = provider["base_url"] + path_and_query
     headers = upstream_headers(request, provider["token"])
-    ensure_1m_beta(headers, model_out)
+    apply_beta_policy(headers, profile, model_with_context_marker)
     proxy = channel_proxy(alias, cfg)
     session = request.app.get(UPSTREAM_SESSION_KEY)
     if session is None:
@@ -1356,29 +1643,6 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             proxy=proxy,
             allow_redirects=False,
         ) as upstream:
-            if is_count and upstream.status in (404, 405, 501):
-                estimate = max(
-                    1,
-                    len(
-                        json.dumps(
-                            {
-                                "m": payload.get("messages"),
-                                "s": payload.get("system"),
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
-                    // 4,
-                )
-                log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"upstream {upstream.status}, estimated {estimate} tokens"
-                )
-                return web.json_response(
-                    {"input_tokens": estimate},
-                    headers={"x-hub-estimated": "1"},
-                )
-
             response_connection_tokens = _connection_header_tokens(
                 upstream.headers
             )
@@ -1389,12 +1653,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 or response_connection_tokens & REPRESENTATION_HEADERS
             ):
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    "upstream returned ambiguous representation headers"
+                    f"{request.path} upstream returned ambiguous "
+                    "representation headers"
                 )
                 return anthropic_error(
                     502,
-                    f"hub: channel '{alias}' returned invalid response headers",
+                    "hub: selected channel returned invalid response headers",
                     "api_error",
                 )
             content_type = content_types[0] if content_types else ""
@@ -1403,6 +1667,17 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 and content_type.split(";", 1)[0].strip().casefold()
                 == "text/event-stream"
             )
+            if upstream.status >= 400:
+                # Consume and discard the bounded upstream error body.  It may
+                # echo private URLs, credentials or Provider account details.
+                await _read_upstream_body(upstream)
+                sanitized = transform_error({}, upstream.status)
+                log(f"{request.path} upstream {upstream.status}")
+                return web.json_response(
+                    sanitized,
+                    status=upstream.status,
+                    headers=capability_response_headers(profile, degraded),
+                )
             try:
                 sse_decoder = (
                     _SSEContentDecoder.from_headers(upstream.headers)
@@ -1411,16 +1686,19 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 )
             except ValueError:
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    "upstream SSE used an unsupported content encoding"
+                    f"{request.path} upstream SSE used an unsupported "
+                    "content encoding"
                 )
                 return anthropic_error(
                     502,
-                    f"hub: channel '{alias}' returned an unsupported SSE encoding",
+                    "hub: selected channel returned an unsupported SSE encoding",
                     "api_error",
                 )
 
             response = web.StreamResponse(status=upstream.status)
+            response.headers.update(
+                capability_response_headers(profile, degraded)
+            )
             response_strip = RESP_STRIP | response_connection_tokens
             for key, value in upstream.headers.items():
                 if key.casefold() not in response_strip:
@@ -1451,8 +1729,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 zlib.error,
             ) as exc:
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"upstream broke or was invalid after {byte_count}B: "
+                    f"{request.path} upstream broke or was invalid after "
+                    f"{byte_count}B: "
                     f"{type(exc).__name__}"
                 )
                 transport = request.transport
@@ -1464,8 +1742,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             if sse_tracker is not None and not sse_tracker.complete:
                 log(
-                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"upstream SSE ended without a valid terminal event after "
+                    f"{request.path} upstream SSE ended without a valid "
+                    f"terminal event after "
                     f"{byte_count}B"
                 )
                 transport = request.transport
@@ -1477,19 +1755,18 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             await response.write_eof()
             log(
-                f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                f"{upstream.status} {'stream' if streamed else 'json'} "
+                f"{request.path} {upstream.status} "
+                f"{'stream' if streamed else 'json'} "
                 f"{time.monotonic() - started:.1f}s {byte_count}B"
             )
             return response
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         log(
-            f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"CONNECT FAIL: {type(exc).__name__}"
+            f"{request.path} CONNECT FAIL: {type(exc).__name__}"
         )
         return anthropic_error(
             502,
-            f"hub: cannot reach channel '{alias}'",
+            "hub: cannot reach selected channel",
             "api_error",
         )
 
@@ -1615,8 +1892,7 @@ async def run_server(fg: bool) -> None:
 
         log(
             f"claude-hub listening on 127.0.0.1:{cfg['port']} "
-            f"(channels: {', '.join(cfg['channels'])}; "
-            f"default: {cfg['default_channel']})"
+            f"({len(cfg['channels'])} configured channels)"
         )
         while True:
             await asyncio.sleep(3600)
@@ -1726,7 +2002,8 @@ def cli_doctor() -> int:
             report("OK", "provider database opens read-only")
 
     if cfg is not None and providers is not None:
-        for alias, channel in cfg["channels"].items():
+        for index, (alias, channel) in enumerate(cfg["channels"].items(), 1):
+            channel_label = f"channel #{index}"
             problems = []
             models = channel.get("models", [])
             if not models:
@@ -1737,6 +2014,8 @@ def cli_doctor() -> int:
             else:
                 if not provider.get("token"):
                     problems.append("credential missing")
+                if provider.get("credential_ambiguous"):
+                    problems.append("credential sources ambiguous")
                 try:
                     validate_upstream_url(
                         provider.get("base_url", ""),
@@ -1746,9 +2025,22 @@ def cli_doctor() -> int:
                 except RouteError:
                     problems.append("upstream policy invalid")
             if problems:
-                report("FAIL", f"channel '{alias}': {', '.join(problems)}")
+                report("FAIL", f"{channel_label}: {', '.join(problems)}")
             else:
-                report("OK", f"channel '{alias}' ready ({len(models)} models)")
+                try:
+                    resolved = resolve_provider(alias, cfg, providers)
+                    profile = resolved["capability_profile"]
+                except (RouteError, ProviderPolicyError):
+                    report("FAIL", f"{channel_label}: capability profile invalid")
+                    continue
+                report("OK", f"{channel_label} ready ({len(models)} models)")
+                report(
+                    "INFO",
+                    f"{channel_label} credential_source="
+                    f"{resolved.get('credential_source', 'missing')}",
+                )
+                for line in capability_summary(profile):
+                    report("INFO", f"{channel_label} capabilities: {line}")
 
     print(
         "\nResult: "
@@ -1776,6 +2068,16 @@ async def cli_check(target: str | None) -> None:
             if channel.get("models")
             else "claude-sonnet-4"
         )
+        profile = provider["capability_profile"]
+        model_with_context_marker = model
+        model_lookup = (
+            model[:-4] if model.casefold().endswith("[1m]") else model
+        )
+        profile = profile.for_model(model_lookup)
+        try:
+            model = apply_model_capabilities(model, profile)
+        except RouteError as exc:
+            return alias, f"✗ {exc.message}"
         headers = {
             "authorization": f"Bearer {provider['token']}",
             "x-api-key": provider["token"],
@@ -1784,37 +2086,54 @@ async def cli_check(target: str | None) -> None:
             "x-app": "cli",
             "anthropic-beta": "claude-code-20250219",
         }
-        ensure_1m_beta(headers, model)
+        apply_beta_policy(headers, profile, model_with_context_marker)
+        test_payload = {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        api_format = str(profile.get("protocol"))
+        if api_format == "anthropic":
+            upstream_url = provider["base_url"] + "/v1/messages"
+            upstream_payload = test_payload
+            upstream_headers_value = headers
+        else:
+            endpoint, upstream_payload = transform_request(
+                test_payload,
+                api_format,
+                provider_type=provider.get("provider_type"),
+            )
+            upstream_url = (
+                provider["base_url"]
+                if provider.get("is_full_url")
+                else provider["base_url"] + endpoint
+            )
+            upstream_headers_value = _transformed_headers(
+                provider["token"],
+                False,
+            )
         started = time.monotonic()
         try:
             async with session.post(
-                provider["base_url"] + "/v1/messages",
-                json={
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "hi"}],
-                },
-                headers=headers,
+                upstream_url,
+                json=upstream_payload,
+                headers=upstream_headers_value,
                 proxy=channel_proxy(alias, cfg),
                 timeout=aiohttp.ClientTimeout(total=30),
                 allow_redirects=False,
             ) as response:
                 duration = time.monotonic() - started
                 if response.status == 200:
-                    return alias, f"✓ 200 {duration:.1f}s ({model})"
-                body = (await response.text())[:120].replace("\n", " ")
-                return (
-                    alias,
-                    f"✗ {response.status} {duration:.1f}s ({model}) {body}",
-                )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            return alias, f"✗ {type(exc).__name__}: {exc}"
+                    return alias, f"✓ 200 {duration:.1f}s"
+                await response.read()
+                return alias, f"✗ {response.status} {duration:.1f}s"
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            return alias, f"✗ {type(error).__name__}"
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*(one(session, alias) for alias in aliases))
-    width = max(len(alias) for alias in aliases)
-    for alias, message in results:
-        print(f"  {alias:<{width}}  {message}")
+    for index, (_alias, message) in enumerate(results, 1):
+        print(f"  channel #{index:<2}  {message}")
 
 
 def cli_logs(args: list[str]) -> None:
