@@ -1,16 +1,20 @@
-"""Immutable, presentation-safe values shared by every application surface.
+"""Immutable domain values shared by every application surface.
 
-The DTOs in this module deliberately have no credential, URL, header, raw
-configuration, database-path, or exception fields.  Arbitrary public
-identifiers are also validated before they can enter a DTO, and ``repr`` never
-includes provider or model values.
+Presentation DTOs deliberately have no credential, URL, header, raw
+configuration, database-path, or exception fields.  Standalone profile
+metadata is an internal persistence value: it may contain a normalized base
+URL and an opaque secret reference, but never credential material, and its
+``repr`` redacts all routing metadata.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
 from enum import Enum
+from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 
 class RuntimeMode(str, Enum):
@@ -46,6 +50,14 @@ class StoreCapability(str, Enum):
         return self is StoreCapability.COMPATIBLE
 
 
+class ProtocolAdapter(str, Enum):
+    """Wire-protocol adapter selected by a standalone profile."""
+
+    ANTHROPIC = "anthropic"
+    OPENAI_CHAT = "openai_chat"
+    OPENAI_RESPONSES = "openai_responses"
+
+
 _SENSITIVE_TEXT_RE = re.compile(
     r"(?i)(?:api[-_]?key|access[-_]?token|auth[-_]?token|bearer|credential|"
     r"password|passwd|private[-_]?key|secret|session[-_]?token|"
@@ -55,6 +67,10 @@ _SECRET_VALUE_RE = re.compile(r"(?i)^(?:sk-|key-|token-)")
 _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ABSOLUTE_PATH_RE = re.compile(r"(?:[/\\]|[A-Za-z]:[/\\])")
+_MAX_BASE_URL_LENGTH = 2048
+_MAX_PROFILE_NAME_LENGTH = 200
+_MAX_PURPOSE_TAGS = 32
+_MAX_PURPOSE_TAG_LENGTH = 64
 
 
 def _require_public_identifier(value: object, *, field_name: str) -> str:
@@ -90,6 +106,142 @@ def _require_local_display_name(value: object) -> str:
     if _CONTROL_CHARACTER_RE.search(value):
         raise ValueError("display_name contains a control character")
     return value
+
+
+def _trim_profile_name(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("profile name must be a string")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_PROFILE_NAME_LENGTH
+        or _CONTROL_CHARACTER_RE.search(normalized)
+    ):
+        raise ValueError("profile name is invalid")
+    return normalized
+
+
+def normalize_base_url(value: object) -> str:
+    """Return a stable HTTP(S) base URL without disclosing it in failures."""
+
+    if not isinstance(value, str):
+        raise TypeError("base URL must be a string")
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > _MAX_BASE_URL_LENGTH
+        or _CONTROL_CHARACTER_RE.search(candidate)
+        or any(character.isspace() for character in candidate)
+    ):
+        raise ValueError("base URL is invalid")
+    try:
+        parsed = urlsplit(candidate)
+        scheme = parsed.scheme.casefold()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        raise ValueError("base URL is invalid") from None
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("base URL is invalid")
+    try:
+        normalized_host = hostname.encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        raise ValueError("base URL is invalid") from None
+    if not normalized_host:
+        raise ValueError("base URL is invalid")
+
+    host_for_netloc = (
+        f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    )
+    default_port = 80 if scheme == "http" else 443
+    netloc = (
+        host_for_netloc
+        if port is None or port == default_port
+        else f"{host_for_netloc}:{port}"
+    )
+    normalized_path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, normalized_path, "", ""))
+
+
+def _normalize_profile_id(value: object) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("profile ID must be a UUID")
+    try:
+        return UUID(value)
+    except (AttributeError, ValueError):
+        raise ValueError("profile ID must be a UUID") from None
+
+
+def _normalize_adapter(value: object) -> ProtocolAdapter:
+    if isinstance(value, ProtocolAdapter):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("adapter must be a ProtocolAdapter")
+    try:
+        return ProtocolAdapter(value)
+    except ValueError:
+        raise ValueError("adapter is unsupported") from None
+
+
+def _normalize_secret_reference(value: object) -> UUID:
+    if isinstance(value, UUID):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("secret reference must be a UUID")
+    try:
+        return UUID(value)
+    except (AttributeError, ValueError):
+        raise ValueError("secret reference must be a UUID") from None
+
+
+def _normalize_timestamp(value: object, *, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{field_name} must be a datetime")
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError):
+        raise ValueError(f"{field_name} must be timezone-aware") from None
+    if offset is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _normalize_purpose_tags(value: object) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)):
+        raise TypeError("purpose_tags must be an iterable of strings")
+    try:
+        raw_tags = tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        raise TypeError("purpose_tags must be an iterable of strings") from None
+    if len(raw_tags) > _MAX_PURPOSE_TAGS:
+        raise ValueError("purpose_tags contains too many values")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        if not isinstance(raw_tag, str):
+            raise TypeError("purpose_tags must contain only strings")
+        tag = raw_tag.strip()
+        if (
+            not tag
+            or len(tag) > _MAX_PURPOSE_TAG_LENGTH
+            or _CONTROL_CHARACTER_RE.search(tag)
+        ):
+            raise ValueError("purpose_tags contains an invalid value")
+        if tag not in seen:
+            normalized.append(tag)
+            seen.add(tag)
+    return tuple(normalized)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -227,6 +379,77 @@ class ProviderInspection:
         return self.is_current
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class StandaloneProfile:
+    """Credential-free metadata for one standalone provider profile."""
+
+    profile_id: UUID
+    name: str
+    base_url: str
+    adapter: ProtocolAdapter
+    secret_ref: UUID
+    created_at: datetime
+    updated_at: datetime
+    models: ModelMapping = ModelMapping()
+    purpose_tags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "profile_id",
+            _normalize_profile_id(self.profile_id),
+        )
+        object.__setattr__(self, "name", _trim_profile_name(self.name))
+        object.__setattr__(
+            self,
+            "base_url",
+            normalize_base_url(self.base_url),
+        )
+        object.__setattr__(
+            self,
+            "adapter",
+            _normalize_adapter(self.adapter),
+        )
+        object.__setattr__(
+            self,
+            "secret_ref",
+            _normalize_secret_reference(self.secret_ref),
+        )
+        object.__setattr__(
+            self,
+            "created_at",
+            _normalize_timestamp(self.created_at, field_name="created_at"),
+        )
+        object.__setattr__(
+            self,
+            "updated_at",
+            _normalize_timestamp(self.updated_at, field_name="updated_at"),
+        )
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not precede created_at")
+        if not isinstance(self.models, ModelMapping):
+            raise TypeError("models must be a ModelMapping")
+        object.__setattr__(
+            self,
+            "purpose_tags",
+            _normalize_purpose_tags(self.purpose_tags),
+        )
+
+    @property
+    def protocol_adapter(self) -> ProtocolAdapter:
+        """Descriptive alias used by storage and launch adapters."""
+
+        return self.adapter
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(profile_id=<redacted>, "
+            f"adapter={self.adapter.value!r}, models={self.models!r}, "
+            f"purpose_tag_count={len(self.purpose_tags)}, "
+            "routing_metadata=<redacted>)"
+        )
+
+
 # Names kept explicit for callers that prefer the longer DTO terminology.
 ProviderReference = ProviderRef
 ProviderInspect = ProviderInspection
@@ -238,6 +461,9 @@ __all__ = [
     "ProviderInspection",
     "ProviderRef",
     "ProviderReference",
+    "ProtocolAdapter",
     "RuntimeMode",
+    "StandaloneProfile",
     "StoreCapability",
+    "normalize_base_url",
 ]
