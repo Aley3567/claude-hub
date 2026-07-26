@@ -931,7 +931,7 @@ class CompanionApplyBackupFailureTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     companion_apply,
-                    "_secure_create_file",
+                    "_secure_open_file",
                     side_effect=OSError(
                         f"private create failure {database} {PRIVATE_KEY}"
                     ),
@@ -2298,22 +2298,129 @@ class CompanionApplyDurabilityTests(unittest.TestCase):
         self.assertEqual(database_rows(database), before)
         self.assertEqual(tuple(backups.iterdir()), ())
 
+    def test_final_leaf_close_error_never_falls_back_to_stale_cleanup(
+        self,
+    ) -> None:
+        for close_mode in ("close-then-raise", "raise-without-close"):
+            with self.subTest(close_mode=close_mode):
+                (
+                    temporary,
+                    database,
+                    backups,
+                    plan,
+                    registry,
+                    handle,
+                ) = self._fixture()
+                self.addCleanup(temporary.cleanup)
+                before = database_rows(database)
+                real_close = (
+                    companion_apply._close_backup_leaf_descriptor
+                )
+                close_calls = 0
+                failed_descriptor: int | None = None
+                retained_leaf: pathlib.Path | None = None
+
+                def fail_final_leaf_close(descriptor: int) -> None:
+                    nonlocal close_calls
+                    nonlocal failed_descriptor
+                    nonlocal retained_leaf
+                    close_calls += 1
+                    if close_calls != 2:
+                        real_close(descriptor)
+                        return
+                    operation_directories = tuple(backups.iterdir())
+                    if len(operation_directories) != 1:
+                        raise AssertionError(
+                            "final backup workspace is missing"
+                        )
+                    retained_leaf = (
+                        operation_directories[0] / "cc-switch.db"
+                    )
+                    if close_mode == "close-then-raise":
+                        real_close(descriptor)
+                        retained_leaf.unlink()
+                        retained_leaf.write_bytes(b"replacement")
+                        retained_leaf.chmod(0o600)
+                    else:
+                        failed_descriptor = descriptor
+                    raise OSError(
+                        f"private final close {database} {PRIVATE_KEY}"
+                    )
+
+                try:
+                    with (
+                        mock.patch.object(
+                            companion_apply,
+                            "_close_backup_leaf_descriptor",
+                            side_effect=fail_final_leaf_close,
+                        ),
+                        self.assertRaises(
+                            CompanionApplyError
+                        ) as caught,
+                    ):
+                        service(database, backups).apply(
+                            plan=plan,
+                            approval_registry=registry,
+                            approval_handle=handle,
+                        )
+
+                    self.assertEqual(close_calls, 2)
+                    self.assertIs(
+                        caught.exception.status,
+                        CompanionApplyStatus.BACKUP_FAILED,
+                    )
+                    self.assertEqual(database_rows(database), before)
+                    if retained_leaf is None:
+                        raise AssertionError(
+                            "retained backup leaf was not observed"
+                        )
+                    self.assertTrue(retained_leaf.is_file())
+                    if close_mode == "close-then-raise":
+                        self.assertEqual(
+                            retained_leaf.read_bytes(),
+                            b"replacement",
+                        )
+                    else:
+                        if failed_descriptor is None:
+                            raise AssertionError(
+                                "failed descriptor was not captured"
+                            )
+                        os.fstat(failed_descriptor)
+                finally:
+                    if failed_descriptor is not None:
+                        real_close(failed_descriptor)
+
     def test_replaced_leaf_is_never_fsynced(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = pathlib.Path(raw_directory)
             backup = directory / "backup.db"
-            identity = companion_apply._secure_create_file(backup)
+            owner = companion_apply._secure_open_file(backup)
             backup.unlink()
             backup.write_bytes(b"replacement")
             backup.chmod(0o600)
+            replacement_identity = (
+                backup.stat().st_dev,
+                backup.stat().st_ino,
+            )
+            self.assertNotEqual(replacement_identity, owner.identity)
 
-            with (
-                mock.patch.object(companion_apply.os, "fsync") as fsync,
-                self.assertRaises(OSError),
-            ):
-                companion_apply._fsync_backup_leaf(backup, identity)
+            try:
+                with (
+                    mock.patch.object(companion_apply.os, "fsync") as fsync,
+                    self.assertRaises(OSError),
+                ):
+                    companion_apply._fsync_backup_leaf(
+                        backup,
+                        owner.identity,
+                        descriptor=owner.descriptor,
+                    )
 
-            fsync.assert_not_called()
+                fsync.assert_not_called()
+            finally:
+                companion_apply._cleanup_backup_leaf_owner(
+                    owner,
+                    backup,
+                )
             self.assertEqual(backup.read_bytes(), b"replacement")
 
     def test_unknown_operation_entry_is_not_fsynced_or_deleted(self) -> None:
@@ -2323,7 +2430,7 @@ class CompanionApplyDurabilityTests(unittest.TestCase):
             operation.mkdir(mode=0o700)
             operation.chmod(0o700)
             backup = operation / "cc-switch.db"
-            backup_identity = companion_apply._secure_create_file(backup)
+            backup_owner = companion_apply._secure_open_file(backup)
             unknown = operation / "unknown-user-file"
             unknown.write_text("preserve", encoding="utf-8")
             operation_stat = operation.stat()
@@ -2337,7 +2444,7 @@ class CompanionApplyDurabilityTests(unittest.TestCase):
                 ),
                 root_path=root,
                 root_identity=(root_stat.st_dev, root_stat.st_ino),
-                backup_identity=backup_identity,
+                backup_owner=backup_owner,
             )
 
             with (
@@ -2370,17 +2477,15 @@ class CompanionApplyHardeningTests(unittest.TestCase):
             operation.mkdir(mode=0o700)
             operation.chmod(0o700)
             backup = operation / "cc-switch.db"
-            backup.write_bytes(b"original")
-            backup.chmod(0o600)
+            backup_owner = companion_apply._secure_open_file(backup)
             directory_stat = operation.stat()
-            backup_stat = backup.stat()
             workspace = companion_apply._BackupWorkspace(
                 path=operation,
                 name=operation.name,
                 identity=(directory_stat.st_dev, directory_stat.st_ino),
                 root_path=root,
                 root_identity=(root.stat().st_dev, root.stat().st_ino),
-                backup_identity=(backup_stat.st_dev, backup_stat.st_ino),
+                backup_owner=backup_owner,
             )
             unknown = operation / "unknown-user-file"
             unknown.write_text("preserve", encoding="utf-8")
@@ -2398,6 +2503,45 @@ class CompanionApplyHardeningTests(unittest.TestCase):
             self.assertEqual(replacement.read_bytes(), b"replacement")
             self.assertEqual(unknown.read_text(encoding="utf-8"), "preserve")
 
+    def test_repeated_staging_cleanup_never_deletes_replacement(
+        self,
+    ) -> None:
+        staging = companion_apply._create_staging_workspace()
+        unknown = staging.directory / "unknown-user-file"
+        replacement = staging.database
+
+        def cleanup_fixture() -> None:
+            for candidate in (replacement, unknown):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    pass
+            try:
+                staging.directory.rmdir()
+            except FileNotFoundError:
+                pass
+
+        self.addCleanup(cleanup_fixture)
+        unknown.write_text("preserve", encoding="utf-8")
+        owner = staging.database_owner
+        if owner is None or owner.descriptor is None:
+            raise AssertionError("staging owner is missing")
+        descriptor = owner.descriptor
+
+        self.assertFalse(
+            companion_apply._cleanup_staging_workspace(staging)
+        )
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+
+        self.assertFalse(
+            companion_apply._cleanup_staging_workspace(staging)
+        )
+        self.assertEqual(replacement.read_bytes(), b"replacement")
+        self.assertEqual(unknown.read_text(encoding="utf-8"), "preserve")
+
     def test_cleanup_never_claims_injected_sqlite_sidecar_names(
         self,
     ) -> None:
@@ -2407,7 +2551,7 @@ class CompanionApplyHardeningTests(unittest.TestCase):
             operation.mkdir(mode=0o700)
             operation.chmod(0o700)
             backup = operation / "cc-switch.db"
-            backup_identity = companion_apply._secure_create_file(backup)
+            backup_owner = companion_apply._secure_open_file(backup)
             operation_stat = operation.stat()
             root_stat = root.stat()
             workspace = companion_apply._BackupWorkspace(
@@ -2419,7 +2563,7 @@ class CompanionApplyHardeningTests(unittest.TestCase):
                 ),
                 root_path=root,
                 root_identity=(root_stat.st_dev, root_stat.st_ino),
-                backup_identity=backup_identity,
+                backup_owner=backup_owner,
             )
             sidecars = tuple(
                 operation / f"cc-switch.db-{suffix}"
@@ -2691,7 +2835,11 @@ class CompanionApplyHardeningTests(unittest.TestCase):
                     with self.assertRaises(OSError):
                         companion_apply._secure_create_file(path)
 
-                self.assertFalse(path.exists())
+                if failed_step == "close":
+                    self.assertTrue(path.is_file())
+                    self.assertEqual(path.read_bytes(), b"")
+                else:
+                    self.assertFalse(path.exists())
 
     def test_non_posix_secure_file_does_not_require_fchmod_or_mode_bits(
         self,
@@ -2937,6 +3085,49 @@ class CompanionApplyHardeningTests(unittest.TestCase):
             self.assertTrue(
                 all(connection.close_observed for connection in opened)
             )
+
+    def test_repeated_success_does_not_leak_file_descriptors(self) -> None:
+        descriptor_directory = next(
+            (
+                candidate
+                for candidate in (
+                    pathlib.Path("/proc/self/fd"),
+                    pathlib.Path("/dev/fd"),
+                )
+                if candidate.is_dir()
+            ),
+            None,
+        )
+        if descriptor_directory is None:
+            self.skipTest("descriptor inspection is unavailable")
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = pathlib.Path(raw_directory)
+            before = frozenset(os.listdir(descriptor_directory))
+            for index in range(4):
+                operation = directory / f"operation-{index}"
+                operation.mkdir()
+                database = operation / "fixture.db"
+                backups = operation / "backups"
+                backups.mkdir()
+                write_schema(database)
+                plan = make_plan(database)
+                registry = ApprovalRegistry(clock=lambda: NOW)
+                handle = approve(registry, plan)
+
+                result = service(database, backups).apply(
+                    plan=plan,
+                    approval_registry=registry,
+                    approval_handle=handle,
+                )
+                self.assertIs(
+                    result.status,
+                    CompanionApplyStatus.APPLIED,
+                )
+
+            after = frozenset(os.listdir(descriptor_directory))
+
+        self.assertEqual(after, before)
 
     @unittest.skipUnless(
         os.name == "posix",

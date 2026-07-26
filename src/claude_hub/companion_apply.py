@@ -252,7 +252,14 @@ class _BackupArtifact:
     path: Path
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(slots=True, repr=False)
+class _BackupLeafOwner:
+    descriptor: int | None
+    identity: tuple[int, int]
+    linked: bool = True
+
+
+@dataclass(slots=True, repr=False)
 class _BackupWorkspace:
     path: Path
     name: str
@@ -261,21 +268,15 @@ class _BackupWorkspace:
     root_identity: tuple[int, int]
     root_fd: int | None = None
     directory_fd: int | None = None
-    backup_identity: tuple[int, int] | None = None
+    backup_owner: _BackupLeafOwner | None = None
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _OpenBackupLeaf:
-    descriptor: int
-    identity: tuple[int, int]
-
-
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(slots=True, repr=False)
 class _StagingWorkspace:
     directory: Path
     directory_identity: tuple[int, int]
     database: Path
-    database_identity: tuple[int, int]
+    database_owner: _BackupLeafOwner | None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -683,47 +684,136 @@ def _require_directory_metadata(
         raise OSError("backup directory is invalid")
 
 
-def _unlink_path_if_identity(
+def _close_backup_leaf_descriptor(descriptor: int) -> None:
+    os.close(descriptor)
+
+
+def _linked_backup_leaf_metadata(
     path: Path,
-    expected_identity: tuple[int, int] | None,
-) -> None:
-    if expected_identity is None:
-        return
+    *,
+    directory_fd: int | None,
+    name: str,
+) -> os.stat_result:
+    if directory_fd is not None:
+        return os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    return path.lstat()
+
+
+def _require_owned_backup_leaf_linked(
+    owner: _BackupLeafOwner | None,
+    path: Path,
+    *,
+    directory_fd: int | None = None,
+    name: str = _BACKUP_FILENAME,
+) -> _BackupLeafOwner:
+    if owner is None or owner.descriptor is None or not owner.linked:
+        raise OSError("backup file is invalid")
+    _require_backup_leaf_metadata(
+        os.fstat(owner.descriptor),
+        owner.identity,
+    )
+    linked = _linked_backup_leaf_metadata(
+        path,
+        directory_fd=directory_fd,
+        name=name,
+    )
+    _require_backup_leaf_metadata(linked, owner.identity)
+    return owner
+
+
+def _unlink_owned_backup_leaf(
+    owner: _BackupLeafOwner,
+    path: Path,
+    *,
+    directory_fd: int | None = None,
+    name: str = _BACKUP_FILENAME,
+) -> bool:
+    """Try one identity-bound unlink while the inode remains pinned."""
+
+    if not owner.linked:
+        return True
+    unlinked = False
     try:
-        metadata = path.lstat()
-        if (
-            stat.S_ISREG(metadata.st_mode)
-            and (metadata.st_dev, metadata.st_ino) == expected_identity
-        ):
+        if owner.descriptor is None:
+            return False
+        _require_backup_leaf_metadata(
+            os.fstat(owner.descriptor),
+            owner.identity,
+        )
+        linked = _linked_backup_leaf_metadata(
+            path,
+            directory_fd=directory_fd,
+            name=name,
+        )
+        _require_backup_leaf_metadata(linked, owner.identity)
+        if directory_fd is not None:
+            os.unlink(name, dir_fd=directory_fd)
+        else:
             path.unlink()
+        unlinked = True
     except BaseException:
         pass
+    finally:
+        # An unlink attempt consumes path ownership even when validation or
+        # unlink failed.  Once the pin is closed, an inode number can be
+        # reused, so no later cleanup may retry by stale identity.
+        owner.linked = False
+    return unlinked
+
+
+def _close_backup_leaf_owner(owner: _BackupLeafOwner) -> bool:
+    """Move out and close the owned descriptor exactly once."""
+
+    descriptor = owner.descriptor
+    owner.descriptor = None
+    if descriptor is None:
+        return True
+    try:
+        _close_backup_leaf_descriptor(descriptor)
+    except BaseException:
+        return False
+    return True
+
+
+def _cleanup_backup_leaf_owner(
+    owner: _BackupLeafOwner,
+    path: Path,
+    *,
+    directory_fd: int | None = None,
+    name: str = _BACKUP_FILENAME,
+) -> bool:
+    unlinked = _unlink_owned_backup_leaf(
+        owner,
+        path,
+        directory_fd=directory_fd,
+        name=name,
+    )
+    closed = _close_backup_leaf_owner(owner)
+    return unlinked and closed
+
+
+def _release_backup_leaf_owner(owner: _BackupLeafOwner) -> bool:
+    """Leave the linked backup in place and relinquish cleanup ownership."""
+
+    owner.linked = False
+    return _close_backup_leaf_owner(owner)
 
 
 def _secure_create_file(path: Path) -> tuple[int, int]:
-    """Create one private leaf and clean its exact inode on partial failure."""
+    """Create and validate one private leaf, then release its inode pin."""
 
     opened = _secure_open_file(path)
-    failed = False
-    try:
-        os.close(opened.descriptor)
-    except BaseException:
-        failed = True
-    if not failed:
-        try:
-            _require_backup_leaf_metadata(
-                path.lstat(),
-                opened.identity,
-            )
-        except BaseException:
-            failed = True
-    if failed:
-        _unlink_path_if_identity(path, opened.identity)
+    identity = opened.identity
+    if not _release_backup_leaf_owner(opened):
         raise OSError("backup file is invalid")
-    return opened.identity
+    return identity
 
 
-def _secure_open_file(path: Path) -> _OpenBackupLeaf:
+def _secure_open_file(path: Path) -> _BackupLeafOwner:
     """Create one private leaf while returning its still-open descriptor."""
 
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
@@ -731,18 +821,20 @@ def _secure_open_file(path: Path) -> _OpenBackupLeaf:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     identity: tuple[int, int] | None = None
+    owner: _BackupLeafOwner | None = None
     try:
         descriptor = os.open(path, flags, 0o600)
         if _strict_posix_permissions():
             os.fchmod(descriptor, 0o600)
         opened = os.fstat(descriptor)
         identity = (opened.st_dev, opened.st_ino)
-        _require_backup_leaf_metadata(opened, identity)
-        _require_backup_leaf_metadata(path.lstat(), identity)
-        return _OpenBackupLeaf(
+        owner = _BackupLeafOwner(
             descriptor=descriptor,
             identity=identity,
         )
+        _require_backup_leaf_metadata(opened, identity)
+        _require_backup_leaf_metadata(path.lstat(), identity)
+        return owner
     except BaseException:
         if descriptor is not None and identity is None:
             try:
@@ -750,25 +842,31 @@ def _secure_open_file(path: Path) -> _OpenBackupLeaf:
                 identity = (opened.st_dev, opened.st_ino)
             except BaseException:
                 pass
-        if descriptor is not None:
+        if owner is None and descriptor is not None and identity is not None:
+            owner = _BackupLeafOwner(
+                descriptor=descriptor,
+                identity=identity,
+            )
+        if owner is not None:
+            _cleanup_backup_leaf_owner(owner, path)
+        elif descriptor is not None:
             try:
-                os.close(descriptor)
+                _close_backup_leaf_descriptor(descriptor)
             except BaseException:
                 pass
-        _unlink_path_if_identity(path, identity)
         raise OSError("backup file is invalid")
 
 
-def _secure_create_file_at(
+def _secure_open_file_at(
     directory_fd: int,
     name: str,
-) -> tuple[int, int]:
+) -> _BackupLeafOwner:
     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     identity: tuple[int, int] | None = None
-    failed = False
+    owner: _BackupLeafOwner | None = None
     try:
         descriptor = os.open(
             name,
@@ -779,48 +877,43 @@ def _secure_create_file_at(
         os.fchmod(descriptor, 0o600)
         opened = os.fstat(descriptor)
         identity = (opened.st_dev, opened.st_ino)
+        owner = _BackupLeafOwner(
+            descriptor=descriptor,
+            identity=identity,
+        )
         _require_backup_leaf_metadata(opened, identity)
+        metadata = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        _require_backup_leaf_metadata(metadata, identity)
+        return owner
     except BaseException:
-        failed = True
         if descriptor is not None and identity is None:
             try:
                 opened = os.fstat(descriptor)
                 identity = (opened.st_dev, opened.st_ino)
             except BaseException:
                 pass
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except BaseException:
-                failed = True
-    if not failed and identity is not None:
-        try:
-            metadata = os.stat(
-                name,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
+        if owner is None and descriptor is not None and identity is not None:
+            owner = _BackupLeafOwner(
+                descriptor=descriptor,
+                identity=identity,
             )
-            _require_backup_leaf_metadata(metadata, identity)
-        except BaseException:
-            failed = True
-    if failed or identity is None:
-        if identity is not None:
+        if owner is not None:
+            _cleanup_backup_leaf_owner(
+                owner,
+                Path(name),
+                directory_fd=directory_fd,
+                name=name,
+            )
+        elif descriptor is not None:
             try:
-                metadata = os.stat(
-                    name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    stat.S_ISREG(metadata.st_mode)
-                    and (metadata.st_dev, metadata.st_ino) == identity
-                ):
-                    os.unlink(name, dir_fd=directory_fd)
+                _close_backup_leaf_descriptor(descriptor)
             except BaseException:
                 pass
         raise OSError("backup file is invalid")
-    return identity
 
 
 def _workspace_path_intact(workspace: _BackupWorkspace) -> None:
@@ -856,15 +949,19 @@ def _workspace_entries(workspace: _BackupWorkspace) -> frozenset[str]:
     return frozenset(entry.name for entry in workspace.path.iterdir())
 
 
-def _close_workspace_fds(workspace: _BackupWorkspace) -> bool:
-    closed = True
-    for descriptor in (workspace.directory_fd, workspace.root_fd):
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except BaseException:
-                closed = False
-    return closed
+def _close_workspace_directory_fds(
+    workspace: _BackupWorkspace,
+) -> bool:
+    for attribute in ("directory_fd", "root_fd"):
+        descriptor = getattr(workspace, attribute)
+        setattr(workspace, attribute, None)
+        if descriptor is None:
+            continue
+        try:
+            os.close(descriptor)
+        except BaseException:
+            return False
+    return True
 
 
 def _cleanup_backup_workspace(
@@ -874,52 +971,39 @@ def _cleanup_backup_workspace(
 
     if workspace is None:
         return
-    if workspace.directory_fd is not None:
-        if workspace.backup_identity is not None:
-            try:
-                metadata = os.stat(
-                    _BACKUP_FILENAME,
-                    dir_fd=workspace.directory_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    stat.S_ISREG(metadata.st_mode)
-                    and metadata.st_nlink == 1
-                    and (metadata.st_dev, metadata.st_ino)
-                    == workspace.backup_identity
-                ):
-                    os.unlink(
-                        _BACKUP_FILENAME,
-                        dir_fd=workspace.directory_fd,
-                    )
-            except BaseException:
-                pass
-        directory_fd = workspace.directory_fd
+    _unlink_workspace_backup(workspace)
+
+    directory_fd = workspace.directory_fd
+    workspace.directory_fd = None
+    if directory_fd is not None:
         try:
             os.close(directory_fd)
         except BaseException:
             pass
-        if workspace.root_fd is not None:
-            try:
-                metadata = os.stat(
-                    workspace.name,
-                    dir_fd=workspace.root_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    stat.S_ISDIR(metadata.st_mode)
-                    and (metadata.st_dev, metadata.st_ino)
-                    == workspace.identity
-                ):
-                    # rmdir succeeds only when no unknown/replaced entry
-                    # remains.  Sidecar names are never treated as ownership.
-                    os.rmdir(workspace.name, dir_fd=workspace.root_fd)
-            except BaseException:
-                pass
-            try:
-                os.close(workspace.root_fd)
-            except BaseException:
-                pass
+
+    root_fd = workspace.root_fd
+    workspace.root_fd = None
+    if root_fd is not None:
+        try:
+            metadata = os.stat(
+                workspace.name,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and (metadata.st_dev, metadata.st_ino)
+                == workspace.identity
+            ):
+                # rmdir succeeds only when no unknown/replaced entry remains.
+                # Sidecar names are never treated as ownership.
+                os.rmdir(workspace.name, dir_fd=root_fd)
+        except BaseException:
+            pass
+        try:
+            os.close(root_fd)
+        except BaseException:
+            pass
         return
 
     try:
@@ -931,11 +1015,6 @@ def _cleanup_backup_workspace(
         )
     except BaseException:
         return
-    if workspace.backup_identity is not None:
-        _unlink_path_if_identity(
-            workspace.path / _BACKUP_FILENAME,
-            workspace.backup_identity,
-        )
     try:
         workspace.path.rmdir()
     except BaseException:
@@ -943,31 +1022,15 @@ def _cleanup_backup_workspace(
 
 
 def _unlink_workspace_backup(workspace: _BackupWorkspace) -> None:
-    if workspace.backup_identity is None:
+    owner = workspace.backup_owner
+    workspace.backup_owner = None
+    if owner is None:
         return
-    if workspace.directory_fd is not None:
-        try:
-            metadata = os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=workspace.directory_fd,
-                follow_symlinks=False,
-            )
-            if (
-                stat.S_ISREG(metadata.st_mode)
-                and metadata.st_nlink == 1
-                and (metadata.st_dev, metadata.st_ino)
-                == workspace.backup_identity
-            ):
-                os.unlink(
-                    _BACKUP_FILENAME,
-                    dir_fd=workspace.directory_fd,
-                )
-        except BaseException:
-            pass
-        return
-    _unlink_path_if_identity(
+    _cleanup_backup_leaf_owner(
+        owner,
         workspace.path / _BACKUP_FILENAME,
-        workspace.backup_identity,
+        directory_fd=workspace.directory_fd,
+        name=_BACKUP_FILENAME,
     )
 
 
@@ -1113,9 +1176,8 @@ def _create_staging_workspace() -> _StagingWorkspace:
         tempfile.mkdtemp(prefix="claude-hub-companion-stage-")
     )
     directory_identity: tuple[int, int] | None = None
-    database_identity: tuple[int, int] | None = None
+    database_owner: _BackupLeafOwner | None = None
     database = directory / _BACKUP_FILENAME
-    failed = False
     try:
         if _strict_posix_permissions():
             directory.chmod(0o700)
@@ -1126,12 +1188,19 @@ def _create_staging_workspace() -> _StagingWorkspace:
             directory_identity,
             private=True,
         )
-        database_identity = _secure_create_file(database)
+        database_owner = _secure_open_file(database)
+        return _StagingWorkspace(
+            directory=directory,
+            directory_identity=directory_identity,
+            database=database,
+            database_owner=database_owner,
+        )
     except BaseException:
-        failed = True
-    if failed or directory_identity is None or database_identity is None:
-        if database_identity is not None:
-            _unlink_path_if_identity(database, database_identity)
+        if database_owner is not None:
+            _cleanup_backup_leaf_owner(
+                database_owner,
+                database,
+            )
         try:
             metadata = directory.lstat()
             if (
@@ -1144,12 +1213,6 @@ def _create_staging_workspace() -> _StagingWorkspace:
         except BaseException:
             pass
         raise OSError("backup staging is invalid")
-    return _StagingWorkspace(
-        directory=directory,
-        directory_identity=directory_identity,
-        database=database,
-        database_identity=database_identity,
-    )
 
 
 def _cleanup_staging_workspace(
@@ -1157,9 +1220,15 @@ def _cleanup_staging_workspace(
 ) -> bool:
     if staging is None:
         return True
-    _unlink_path_if_identity(
-        staging.database,
-        staging.database_identity,
+    owner = staging.database_owner
+    staging.database_owner = None
+    leaf_cleaned = (
+        True
+        if owner is None
+        else _cleanup_backup_leaf_owner(
+            owner,
+            staging.database,
+        )
     )
     try:
         metadata = staging.directory.lstat()
@@ -1170,10 +1239,10 @@ def _cleanup_staging_workspace(
         ):
             staging.directory.rmdir()
     except FileNotFoundError:
-        return True
+        return leaf_cleaned
     except BaseException:
         return False
-    return not staging.directory.exists()
+    return leaf_cleaned and not staging.directory.exists()
 
 
 def _validate_backup_snapshot(
@@ -1211,23 +1280,11 @@ def _fsync_backup_leaf(
     path: Path,
     expected_identity: tuple[int, int],
     *,
+    descriptor: int,
     directory_fd: int | None = None,
 ) -> None:
-    """Durably flush exactly the regular backup inode we created."""
+    """Durably flush the still-pinned regular backup inode."""
 
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = (
-        os.open(
-            _BACKUP_FILENAME,
-            flags,
-            dir_fd=directory_fd,
-        )
-        if directory_fd is not None
-        else os.open(path, flags)
-    )
     failed = False
     try:
         _require_backup_leaf_metadata(
@@ -1235,13 +1292,11 @@ def _fsync_backup_leaf(
             expected_identity,
         )
         linked = (
-            os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
+            _linked_backup_leaf_metadata(
+                path,
+                directory_fd=directory_fd,
+                name=_BACKUP_FILENAME,
             )
-            if directory_fd is not None
-            else path.lstat()
         )
         _require_backup_leaf_metadata(linked, expected_identity)
         os.fsync(descriptor)
@@ -1250,22 +1305,15 @@ def _fsync_backup_leaf(
             expected_identity,
         )
         linked = (
-            os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
+            _linked_backup_leaf_metadata(
+                path,
+                directory_fd=directory_fd,
+                name=_BACKUP_FILENAME,
             )
-            if directory_fd is not None
-            else path.lstat()
         )
         _require_backup_leaf_metadata(linked, expected_identity)
     except BaseException:
         failed = True
-    finally:
-        try:
-            os.close(descriptor)
-        except BaseException:
-            failed = True
     if failed:
         raise OSError("backup durability could not be verified")
 
@@ -1332,15 +1380,19 @@ def _fsync_directory(
 
 
 def _durability_barrier(workspace: _BackupWorkspace) -> None:
-    if workspace.backup_identity is None:
-        raise OSError("backup file is invalid")
     backup_path = workspace.path / _BACKUP_FILENAME
+    owner = _require_owned_backup_leaf_linked(
+        workspace.backup_owner,
+        backup_path,
+        directory_fd=workspace.directory_fd,
+    )
     _workspace_path_intact(workspace)
     if _workspace_entries(workspace) != {_BACKUP_FILENAME}:
         raise OSError("backup directory is invalid")
     _fsync_backup_leaf(
         backup_path,
-        workspace.backup_identity,
+        owner.identity,
+        descriptor=owner.descriptor,
         directory_fd=workspace.directory_fd,
     )
     _workspace_path_intact(workspace)
@@ -1390,83 +1442,43 @@ def _copy_staging_to_workspace(
     if _workspace_entries(workspace):
         raise OSError("backup directory is not empty")
     source_fd: int | None = None
-    destination_fd: int | None = None
-    identity: tuple[int, int] | None = None
-    updated: _BackupWorkspace | None = None
     failed = False
     try:
         if workspace.directory_fd is not None:
-            identity = _secure_create_file_at(
+            owner = _secure_open_file_at(
                 workspace.directory_fd,
                 _BACKUP_FILENAME,
             )
         else:
-            opened = _secure_open_file(
+            owner = _secure_open_file(
                 workspace.path / _BACKUP_FILENAME
             )
-            destination_fd = opened.descriptor
-            identity = opened.identity
-        updated = _BackupWorkspace(
-            path=workspace.path,
-            name=workspace.name,
-            identity=workspace.identity,
-            root_path=workspace.root_path,
-            root_identity=workspace.root_identity,
-            root_fd=workspace.root_fd,
+        workspace.backup_owner = owner
+        owner = _require_owned_backup_leaf_linked(
+            workspace.backup_owner,
+            workspace.path / _BACKUP_FILENAME,
             directory_fd=workspace.directory_fd,
-            backup_identity=identity,
         )
-        if destination_fd is None:
-            destination_flags = os.O_WRONLY
-            destination_flags |= getattr(os, "O_BINARY", 0)
-            destination_flags |= getattr(os, "O_CLOEXEC", 0)
-            destination_flags |= getattr(os, "O_NOFOLLOW", 0)
-            destination_fd = os.open(
-                _BACKUP_FILENAME,
-                destination_flags,
-                dir_fd=updated.directory_fd,
-            )
-        _require_backup_leaf_metadata(
-            os.fstat(destination_fd),
-            identity,
-        )
-        _workspace_path_intact(updated)
-        linked = (
-            os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=updated.directory_fd,
-                follow_symlinks=False,
-            )
-            if updated.directory_fd is not None
-            else (
-                updated.path / _BACKUP_FILENAME
-            ).lstat()
-        )
-        _require_backup_leaf_metadata(linked, identity)
-        if _workspace_entries(updated) != {_BACKUP_FILENAME}:
+        destination_fd = owner.descriptor
+        _workspace_path_intact(workspace)
+        if _workspace_entries(workspace) != {_BACKUP_FILENAME}:
             raise OSError("backup directory is invalid")
-        _workspace_path_intact(updated)
-        _require_backup_leaf_metadata(
-            os.fstat(destination_fd),
-            identity,
+        _workspace_path_intact(workspace)
+        owner = _require_owned_backup_leaf_linked(
+            workspace.backup_owner,
+            workspace.path / _BACKUP_FILENAME,
+            directory_fd=workspace.directory_fd,
         )
-        linked = (
-            os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=updated.directory_fd,
-                follow_symlinks=False,
-            )
-            if updated.directory_fd is not None
-            else (
-                updated.path / _BACKUP_FILENAME
-            ).lstat()
-        )
-        _require_backup_leaf_metadata(linked, identity)
+        destination_fd = owner.descriptor
 
-        # The path-only fallback writes through the descriptor returned by
-        # creation.  All path identities are checked before this source is
-        # even opened, so a root replacement can receive at most an empty
-        # leaf and can never redirect database bytes through a reopen.
+        # Both paths write through the descriptor returned by creation.
+        # All path identities are checked before this source is even opened,
+        # so a root replacement cannot redirect database bytes through a
+        # reopened or inode-reused leaf.
+        staging_owner = _require_owned_backup_leaf_linked(
+            staging.database_owner,
+            staging.database,
+        )
         source_flags = os.O_RDONLY
         source_flags |= getattr(os, "O_BINARY", 0)
         source_flags |= getattr(os, "O_CLOEXEC", 0)
@@ -1474,7 +1486,7 @@ def _copy_staging_to_workspace(
         source_fd = os.open(staging.database, source_flags)
         _require_backup_leaf_metadata(
             os.fstat(source_fd),
-            staging.database_identity,
+            staging_owner.identity,
         )
         while True:
             if monotonic() >= deadline:
@@ -1490,39 +1502,24 @@ def _copy_staging_to_workspace(
                 if written <= 0:
                     raise OSError("backup copy failed")
                 view = view[written:]
-        _workspace_path_intact(updated)
-        _require_backup_leaf_metadata(
-            os.fstat(destination_fd),
-            identity,
+        _workspace_path_intact(workspace)
+        _require_owned_backup_leaf_linked(
+            workspace.backup_owner,
+            workspace.path / _BACKUP_FILENAME,
+            directory_fd=workspace.directory_fd,
         )
-        linked = (
-            os.stat(
-                _BACKUP_FILENAME,
-                dir_fd=updated.directory_fd,
-                follow_symlinks=False,
-            )
-            if updated.directory_fd is not None
-            else (
-                updated.path / _BACKUP_FILENAME
-            ).lstat()
-        )
-        _require_backup_leaf_metadata(linked, identity)
     except BaseException:
         failed = True
     finally:
-        for descriptor in (destination_fd, source_fd):
-            if descriptor is not None:
-                try:
-                    _close_backup_copy_descriptor(descriptor)
-                except BaseException:
-                    failed = True
+        if source_fd is not None:
+            try:
+                _close_backup_copy_descriptor(source_fd)
+            except BaseException:
+                failed = True
     if failed:
-        if updated is not None:
-            _unlink_workspace_backup(updated)
+        _unlink_workspace_backup(workspace)
         raise OSError("backup copy failed")
-    if updated is None:
-        raise OSError("backup copy failed")
-    return updated
+    return workspace
 
 
 def _online_backup(
@@ -1598,9 +1595,9 @@ def _online_backup(
             failed = True
     if not failed and workspace is not None and staging is not None:
         try:
-            _require_backup_leaf_metadata(
-                staging.database.lstat(),
-                staging.database_identity,
+            _require_owned_backup_leaf_linked(
+                staging.database_owner,
+                staging.database,
             )
             workspace = _copy_staging_to_workspace(
                 staging,
@@ -1616,17 +1613,23 @@ def _online_backup(
                 database_path,
                 expected_source_files,
             )
-            held_workspace = workspace
-            workspace = _BackupWorkspace(
-                path=held_workspace.path,
-                name=held_workspace.name,
-                identity=held_workspace.identity,
-                root_path=held_workspace.root_path,
-                root_identity=held_workspace.root_identity,
-                backup_identity=held_workspace.backup_identity,
+            _workspace_path_intact(workspace)
+            if _workspace_entries(workspace) != {_BACKUP_FILENAME}:
+                raise OSError("backup directory is invalid")
+            _require_owned_backup_leaf_linked(
+                workspace.backup_owner,
+                workspace.path / _BACKUP_FILENAME,
+                directory_fd=workspace.directory_fd,
             )
-            if not _close_workspace_fds(held_workspace):
+            if not _close_workspace_directory_fds(workspace):
                 raise OSError("backup directory close failed")
+            owner = workspace.backup_owner
+            workspace.backup_owner = None
+            if (
+                owner is None
+                or not _release_backup_leaf_owner(owner)
+            ):
+                raise OSError("backup file close failed")
             artifact = _BackupArtifact(
                 path=workspace.path / _BACKUP_FILENAME
             )
