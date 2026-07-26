@@ -7,9 +7,18 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
+from . import __version__
 from .domain import StoreCapability
 from .service import ProviderApplicationService
 from .testing import InMemoryProviderStore
+from .update_check import (
+    ReleaseChannel,
+    UpdateChecker,
+    UpdateCheckResult,
+    UpdateCheckSettings,
+    UpdateStatus,
+    build_default_checker,
+)
 
 
 SCHEMA_VERSION = 1
@@ -17,7 +26,7 @@ EXIT_OK = 0
 EXIT_RUNTIME_ERROR = 1
 EXIT_USAGE = 2
 
-_USAGE = "switchctl detect"
+_USAGE = "switchctl detect | switchctl check-update [--disabled]"
 
 
 def build_default_service() -> ProviderApplicationService:
@@ -63,10 +72,12 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     service: ProviderApplicationService | None = None,
+    update_checker: UpdateChecker | None = None,
+    update_settings: UpdateCheckSettings | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
-    """Run ``switchctl`` with injectable argv, service, and output streams."""
+    """Run ``switchctl`` with injectable services and output streams."""
 
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     output = sys.stdout if stdout is None else stdout
@@ -83,7 +94,11 @@ def main(
         )
         return EXIT_OK
 
-    if arguments != ("detect",):
+    if arguments not in {
+        ("detect",),
+        ("check-update",),
+        ("check-update", "--disabled"),
+    }:
         _write_json(
             output,
             _envelope(
@@ -97,6 +112,54 @@ def main(
         )
         diagnostics.write("switchctl: usage_error\n")
         return EXIT_USAGE
+
+    if arguments == ("check-update", "--disabled"):
+        update_result = UpdateCheckResult(
+            status=UpdateStatus.DISABLED,
+            current_version=__version__,
+            channel=(
+                ReleaseChannel.STABLE
+                if update_settings is None
+                else update_settings.channel
+            ),
+        )
+        _write_json(
+            output,
+            _envelope(
+                ok=True,
+                data={"update": update_result.to_public_dict()},
+                error=None,
+            ),
+        )
+        return EXIT_OK
+
+    if arguments == ("check-update",):
+        try:
+            checker = (
+                build_default_checker(settings=update_settings)
+                if update_checker is None
+                else update_checker
+            )
+            update_result = checker.check(__version__)
+        except Exception:
+            update_result = UpdateCheckResult(
+                status=UpdateStatus.UNAVAILABLE,
+                current_version=__version__,
+                channel=(
+                    ReleaseChannel.STABLE
+                    if update_settings is None
+                    else update_settings.channel
+                ),
+            )
+        _write_json(
+            output,
+            _envelope(
+                ok=True,
+                data={"update": update_result.to_public_dict()},
+                error=None,
+            ),
+        )
+        return EXIT_OK
 
     try:
         application = build_default_service() if service is None else service
