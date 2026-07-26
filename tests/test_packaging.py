@@ -30,6 +30,14 @@ class PackagingMetadataTests(unittest.TestCase):
         self.assertEqual(config["project"]["name"], "claude-hub-kit")
         self.assertEqual(config["project"]["version"], __version__)
         self.assertEqual(config["project"]["requires-python"], ">=3.11")
+        self.assertEqual(config["project"]["dependencies"], [])
+        self.assertEqual(
+            config["project"]["optional-dependencies"]["desktop"],
+            [
+                "PySide6>=6.8,<7",
+                "keyring>=25,<26",
+            ],
+        )
         self.assertEqual(
             config["project"]["scripts"],
             {
@@ -81,6 +89,7 @@ class PackagingMetadataTests(unittest.TestCase):
                 members = archive.namelist()
 
             self.assertIn("claude_hub/__init__.py", members)
+            self.assertIn("claude_hub/desktop.py", members)
             self.assertIn("claude_hub/entrypoints.py", members)
             self.assertTrue(
                 all(
@@ -102,22 +111,17 @@ class PackagingMetadataTests(unittest.TestCase):
 
 class PlaceholderEntrypointTests(unittest.TestCase):
     def test_help_is_clear_and_successful(self) -> None:
-        for program, entrypoint in (
-            ("claude-hub", hub_main),
-            ("claude1", claude1_main),
-        ):
-            with self.subTest(program=program):
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    status = entrypoint(["--help"])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status = claude1_main(["--help"])
 
-                self.assertEqual(status, 0)
-                normalized = " ".join(output.getvalue().split())
-                self.assertIn(f"usage: {program}", normalized)
-                self.assertIn(
-                    "operational behavior is not packaged yet",
-                    normalized,
-                )
+        self.assertEqual(status, 0)
+        normalized = " ".join(output.getvalue().split())
+        self.assertIn("usage: claude1", normalized)
+        self.assertIn(
+            "operational behavior is not packaged yet",
+            normalized,
+        )
 
     def test_unimplemented_operation_returns_placeholder_error(self) -> None:
         for program, entrypoint in (

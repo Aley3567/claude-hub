@@ -30,7 +30,8 @@ cd claude-hub
 `python -m pip install --upgrade claude-hub-kit`。再次运行会升级现有安装；
 需要桌面依赖时显式运行 `./install.sh --desktop`，安装
 `claude-hub-kit[desktop]`。安装器会在执行前显示经过 shell 安全引用的准确
-命令。
+命令。安装 desktop extra 后可运行 `claude-hub gui` 启动 Qt Widgets
+桌面空壳；核心安装缺少该 extra 时，命令会显示同一条准确补装命令。
 
 ### 3. 选择渠道
 
@@ -235,6 +236,7 @@ provider 或 current 状态。
 | `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
 | `claude1_provider.py` | 统一 Provider capability profile、来源审计与凭证隔离 |
 | `claude1-turn-guard.py` | 指定 Provider opt-in 的 thinking-only Stop Guard |
+| `src/claude_hub/desktop.py` | 仅依赖共享应用服务的 Qt Widgets 桌面空壳 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |
