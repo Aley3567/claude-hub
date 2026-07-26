@@ -22,6 +22,11 @@ from claude_hub.switchctl import (  # noqa: E402
     main,
 )
 from claude_hub.testing import InMemoryProviderStore  # noqa: E402
+from claude_hub.update_check import (  # noqa: E402
+    HttpResponse,
+    UpdateCheckSettings,
+    UpdateChecker,
+)
 
 
 SUCCESS_GOLDEN = (
@@ -34,7 +39,8 @@ FAILURE_GOLDEN = (
 )
 USAGE_GOLDEN = (
     '{"schemaVersion":1,"ok":false,"data":null,'
-    '"error":{"code":"usage_error","message":"usage: switchctl detect"}}\n'
+    '"error":{"code":"usage_error","message":"usage: switchctl detect | '
+    'switchctl check-update [--disabled]"}}\n'
 )
 DEFAULT_GOLDEN = (
     '{"schemaVersion":1,"ok":true,'
@@ -62,12 +68,16 @@ class SwitchctlDetectTests(unittest.TestCase):
         argv: list[str],
         *,
         service: ProviderApplicationService | None = None,
+        update_checker: UpdateChecker | None = None,
+        update_settings: UpdateCheckSettings | None = None,
     ) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
         exit_code = main(
             argv,
             service=service,
+            update_checker=update_checker,
+            update_settings=update_settings,
             stdout=stdout,
             stderr=stderr,
         )
@@ -171,11 +181,117 @@ class SwitchctlDetectTests(unittest.TestCase):
             {
                 "schemaVersion": 1,
                 "ok": True,
-                "data": {"usage": "switchctl detect"},
+                "data": {
+                    "usage": (
+                        "switchctl detect | "
+                        "switchctl check-update [--disabled]"
+                    )
+                },
                 "error": None,
             },
         )
         self.assertEqual(stdout.count("\n"), 1)
+
+    def test_check_update_preserves_envelope_and_stable_success_exit(self) -> None:
+        class _Client:
+            def send(self, request):
+                return HttpResponse(
+                    status=200,
+                    body=(
+                        b'[{"tag_name":"v0.2.0","prerelease":false,'
+                        b'"draft":false}]'
+                    ),
+                )
+
+        checker = UpdateChecker(
+            http_client=_Client(),
+            settings=UpdateCheckSettings(cache_enabled=False),
+        )
+
+        exit_code, stdout, stderr = self._run(
+            ["check-update"],
+            update_checker=checker,
+        )
+
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.count("\n"), 1)
+        payload = json.loads(stdout)
+        self.assertEqual(
+            list(payload),
+            ["schemaVersion", "ok", "data", "error"],
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"]["update"]["status"], "available")
+        self.assertEqual(
+            payload["data"]["update"]["latestVersion"],
+            "0.2.0",
+        )
+
+    def test_disabled_check_update_makes_no_request_and_still_succeeds(self) -> None:
+        with (
+            mock.patch(
+                "claude_hub.switchctl.build_default_checker",
+                side_effect=AssertionError("checker construction used"),
+            ),
+            mock.patch(
+                "claude_hub.update_check.urllib.request.urlopen",
+                side_effect=AssertionError("network used"),
+            ),
+        ):
+            exit_code, stdout, stderr = self._run(
+                ["check-update", "--disabled"],
+            )
+
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            json.loads(stdout)["data"]["update"]["status"],
+            "disabled",
+        )
+
+    def test_injected_disabled_setting_is_also_a_zero_request_contract(
+        self,
+    ) -> None:
+        with mock.patch(
+            "claude_hub.update_check.urllib.request.urlopen",
+            side_effect=AssertionError("network used"),
+        ):
+            exit_code, stdout, stderr = self._run(
+                ["check-update"],
+                update_settings=UpdateCheckSettings(enabled=False),
+            )
+
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            json.loads(stdout)["data"]["update"]["status"],
+            "disabled",
+        )
+
+    def test_offline_check_is_unavailable_without_changing_exit_code(self) -> None:
+        class _OfflineClient:
+            def send(self, request):
+                raise OSError("private network detail")
+
+        checker = UpdateChecker(
+            http_client=_OfflineClient(),
+            settings=UpdateCheckSettings(cache_enabled=False),
+        )
+
+        exit_code, stdout, stderr = self._run(
+            ["check-update"],
+            update_checker=checker,
+        )
+
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            payload["data"]["update"]["status"],
+            "unavailable",
+        )
 
 
 if __name__ == "__main__":
