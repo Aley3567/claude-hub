@@ -167,12 +167,55 @@ def resolve_claude_bin() -> Path:
     return DEFAULT_CLAUDE_BIN
 
 
-def load_mru() -> dict[str, float]:
+FRECENCY_HALF_LIFE_SECONDS = 7 * 24 * 3600.0  # 一周衰减一半，久不用的渠道自然下沉
+FIXED_TOP_SLOTS = 3  # 列表前三保持 CC Switch 顺序，数字键 1-3 的肌肉记忆不随排名漂移
+
+
+def _coerce_stat_entry(value) -> dict[str, float] | None:
+    """兼容旧版纯时间戳与新版 {"last", "score"} 两种存储格式。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return {"last": float(value), "score": 1.0}
+    if isinstance(value, dict):
+        last = value.get("last")
+        score = value.get("score")
+        if (
+            isinstance(last, (int, float))
+            and not isinstance(last, bool)
+            and isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and float(score) >= 0.0
+        ):
+            return {"last": float(last), "score": float(score)}
+    return None
+
+
+def load_use_stats() -> dict[str, dict[str, float]]:
     try:
         data = json.loads(MRU_PATH.read_text())
-        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    stats: dict[str, dict[str, float]] = {}
+    for key, value in data.items():
+        entry = _coerce_stat_entry(value)
+        if isinstance(key, str) and entry is not None:
+            stats[key] = entry
+    return stats
+
+
+def load_mru() -> dict[str, float]:
+    return {name: entry["last"] for name, entry in load_use_stats().items()}
+
+
+def frecency_score(entry: dict[str, float] | None, now: float) -> float:
+    """zoxide 式 frecency：分数随距上次使用的时间指数衰减，命中一次 +1。"""
+    if not entry:
+        return 0.0
+    age = max(0.0, now - entry["last"])
+    return entry["score"] * 0.5 ** (age / FRECENCY_HALF_LIFE_SECONDS)
 
 
 def _atomic_private_write(path: Path, text: str) -> None:
@@ -233,12 +276,16 @@ def _open_private_append(path: Path):
 
 
 def record_use(name: str) -> None:
-    mru = load_mru()
-    mru[name] = time.time()
+    stats = load_use_stats()
+    now = time.time()
+    stats[name] = {
+        "last": now,
+        "score": frecency_score(stats.get(name), now) + 1.0,
+    }
     try:
         _atomic_private_write(
             MRU_PATH,
-            json.dumps(mru, ensure_ascii=False, indent=1),
+            json.dumps(stats, ensure_ascii=False, indent=1),
         )
     except OSError:
         pass  # MRU is best-effort; never block a launch on it
@@ -1419,20 +1466,27 @@ _MIN_TUI_COLS = 32
 INTRO_DURATION_SECONDS = 0.24
 INTRO_FRAME_SECONDS = 0.016
 INTRO_FLOW_STEP_SECONDS = 0.04
+# 待机呼吸：交互后以低帧率继续流动一小段时间，然后回到零唤醒阻塞。
+# 150ms/帧 ≈ 6.7fps，每帧只补画 logo 与顶线（curses 只重传变化的格子）。
+IDLE_FRAME_MS = 150
+IDLE_BREATH_SECONDS = 8.0
 LOGO_BREATH_LEVELS = (
     0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 0, 0,
 )
 C: dict = {}
 
-# Logo and provider rows share a vivid full-spectrum identity.
+# Logo 与顶线共用全光谱流动渐变；列表行沿同一色相环按序取色，
+# 相邻行相邻色相 —— 有序的渐变是设计，随机的轮换才是噪音。
 LOGO_GRAD = [
     196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46, 48,
     50, 51, 45, 39, 33, 63, 99, 135, 171, 207, 201, 199,
 ]
 _logo_pairs: list[int] = []
-RAINBOW = [203, 208, 214, 220, 148, 46, 42, 51, 45, 75, 99, 141, 207, 205]
+# 亮度一致的高饱和色环（红珊瑚 → 橙 → 金 → 绿 → 青 → 蓝 → 紫 → 玫红）。
+RAINBOW = [203, 209, 215, 221, 155, 84, 49, 45, 75, 105, 135, 171, 205, 199]
 _row_pairs: list[int] = []
+_row_sel_pairs: list[int] = []
 
 
 def _addstr(win, y, x, text, attr=0) -> None:
@@ -1491,19 +1545,93 @@ def _pad_display(text: str, width: int) -> str:
     return clipped + (" " * max(0, width - _dwidth(clipped)))
 
 
-def _compose_row(left: str, right: str, width: int) -> str:
-    """Fit one provider row, keeping its short status aligned when possible."""
+def _compose_row_segments(
+    left: str,
+    right: str,
+    width: int,
+) -> tuple[str, str, int]:
+    """Split one row into left / right segments plus the gap between them."""
     if width <= 0:
-        return ""
+        return ("", "", 0)
     if not right:
-        return _truncate_display(left, width)
+        return (_truncate_display(left, width), "", 0)
     right = _truncate_display(right, width)
     right_width = _dwidth(right)
     if right_width + 2 >= width:
-        return _truncate_display(left, width)
+        return (_truncate_display(left, width), "", 0)
     left = _truncate_display(left, width - right_width - 2)
     gap = max(2, width - _dwidth(left) - right_width)
-    return _truncate_display(left + (" " * gap) + right, width)
+    return (left, right, gap)
+
+
+def _compose_row(left: str, right: str, width: int) -> str:
+    """Fit one provider row, keeping its short status aligned when possible."""
+    left_part, right_part, gap = _compose_row_segments(left, right, width)
+    if not right_part:
+        return left_part
+    return _truncate_display(left_part + (" " * gap) + right_part, width)
+
+
+def _draw_hints(win, row: int, x: int, parts) -> int:
+    """键位提示：键名用主色、说明用暗灰，扫一眼就能找到键。
+
+    parts 是 (key, desc) 序列；key 为空串时整段按说明文字渲染。
+    返回绘制结束后的 x 列，便于调用方接排后续内容。
+    """
+    first = True
+    for key, desc in parts:
+        if not first:
+            _addstr(win, row, x, " · ", C.get("dim", 0))
+            x += 3
+        first = False
+        if key:
+            _addstr(win, row, x, key, C.get("accent", 0))
+            x += _dwidth(key)
+            if desc:
+                _addstr(win, row, x, f" {desc}", C.get("dim", 0))
+                x += 1 + _dwidth(desc)
+        elif desc:
+            _addstr(win, row, x, desc, C.get("dim", 0))
+            x += _dwidth(desc)
+    return x
+
+
+def _draw_top_rule(win, phase: int) -> None:
+    """顶部渐变饰线 + 嵌入品牌名，是面板的第一眼轮廓。
+
+    名牌逐字符取渐变色并随 phase 一起流动，与 logo 同源同动。
+    """
+    _h, w = win.getmaxyx()
+    n = len(_logo_pairs) or 1
+    for x in range(max(0, w - 1)):
+        attr = _logo_pairs[(x + phase) % n]
+        try:
+            win.addstr(0, x, "━", attr)
+        except curses.error:
+            pass
+    for i, chx in enumerate(" claude1 "):
+        _addstr(
+            win,
+            0,
+            3 + i,
+            chx,
+            _logo_pairs[(3 + i + phase) % n] | curses.A_BOLD,
+        )
+
+
+def _draw_bottom_rule(win, row: int, parts) -> None:
+    """底部细线内嵌键位提示，收住面板的下缘。"""
+    _h, w = win.getmaxyx()
+    _addstr(win, row, 0, "─" * max(0, w - 1), C.get("dim", 0))
+    _addstr(win, row, 2, " ", 0)
+    end = _draw_hints(win, row, 3, parts)
+    _addstr(win, row, end, " ", 0)
+
+
+def _draw_section_label(win, row: int, text: str, width: int) -> None:
+    """`─ 标题 ────` 式的细线分组，代替光秃秃的一行小字。"""
+    fill = max(0, min(width, 40) - _dwidth(text) - 3)
+    _addstr(win, row, 2, f"─ {text} " + "─" * fill, C.get("dim", 0))
 
 
 def _safe_curs_set(visibility: int) -> None:
@@ -1542,13 +1670,13 @@ def _init_colors() -> dict:
     }
     _logo_pairs.clear()
     _row_pairs.clear()
+    _row_sel_pairs.clear()
     try:
         has_colors = curses.has_colors()
     except curses.error:
         has_colors = False
     if not has_colors:
         _logo_pairs.append(0)
-        _row_pairs.extend([d["base"], d["accent"], d["brand"], d["warning"]])
         return d
     try:
         curses.start_color()
@@ -1557,25 +1685,25 @@ def _init_colors() -> dict:
     except curses.error:
         bg = 0
 
-    def _pair(pid: int, fg: int, fallback: int = 0) -> int:
+    def _pair(pid: int, fg: int, fallback: int = 0, pair_bg: int | None = None) -> int:
         max_pairs = int(getattr(curses, "COLOR_PAIRS", 0) or 0)
         if max_pairs and pid >= max_pairs:
             return fallback
         try:
-            curses.init_pair(pid, fg, bg)
+            curses.init_pair(pid, fg, bg if pair_bg is None else pair_bg)
             return curses.color_pair(pid)
         except curses.error:
             return fallback
 
     cyan = _pair(1, curses.COLOR_CYAN)
-    green = _pair(2, curses.COLOR_GREEN)
     yellow = _pair(3, curses.COLOR_YELLOW)
     magenta = _pair(4, curses.COLOR_MAGENTA)
     red = _pair(5, curses.COLOR_RED)
     d.update(
         dim=curses.A_DIM,
-        base=green,
-        accent=cyan | curses.A_BOLD,
+        base=0,  # 渠道名默认前景兜底；256 色下由彩虹渐变接管
+        title=curses.A_BOLD,
+        accent=cyan,
         warning=yellow,
         error=red | curses.A_BOLD,
         brand=magenta | curses.A_BOLD,
@@ -1584,33 +1712,35 @@ def _init_colors() -> dict:
 
     has256 = getattr(curses, "COLORS", 0) >= 256
 
-    # Named vivid accents with safe basic-color fallbacks.
-    d["orange"] = _pair(60, 208, d["warning"]) if has256 else d["warning"]
-    d["pink"] = _pair(61, 205, d["brand"]) if has256 else d["brand"]
-    d["lime"] = _pair(62, 118, d["base"]) if has256 else d["base"]
-    d["gold"] = _pair(63, 220, d["warning"]) if has256 else d["warning"]
-    d["teal"] = _pair(64, 44, d["accent"]) if has256 else d["accent"]
-    d["violet"] = _pair(65, 141, d["brand"]) if has256 else d["brand"]
-
-    # Selected row: bold black text on a vivid orange background.
     if has256:
-        try:
-            curses.init_pair(66, 16, 208)
-            d["sel"] = curses.color_pair(66) | curses.A_BOLD
-        except curses.error:
-            pass
-
-    # Rotate provider rows through a full spectrum; basic terminals keep
-    # a compact four-color fallback.
-    if has256:
+        # 角色分色：标题是结构，用亮白；键名是操作，用青；
+        # 品牌与 Hub 入口直接用渐变本身 —— 高饱和粉只留在色环里。
+        d["title"] = _pair(71, 231, 0) | curses.A_BOLD
+        d["accent"] = _pair(64, 45, cyan)
+        d["brand"] = _pair(60, 205, magenta) | curses.A_BOLD
+        # 结构层永远是灰阶：rank、meta、分组线靠它衬出彩色主体。
+        d["dim"] = _pair(67, 243, curses.A_DIM)
+        # 状态色用亮版，耀眼但只在需要时出现。
+        d["lime"] = _pair(62, 118, d["base"])
+        d["warning"] = _pair(63, 220, yellow)
+        d["error"] = _pair(68, 203, red) | curses.A_BOLD
+        # 家族/字段辅色（信息色，保持鲜艳可辨）。
+        d["pink"] = _pair(61, 205, magenta)
+        d["gold"] = _pair(69, 220, yellow)
+        d["teal"] = _pair(65, 45, cyan)
+        d["violet"] = _pair(66, 135, magenta)
+        d["orange"] = _pair(70, 209, yellow)
+        # 列表行：沿色相环按序取色；选中行翻转为黑字彩底，
+        # 底色继承该行自己的色相 —— 焦点耀眼且与整体渐变连续。
         for i, cidx in enumerate(RAINBOW):
-            pair = _pair(40 + i, cidx, 0)
+            pair = _pair(80 + i, cidx, 0)
             if pair:
                 _row_pairs.append(pair)
-    if not _row_pairs:
-        _row_pairs.extend([d["base"], d["accent"], d["brand"], d["warning"]])
-
-    if has256:
+            sel_pair = _pair(110 + i, 16, 0, pair_bg=cidx)
+            if sel_pair:
+                _row_sel_pairs.append(sel_pair)
+        if _row_sel_pairs:
+            d["sel"] = _row_sel_pairs[0] | curses.A_BOLD
         for i, cidx in enumerate(LOGO_GRAD):
             _logo_pairs.append(_pair(10 + i, cidx, d["brand"]))
     if not _logo_pairs:
@@ -1635,6 +1765,22 @@ def _tui_size_supported(rows: int, cols: int) -> bool:
 def _animation_enabled() -> bool:
     disabled = os.environ.get("CLAUDE1_NO_ANIMATION", "").strip().casefold()
     return disabled not in {"1", "true", "yes", "on"}
+
+
+def _idle_breath_seconds() -> float:
+    """待机呼吸时长；单色（无 256 色渐变）屏没有可见动画，保持零唤醒。
+
+    CLAUDE1_BREATH_SECONDS 可调时长，设 0 只保留入场动画。
+    """
+    if not _animation_enabled() or len(_logo_pairs) <= 1:
+        return 0.0
+    raw = os.environ.get("CLAUDE1_BREATH_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return IDLE_BREATH_SECONDS
 
 
 def _logo_intensity(phase: int, breathing: bool) -> int:
@@ -1683,16 +1829,17 @@ def _intro(win) -> int | None:
                 return None
             progress = min(1.0, elapsed / INTRO_DURATION_SECONDS)
             phase = int(elapsed / INTRO_FLOW_STEP_SECONDS)
+            _draw_top_rule(win, phase)
             typed = min(
                 len("欢迎回来"),
                 max(1, int((elapsed / 0.12) * len("欢迎回来"))),
             )
             _addstr(
                 win,
-                0,
+                1,
                 2,
                 _pad_display("欢迎回来"[:typed], _dwidth("欢迎回来")),
-                C.get("pink", 0) | curses.A_BOLD,
+                C.get("dim", 0),
             )
             col = max(1, int(width * progress))
             for r, line in enumerate(LOGO):
@@ -1718,13 +1865,28 @@ def _intro(win) -> int | None:
         win.nodelay(False)
 
 
-def _build_view(cfg, db_names, mru, show_hidden):
-    """Keep config order stable; MRU only affects the initial cursor."""
+def _build_view(cfg, db_names, stats, show_hidden):
+    """前 FIXED_TOP_SLOTS 个保持 CC Switch 顺序，其余按 frecency 降序。
+
+    stats 接受 load_use_stats() 的完整格式，也兼容旧的纯时间戳映射。
+    平分时回落到 CC Switch 顺序，保证排序稳定。
+    """
     meta = cfg["providers"]
-    return [
+    base = [
         n for n in meta
         if n in db_names and (show_hidden or not meta[n].get("hidden"))
     ]
+    head = base[:FIXED_TOP_SLOTS]
+    tail = base[FIXED_TOP_SLOTS:]
+    now = time.time()
+    config_order = {name: index for index, name in enumerate(base)}
+    tail.sort(
+        key=lambda name: (
+            -frecency_score(_coerce_stat_entry(stats.get(name)), now),
+            config_order[name],
+        )
+    )
+    return head + tail
 
 
 def _recent_name(view: list[str], mru: dict[str, float]) -> str | None:
@@ -1879,7 +2041,8 @@ def _draw_launcher(
     big = _large_logo_supported(h, w)
 
     if show_brand and big:
-        _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
+        _draw_top_rule(win, logo_phase)
+        _addstr(win, 1, 2, "欢迎回来", C.get("dim", 0))
         _draw_logo(win, logo_phase, breathing=logo_breathing)
         head = _LOGO_TOP + len(LOGO)
     elif show_brand:
@@ -1891,12 +2054,12 @@ def _draw_launcher(
             0,
             2,
             "欢迎使用 claude1",
-            C.get("pink", 0) | curses.A_BOLD,
+            C.get("title", curses.A_BOLD),
         )
         head = 1
 
     heading = "选择本次渠道"
-    _addstr(win, head + 1, 2, heading, C.get("lime", 0) | curses.A_BOLD)
+    _addstr(win, head + 1, 2, heading, C.get("title", curses.A_BOLD))
     if show_hidden:
         _addstr(
             win,
@@ -1905,16 +2068,22 @@ def _draw_launcher(
             "· 含隐藏项",
             C.get("dim", 0),
         )
-    guide = "↑↓ / jk 移动 · → 编辑模型 · Enter 启动 · 数字直达"
+    guide = [("↑↓/jk", "移动"), ("→", "编辑模型"), ("Enter", "启动"), ("1-9", "直达")]
     if hub_status is not None:
-        guide = "↑↓ / jk 移动 · → 编辑模型 · Enter 进入 Hub / 启动 · 数字直达"
-    _addstr(win, head + 2, 2, guide, C.get("dim", 0))
+        guide = [
+            ("↑↓/jk", "移动"),
+            ("→", "编辑模型"),
+            ("Enter", "进入 Hub / 启动"),
+            ("1-9", "直达"),
+        ]
+    _draw_hints(win, head + 2, 2, guide)
     row_cursor = head + 4
     if hub_status is not None:
-        _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
+        _draw_section_label(win, row_cursor, "多渠道会话", max(0, w - 4))
         row_cursor += 1
-        entry = (
-            f"◆ Claude-Hub · 多渠道会话 · {hub_status.summary}"
+        entry_head = "◆ Claude-Hub"
+        entry_tail = (
+            f" · 多渠道会话 · {hub_status.summary}"
             " · 会话内 /model 切换"
         )
         entry_width = max(0, w - 4)
@@ -1923,19 +2092,32 @@ def _draw_launcher(
                 win,
                 row_cursor,
                 2,
-                _pad_display(entry, entry_width),
+                _pad_display(entry_head + entry_tail, entry_width),
                 C.get("sel", curses.A_REVERSE),
             )
         else:
+            # 词头逐字符走渐变（Hub = 全部渠道的集合），说明文字退灰。
+            n = len(_logo_pairs) or 1
+            x = 2
+            for i, chx in enumerate(_truncate_display(entry_head, entry_width)):
+                _addstr(
+                    win,
+                    row_cursor,
+                    x,
+                    chx,
+                    _logo_pairs[i % n] | curses.A_BOLD,
+                )
+                x += _dwidth(chx)
+            tail_width = max(0, entry_width - _dwidth(entry_head))
             _addstr(
                 win,
                 row_cursor,
-                2,
-                _truncate_display(entry, entry_width),
-                C.get("orange", 0) | curses.A_BOLD,
+                x,
+                _truncate_display(entry_tail, tail_width),
+                C.get("dim", 0),
             )
         row_cursor += 2
-        _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
+        _draw_section_label(win, row_cursor, "单渠道直连", max(0, w - 4))
         row_cursor += 1
     list_top = row_cursor
     footer_row = max(0, h - 1)
@@ -1954,7 +2136,7 @@ def _draw_launcher(
         hidden = m.get("hidden")
         rank = i + 1
         selected = (not hub_focus) and (i == idx)
-        marker = "▸" if selected else " "
+        marker = "▌" if selected else " "
         label = f"{marker} {rank:>2}  {name}"
         status: list[str] = []
         if m.get("alias"):
@@ -1965,31 +2147,47 @@ def _draw_launcher(
             status.append("已隐藏")
         if model_summaries.get(name):
             status.append(f"模型 {model_summaries[name]}")
-        line = _compose_row(label, " · ".join(status), row_width)
         row = list_top + row_offset
         if selected:
+            line = _compose_row(label, " · ".join(status), row_width)
+            sel_attr = (
+                _row_sel_pairs[i % len(_row_sel_pairs)] | curses.A_BOLD
+                if _row_sel_pairs
+                else C.get("sel", curses.A_REVERSE)
+            )
             _addstr(
                 win,
                 row,
                 2,
                 _pad_display(line, row_width),
-                C.get("sel", curses.A_REVERSE),
+                sel_attr,
             )
         else:
-            row_attr = (
-                _row_pairs[i % len(_row_pairs)]
-                if _row_pairs
-                else C.get("base", 0)
+            # 分段绘制建立层级：rank 与 meta 退灰，渠道名沿色相环渐变。
+            left_part, right_part, gap = _compose_row_segments(
+                label, " · ".join(status), row_width
             )
-            attr = (
-                C.get("dim", 0)
-                if hidden
-                else row_attr | curses.A_BOLD
-            )
-            _addstr(win, row, 2, line, attr)
+            prefix, name_part = left_part[:6], left_part[6:]
+            if hidden:
+                name_attr = C.get("dim", 0)
+            elif _row_pairs:
+                name_attr = _row_pairs[i % len(_row_pairs)] | curses.A_BOLD
+            else:
+                name_attr = C.get("base", 0)
+            _addstr(win, row, 2, prefix, C.get("dim", 0))
+            _addstr(win, row, 8, name_part, name_attr)
+            if right_part:
+                _addstr(
+                    win,
+                    row,
+                    2 + _dwidth(left_part) + gap,
+                    right_part,
+                    C.get("dim", 0),
+                )
 
     if notice_row is not None:
         kind, text = notice if isinstance(notice, tuple) else ("warn", notice)
+        icon = {"ok": "✓", "error": "✗"}.get(kind, "!")
         notice_attr = {
             "ok": C.get("lime", 0),
             "error": C.get("error", 0),
@@ -1998,17 +2196,31 @@ def _draw_launcher(
             win,
             notice_row,
             2,
-            _truncate_display(text, max(0, w - 4)),
-            notice_attr | curses.A_BOLD,
+            _truncate_display(f"{icon} {text}", max(0, w - 4)),
+            notice_attr,
         )
     if help_open:
-        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · → 编辑模型 · Esc/q 退出 · ? 返回"
+        foot = [
+            ("a", "设置别名"),
+            ("x", "隐藏/显示"),
+            ("h", "隐藏项"),
+            ("→", "编辑模型"),
+            ("Esc/q", "退出"),
+            ("?", "返回"),
+        ]
     else:
         visible_range = ""
         if start > 0 or end < len(view):
             visible_range = f" · {start + 1}–{end}/{len(view)}"
-        foot = f"共 {len(view)} 个{visible_range} · ? 更多操作 · q 退出"
-    _addstr(win, footer_row, 2, foot, C.get("dim", 0))
+        foot = [
+            ("", f"共 {len(view)} 个{visible_range}"),
+            ("?", "更多操作"),
+            ("q", "退出"),
+        ]
+    if big:
+        _draw_bottom_rule(win, footer_row, foot)
+    else:
+        _draw_hints(win, footer_row, 2, foot)
     win.refresh()
 
 
@@ -2035,10 +2247,13 @@ def _draw_hub_workspace(
     """Render the second-level Hub model picker (类型 / 渠道 / 模型 / 状态)."""
     win.erase()
     h, w = win.getmaxyx()
-    _addstr(win, 0, 2, "Claude1  ›  Claude-Hub", C.get("dim", 0))
-    _addstr(win, 1, 2, "选择 Hub 模型", C.get("lime", 0) | curses.A_BOLD)
+    _draw_top_rule(win, 0)
+    _addstr(
+        win, 0, 3, " claude1 › Claude-Hub ", C.get("title", curses.A_BOLD)
+    )
+    _addstr(win, 1, 2, "选择 Hub 模型", C.get("title", curses.A_BOLD))
     if status.healthy is True:
-        badge, badge_attr = "● 已就绪", C.get("lime", 0) | curses.A_BOLD
+        badge, badge_attr = "● 已就绪", C.get("lime", 0)
     elif status.healthy is False:
         badge, badge_attr = "● 未就绪（选择后自动拉起）", C.get("warning", 0)
     else:
@@ -2059,7 +2274,7 @@ def _draw_hub_workspace(
     start, end = _visible_window(len(options), idx, capacity)
     for offset, i in enumerate(range(start, end)):
         option = options[i]
-        marker = "▸" if i == idx else " "
+        marker = "▌" if i == idx else " "
         text = _hub_row_text(
             (
                 f"{marker} {option.family}",
@@ -2080,9 +2295,17 @@ def _draw_hub_workspace(
             )
         else:
             family_color = _HUB_FAMILY_COLOR.get(option.family, "violet")
-            _addstr(win, row, 2, text, C.get(family_color, 0) | curses.A_BOLD)
-    foot = "Esc 返回 Claude1 · ↑↓ / jk 选择 · Enter 启动 · q 退出"
-    _addstr(win, footer_row, 2, foot, C.get("dim", 0))
+            _addstr(win, row, 2, text, C.get(family_color, 0))
+    _draw_bottom_rule(
+        win,
+        footer_row,
+        [
+            ("Esc", "返回 Claude1"),
+            ("↑↓/jk", "选择"),
+            ("Enter", "启动"),
+            ("q", "退出"),
+        ],
+    )
     win.refresh()
 
 
@@ -2153,7 +2376,7 @@ def _draw_model_editor(
         0,
         2,
         _truncate_display(f"Provider 模型 · {snapshot.provider_name}", usable),
-        C.get("pink", 0) | curses.A_BOLD,
+        C.get("title", curses.A_BOLD),
     )
     mode_attr = (
         C.get("warning", 0)
@@ -2453,10 +2676,11 @@ def _launcher_main(win, cfg, db_names):
         pass
     global C
     C = _init_colors()
-    mru = load_mru()
+    stats = load_use_stats()
+    mru = {name: entry["last"] for name, entry in stats.items()}
     meta = cfg["providers"]
     show_hidden = False
-    view = _build_view(cfg, db_names, mru, show_hidden)
+    view = _build_view(cfg, db_names, stats, show_hidden)
     idx = _initial_index(view, mru)
     hub_view = _load_hub_view()
     hub_status, hub_options = hub_view if hub_view is not None else (None, [])
@@ -2472,9 +2696,18 @@ def _launcher_main(win, cfg, db_names):
     rows, cols = win.getmaxyx()
     intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
     pending_key = _intro(win) if intro_animate else None
-    # The logo motion is a finite entrance, not a background task. Keep the
-    # finished logo visible while blocking indefinitely with zero timer wakeups.
-    win.timeout(-1)
+    # 待机呼吸是有窗口期的：交互后流动 IDLE_BREATH_SECONDS 秒，随后回到
+    # 零唤醒阻塞等键，直到下一次按键再苏醒 —— 界面活着，空闲不耗电。
+    breath_budget = _idle_breath_seconds()
+    breathing_alive = breath_budget > 0
+    phase = 0
+
+    def _arm_breath() -> float:
+        win.timeout(IDLE_FRAME_MS if breathing_alive else -1)
+        return time.monotonic() + breath_budget
+
+    breath_deadline = _arm_breath()
+    animating = breathing_alive
     _draw_launcher(
         win,
         cfg,
@@ -2483,6 +2716,8 @@ def _launcher_main(win, cfg, db_names):
         show_hidden,
         mru,
         show_brand=True,
+        logo_phase=phase,
+        logo_breathing=animating,
         hub_status=hub_status,
         hub_focus=hub_focus,
         model_summaries=model_summaries,
@@ -2491,8 +2726,25 @@ def _launcher_main(win, cfg, db_names):
         ch = pending_key if pending_key is not None else win.getch()
         pending_key = None
         if ch == -1:
-            # timeout(-1) returning -1 means the controlling terminal closed.
-            return None
+            if not animating:
+                # timeout(-1) returning -1 means the controlling terminal closed.
+                return None
+            if time.monotonic() >= breath_deadline:
+                animating = False
+                win.timeout(-1)
+                continue
+            # 呼吸帧：只补画 logo 与顶线，列表区一个字符都不重绘。
+            phase += 1
+            frame_rows, frame_cols = win.getmaxyx()
+            if _large_logo_supported(frame_rows, frame_cols):
+                _draw_top_rule(win, phase)
+            _draw_logo(win, phase, breathing=True)
+            win.refresh()
+            continue
+        # 真实按键：先恢复阻塞语义，让 Hub / 模型编辑 / 别名 / 确认等
+        # 子界面在无定时器的环境里运行。
+        if breathing_alive:
+            win.timeout(-1)
         notice = None
         direct_index = _digit_index(ch)
         if direct_index is not None:
@@ -2534,12 +2786,12 @@ def _launcher_main(win, cfg, db_names):
                     meta[name]["hidden"] = not nowh
                     save_config(cfg)
                     preferred = name
-                    view = _build_view(cfg, db_names, mru, show_hidden)
+                    view = _build_view(cfg, db_names, stats, show_hidden)
                     idx = _initial_index(view, mru, preferred)
         elif ch == ord("h"):  # 切换「显示隐藏项」
             preferred = view[idx] if view else None
             show_hidden = not show_hidden
-            view = _build_view(cfg, db_names, mru, show_hidden)
+            view = _build_view(cfg, db_names, stats, show_hidden)
             idx = _initial_index(view, mru, preferred)
         elif ch == ord("?"):
             help_open = not help_open
@@ -2576,10 +2828,15 @@ def _launcher_main(win, cfg, db_names):
             show_brand=True,
             help_open=help_open,
             notice=notice,
+            logo_phase=phase,
+            logo_breathing=breathing_alive,
             hub_status=hub_status,
             hub_focus=hub_focus,
             model_summaries=model_summaries,
         )
+        # 每次交互都重新点亮一段呼吸窗口。
+        breath_deadline = _arm_breath()
+        animating = breathing_alive
 
 
 def _launcher_session(win, cfg, db_names):
@@ -3222,11 +3479,7 @@ def cli_list_providers(show_all: bool = False) -> int:
     changed |= migrate_hidden(cfg)
     if changed:
         save_config(cfg)
-    names = [
-        name
-        for name, meta in cfg["providers"].items()
-        if name in by_name and (show_all or not meta.get("hidden"))
-    ]
+    names = _build_view(cfg, by_name, load_use_stats(), show_all)
     if not names:
         print("claude1: 没有可显示的 CC Switch Claude 渠道")
         return 1

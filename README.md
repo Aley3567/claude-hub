@@ -50,8 +50,9 @@ claude1
 ```
 
 使用 `↑↓` 或 `j/k` 移动，按 Enter 启动；前 10 项也可以用 `1–9` 和 `0`
-直接选择。列表会显示每个 Provider 的主模型摘要；最近使用的渠道会成为默认
-光标，但列表顺序和数字编号保持稳定。
+直接选择。列表会显示每个 Provider 的主模型摘要；前三项保持 CC Switch
+顺序和数字编号稳定，其余项按最近使用频率与时间衰减排序。最近使用的渠道仍会
+成为默认光标。
 
 选中普通 Provider 后按 `→` 可进入模型页。模型页默认是 `NORMAL`：
 
@@ -80,16 +81,17 @@ claude1 current                 # 本次使用 CC Switch 当前渠道
 claude1 any                     # 本次使用已有的 AnyRouter settings
 claude1 hub                     # 本次通过可选 claude-hub 启动
 claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
-claude1 list                    # 稳定顺序列出可见渠道
+claude1 list                    # 按与选择器一致的顺序列出可见渠道
 claude1 doctor                  # 本机只读检查，不连接 provider
 claude1 --help                  # 查看完整命令与快捷键
 CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 ```
 
-大 Logo 只在进入时流动并呼吸，最长 `240ms`；随后停在明亮静态帧，并在
-选择渠道期间保持显示。选择器阻塞等待按键，没有后台动画和定时唤醒；选中
-渠道时先清除界面，按 `q` 或 `Esc` 退出则清屏后只留下简短的 Bye 欢迎语。
-需要完全跳过开场动画时使用 `CLAUDE1_NO_ANIMATION=1`。
+大 Logo 的入场动画最长 `240ms`。入场和每次交互后会以约 `6.7fps` 继续低帧率
+呼吸，默认最多 `8s`，随后恢复零定时唤醒的阻塞等待；可用
+`CLAUDE1_BREATH_SECONDS=0` 只保留入场动画。选中渠道时先清除界面，按 `q`
+或 `Esc` 退出则清屏后只留下简短的 Bye 欢迎语。需要关闭全部动画时使用
+`CLAUDE1_NO_ANIMATION=1`。
 
 Provider 名称匹配不区分大小写；如果多个名称都匹配，会要求再次选择，避免
 静默走错渠道。别名不能与 `hub`、`list`、`doctor` 等保留命令冲突。

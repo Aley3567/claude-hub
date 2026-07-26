@@ -205,6 +205,66 @@ class TurnGuardTests(unittest.TestCase):
                 (state_dir / "watch.log").read_text(encoding="utf-8"),
             )
 
+    def test_tool_use_end_turn_is_released_as_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            state_dir = home / "guard-state"
+            transcript = home / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg_fixture_tool_use",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": "fixture reasoning",
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_fixture",
+                                    "name": "fixture_tool",
+                                    "input": {},
+                                },
+                            ],
+                            "stop_reason": "end_turn",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            hook_input = {
+                "transcript_path": str(transcript),
+                "stop_hook_active": False,
+                "last_assistant_message": "",
+            }
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "CLAUDE1_TURN_GUARD_STATE_DIR": str(state_dir),
+            }
+
+            result = subprocess.run(
+                [sys.executable, str(GUARD), "stop"],
+                input=json.dumps(hook_input),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # 含 tool_use 的 end_turn 是可用响应：不得 block、不得触发熔断。
+            self.assertEqual(result.stdout, "")
+            self.assertIn(
+                "LIVE_OK usable assistant response",
+                (state_dir / "watch.log").read_text(encoding="utf-8"),
+            )
+
     def test_malformed_transcript_is_released_without_logging_content(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)

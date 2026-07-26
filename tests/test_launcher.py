@@ -131,7 +131,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     )
                 )
 
-    def test_mru_sets_cursor_and_recent_badge_without_reordering(self) -> None:
+    def test_mru_sets_cursor_and_recent_badge_in_fixed_top_slots(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
@@ -148,9 +148,70 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     cfg, {"Alpha", "Beta", "Gamma"}, mru, False
                 )
 
+                # 前 FIXED_TOP_SLOTS 个渠道保持 CC Switch 顺序，不参与重排。
                 self.assertEqual(view, ["Alpha", "Beta", "Gamma"])
                 self.assertEqual(launcher._recent_name(view, mru), "Gamma")
                 self.assertEqual(launcher._initial_index(view, mru), 2)
+
+    def test_frecency_reorders_tail_but_keeps_top_three_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                names = ["A", "B", "C", "D", "E", "F"]
+                cfg = {"providers": {n: {"hidden": False} for n in names}}
+                now = time.time()
+                stats = {
+                    "A": {"last": now, "score": 9.0},  # 在固定区，分数再高也不动
+                    "E": {"last": now, "score": 2.0},
+                    "F": {"last": now, "score": 5.0},
+                }
+
+                view = launcher._build_view(cfg, set(names), stats, False)
+
+                self.assertEqual(view, ["A", "B", "C", "F", "E", "D"])
+
+    def test_frecency_score_halves_per_half_life_and_ties_keep_config_order(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                entry = {"last": 0.0, "score": 4.0}
+                self.assertAlmostEqual(
+                    launcher.frecency_score(
+                        entry, launcher.FRECENCY_HALF_LIFE_SECONDS
+                    ),
+                    2.0,
+                )
+                self.assertEqual(launcher.frecency_score(None, 0.0), 0.0)
+
+                names = ["A", "B", "C", "D", "E"]
+                cfg = {"providers": {n: {"hidden": False} for n in names}}
+                view = launcher._build_view(cfg, set(names), {}, False)
+                self.assertEqual(view, names)
+
+    def test_record_use_migrates_legacy_timestamps_and_accumulates_score(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            mru_path = Path(env["CLAUDE1_MRU_PATH"])
+            mru_path.parent.mkdir(parents=True, exist_ok=True)
+            mru_path.write_text(
+                json.dumps({"Legacy": 1000.0}), encoding="utf-8"
+            )
+
+            with loaded_launcher(env) as launcher:
+                with mock.patch("time.time", return_value=1000.0):
+                    launcher.record_use("Legacy")
+                    launcher.record_use("Legacy")
+
+                data = json.loads(mru_path.read_text(encoding="utf-8"))
+                self.assertEqual(data["Legacy"]["last"], 1000.0)
+                # 旧时间戳按 score=1.0 迁移，零衰减下两次使用累加到 3.0。
+                self.assertAlmostEqual(data["Legacy"]["score"], 3.0)
+                # load_mru 仍返回时间戳视图，光标与「最近」标签的老调用点不受影响。
+                self.assertEqual(launcher.load_mru(), {"Legacy": 1000.0})
 
     def test_alias_matching_and_casefolded_conflict_validation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -290,7 +351,6 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     "sel": 0,
                 }
                 launcher._logo_pairs[:] = [0]
-                launcher._row_pairs[:] = [0]
                 window = FakeWindow()
 
                 launcher._draw_launcher(
@@ -456,7 +516,10 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     selected = launcher._launcher_main(window, cfg, {"Alpha"})
 
                 self.assertIsNone(selected)
-                self.assertEqual(window.timeouts, [-1])
+                # 多色屏交互后先武装一段呼吸窗口，按键处理时回到阻塞语义。
+                self.assertEqual(
+                    window.timeouts, [launcher.IDLE_FRAME_MS, -1]
+                )
                 self.assertTrue(draw_launcher.call_args_list)
                 self.assertTrue(
                     all(
@@ -465,6 +528,101 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     )
                 )
                 draw_logo.assert_not_called()
+
+    def test_idle_breath_animates_then_falls_back_to_zero_wakeups(self) -> None:
+        class FakeWindow:
+            def __init__(self, keys: list[int]) -> None:
+                self.timeouts: list[int] = []
+                self.keys = keys
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 100)
+
+            def keypad(self, _value: bool) -> None:
+                return
+
+            def timeout(self, value: int) -> None:
+                self.timeouts.append(value)
+
+            def erase(self) -> None:
+                return
+
+            def addstr(self, *_args) -> None:
+                return
+
+            def refresh(self) -> None:
+                return
+
+            def getch(self) -> int:
+                return self.keys.pop(0)
+
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home), CLAUDE1_NO_ANIMATION="0")
+            with loaded_launcher(env) as launcher:
+                cfg = {"providers": {"Alpha": {"hidden": False}}}
+
+                # 窗口期内：-1 是呼吸帧，逐帧补画 logo，不改定时器。
+                window = FakeWindow([-1, -1, ord("q")])
+                launcher._logo_pairs[:] = [1, 2]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_top_rule"),
+                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"Alpha"})
+                    )
+                self.assertEqual(
+                    window.timeouts, [launcher.IDLE_FRAME_MS, -1]
+                )
+                self.assertEqual(draw_logo.call_count, 2)
+                self.assertTrue(
+                    all(
+                        call.kwargs.get("breathing") is True
+                        for call in draw_logo.call_args_list
+                    )
+                )
+
+                # 窗口到期：第一个 -1 关掉定时器，第二个 -1 视为终端关闭。
+                window = FakeWindow([-1, -1])
+                launcher._logo_pairs[:] = [1, 2]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "_draw_logo") as draw_logo,
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.dict(
+                        os.environ, {"CLAUDE1_BREATH_SECONDS": "0.000001"}
+                    ),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"Alpha"})
+                    )
+                self.assertEqual(
+                    window.timeouts, [launcher.IDLE_FRAME_MS, -1]
+                )
+                draw_logo.assert_not_called()
+
+                # CLAUDE1_BREATH_SECONDS=0 彻底关闭待机动画，保持零唤醒。
+                window = FakeWindow([ord("q")])
+                launcher._logo_pairs[:] = [1, 2]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.dict(
+                        os.environ, {"CLAUDE1_BREATH_SECONDS": "0"}
+                    ),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"Alpha"})
+                    )
+                self.assertEqual(window.timeouts, [-1])
 
     def test_launcher_session_always_clears_the_tui(self) -> None:
         window = mock.Mock()
