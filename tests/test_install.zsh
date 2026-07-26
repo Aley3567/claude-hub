@@ -5,10 +5,8 @@ set -eu
 typeset -r TEST_DIR="${0:A:h}"
 typeset -r REPO_ROOT="${TEST_DIR:h}"
 typeset -r INSTALLER="${REPO_ROOT}/install.sh"
-typeset -r SYSTEM_ZSH="$(whence -p zsh)"
 typeset -r SYSTEM_PYTHON="$(whence -p python3)"
-typeset -r SYSTEM_DIRNAME="$(whence -p dirname)"
-typeset -r TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/claude1-install.XXXXXX")"
+typeset -r TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/claude-hub-install.XXXXXX")"
 
 cleanup() {
   command rm -rf -- "$TEMP_ROOT"
@@ -27,213 +25,322 @@ pass() {
   print -- "ok ${PASSED} - $1"
 }
 
-assert_file_content() {
-  local expected="$1"
-  local file_path="$2"
-  [[ -f "$file_path" ]] || fail "missing file: $file_path"
-  [[ "$(<"$file_path")" == "$expected" ]] ||
-    fail "unexpected content in $file_path"
+write_fake_python() {
+  local target="$1"
+  command mkdir -p -- "${target:h}"
+  {
+    print -r -- '#!/bin/sh'
+    print -r -- 'set -eu'
+    print -r -- 'if { [ "${FAKE_PYTHON_TOO_OLD:-0}" = "1" ] || [ "${FAKE_OLD_COMMAND:-}" = "$0" ]; } && [ "${1:-}" = "-c" ]; then'
+    print -r -- '  exit 1'
+    print -r -- 'fi'
+    print -r -- 'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ]; then'
+    print -r -- '  shift 2'
+    print -r -- '  if [ "${1:-}" = "--version" ]; then'
+    print -r -- '    [ "${FAKE_PIP_AVAILABLE:-1}" = "1" ] || exit 1'
+    print -r -- '    [ "${FAKE_NO_PIP_COMMAND:-}" != "$0" ] || exit 1'
+    print -r -- '    printf "%s\n" "pip 99.0 from fake fixture"'
+    print -r -- '    exit 0'
+    print -r -- '  fi'
+    print -r -- '  [ "${FAKE_PIP_AVAILABLE:-1}" = "1" ] || exit 1'
+    print -r -- '  [ "${FAKE_NO_PIP_COMMAND:-}" != "$0" ] || exit 1'
+    print -r -- '  [ "${1:-}" = "install" ] || exit 91'
+    print -r -- '  : "${FAKE_PIP_LOG:?}"'
+    print -r -- '  {'
+    print -r -- '    printf "%s\n" "CALL"'
+    print -r -- '    for argument in "$@"; do'
+    print -r -- '      printf "ARG=%s\n" "$argument"'
+    print -r -- '    done'
+    print -r -- '    printf "%s\n" "END"'
+    print -r -- '  } >> "$FAKE_PIP_LOG"'
+    print -r -- '  exit 0'
+    print -r -- 'fi'
+    print -r -- "exec ${(q)SYSTEM_PYTHON} \"\$@\""
+  } > "$target"
+  command chmod 755 "$target"
 }
 
-write_command() {
-  local file_path="$1"
-  local body="${2:-exit 0}"
-  print -r -- '#!/bin/sh' > "$file_path"
-  print -r -- "$body" >> "$file_path"
-  command chmod 755 "$file_path"
-}
-
-make_home() {
+make_fixture() {
   local name="$1"
-  local home="${TEMP_ROOT}/${name}"
-  command mkdir -p -- "$home/bin" "$home/.cc-switch"
-  write_command "$home/bin/zsh" "exec ${(q)SYSTEM_ZSH} \"\$@\""
-  write_command "$home/bin/python3" "exec ${(q)SYSTEM_PYTHON} \"\$@\""
-  write_command "$home/bin/claude" 'printf "%s\n" "ordinary-claude"'
-  command touch "$home/.cc-switch/cc-switch.db"
-  print -r -- "$home"
+  local python_name="$2"
+  local root="${TEMP_ROOT}/${name}"
+  command mkdir -p -- "$root/bin" "$root/home"
+  write_fake_python "$root/bin/$python_name"
+  : > "$root/pip.log"
+  print -r -- "$root"
 }
 
 run_install() {
-  local home="$1"
+  local root="$1"
   shift
-  HOME="$home" \
-    CLAUDE1_INSTALL_ROOT="$home/install root" \
-    PATH="$home/bin:/usr/bin:/bin" \
-    /bin/sh "$INSTALLER" "$@"
+  (
+    unset HOME
+    PATH="$root/bin" \
+      FAKE_PIP_LOG="$root/pip.log" \
+      FAKE_PIP_AVAILABLE="${FAKE_PIP_AVAILABLE:-1}" \
+      FAKE_PYTHON_TOO_OLD="${FAKE_PYTHON_TOO_OLD:-0}" \
+      /bin/sh "$INSTALLER" "$@"
+  )
 }
 
-managed_line_count() {
-  local file_path="$1"
-  command grep -c '# claude1 managed source' "$file_path" 2>/dev/null || true
+assert_no_legacy_writes() {
+  local root="$1"
+  [[ ! -e "$root/home/.zshrc" ]] ||
+    fail "installer wrote .zshrc"
+  [[ ! -e "$root/home/.claude" ]] ||
+    fail "installer wrote the legacy Claude install tree"
+  [[ ! -e "$root/home/.cc-switch" ]] ||
+    fail "installer wrote CC Switch state"
+  [[ ! -e "$root/home/.config" ]] ||
+    fail "installer wrote settings under HOME"
 }
 
-test_first_install_is_safe() {
-  local home="$(make_home first)"
-  print -r -- 'claude() { print -- "kept-claude"; }' > "$home/.zshrc"
+expected_call() {
+  local package_spec="$1"
+  print -r -- "CALL"
+  print -r -- "ARG=install"
+  print -r -- "ARG=--upgrade"
+  print -r -- "ARG=$package_spec"
+  print -r -- "END"
+}
 
-  local output
-  output="$(run_install "$home" 2>&1)"
+assert_success_output() {
+  local output="$1"
+  local python_path="$2"
+  local package_spec="$3"
+  local expected_command
+  expected_command="$(
+    "$SYSTEM_PYTHON" - "$python_path" "$package_spec" <<'PY'
+import shlex
+import sys
 
-  command cmp -s "$REPO_ROOT/claude-provider-once.py" \
-    "$home/install root/scripts/claude-provider-once.py" ||
-    fail "launcher was not installed"
-  command cmp -s "$REPO_ROOT/claude-hub.py" \
-    "$home/install root/scripts/claude-hub.py" ||
-    fail "hub was not installed"
-  command cmp -s "$REPO_ROOT/claude1_protocol.py" \
-    "$home/install root/scripts/claude1_protocol.py" ||
-    fail "protocol bridge was not installed"
-  command cmp -s "$REPO_ROOT/claude1_provider.py" \
-    "$home/install root/scripts/claude1_provider.py" ||
-    fail "provider policy was not installed"
-  command cmp -s "$REPO_ROOT/claude1-turn-guard.py" \
-    "$home/install root/scripts/claude1-turn-guard.py" ||
-    fail "turn guard was not installed"
-  command cmp -s "$REPO_ROOT/zsh-functions.sh" \
-    "$home/install root/claude1/zsh-functions.sh" ||
-    fail "safe shell integration was not installed"
-  [[ "$(managed_line_count "$home/.zshrc")" == "1" ]] ||
-    fail "managed source line was not added exactly once"
-  [[ "$(<"$home/.zshrc")" != *"zsh-sticky-integration"* ]] ||
-    fail "installer enabled sticky integration"
-  [[ ! -e "$home/install root/claude1/zsh-sticky-integration.sh" ]] ||
-    fail "installer copied sticky integration"
-  [[ "$output" == *"未找到 uv"* ]] ||
-    fail "missing uv warning was not shown"
-  HOME="$home" "$SYSTEM_PYTHON" \
-    "$home/install root/scripts/claude-provider-once.py" --help \
-    >/dev/null ||
-    fail "installed launcher cannot import the protocol bridge"
-
-  local shell_output
-  shell_output="$(
-    HOME="$home" PATH="$home/bin:/usr/bin:/bin" "$SYSTEM_ZSH" -f -c '
-      source "$HOME/.zshrc"
-      (( ${+functions[claude1]} )) || exit 20
-      claude
-    '
+print(
+    shlex.join(
+        [
+            sys.argv[1],
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            sys.argv[2],
+        ]
+    )
+)
+PY
   )"
-  [[ "$shell_output" == "kept-claude" ]] ||
-    fail "ordinary claude function was replaced"
 
-  pass "first install adds only the safe claude1 integration"
+  [[ "$output" == *"[claude-hub] 执行: $expected_command"* ]] ||
+    fail "installer did not print the exact safely quoted pip command"
+  [[ "$output" == *$'  claude-hub\n  claude1\n  switchctl'* ]] ||
+    fail "installer did not print all installed entry points"
 }
 
-test_repeated_install_is_idempotent() {
-  local home="$(make_home repeat)"
-  print -r -- '# user config' > "$home/.zshrc"
+test_macos_fresh_install_uses_python3_and_core_package() {
+  local root="$(make_fixture "macOS fixture's fresh install" python3)"
+  local output
+  output="$(run_install "$root" 2>&1)"
 
-  run_install "$home" >/dev/null 2>&1
-  local before_zshrc="$(<"$home/.zshrc")"
-  local -a before_backups=("$home/install root/backups"/*(N))
+  [[ "$(<"$root/pip.log")" == "$(expected_call claude-hub-kit)" ]] ||
+    fail "fresh macOS fixture did not use the direct core pip spec"
+  assert_success_output "$output" "$root/bin/python3" "claude-hub-kit"
+  assert_no_legacy_writes "$root"
 
-  run_install "$home" >/dev/null 2>&1
-  local -a after_backups=("$home/install root/backups"/*(N))
-
-  [[ "$(<"$home/.zshrc")" == "$before_zshrc" ]] ||
-    fail "second install changed .zshrc"
-  [[ "$(managed_line_count "$home/.zshrc")" == "1" ]] ||
-    fail "second install duplicated managed source line"
-  [[ ${#after_backups} -eq ${#before_backups} ]] ||
-    fail "unchanged reinstall created another backup"
-
-  pass "repeated install is idempotent"
+  pass "macOS fixture performs a core pip install without HOME"
 }
 
-test_existing_files_are_backed_up() {
-  local home="$(make_home backup)"
-  command mkdir -p -- "$home/install root/scripts" "$home/install root/claude1"
-  print -r -- 'old launcher' > "$home/install root/scripts/claude-provider-once.py"
-  print -r -- 'old hub' > "$home/install root/scripts/claude-hub.py"
-  print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
-  print -r -- 'old provider policy' > "$home/install root/scripts/claude1_provider.py"
-  print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
-  command mkdir -p -- "$home/dotfiles"
-  print -r -- 'old zshrc' > "$home/dotfiles/zshrc"
-  command ln -s "$home/dotfiles/zshrc" "$home/.zshrc"
+test_linux_repeated_run_keeps_upgrade_semantics() {
+  local root="$(make_fixture linux-repeat python)"
 
-  run_install "$home" >/dev/null 2>&1
+  run_install "$root" >/dev/null 2>&1
+  run_install "$root" >/dev/null 2>&1
 
-  [[ -L "$home/.zshrc" ]] || fail "installer replaced the .zshrc symlink"
-  local -a backups=("$home/install root/backups"/*(N/))
-  [[ ${#backups} -eq 1 ]] || fail "expected one backup directory"
-  local backup="${backups[1]}"
-  assert_file_content "old launcher" "$backup/claude-provider-once.py"
-  assert_file_content "old hub" "$backup/claude-hub.py"
-  assert_file_content "old protocol" "$backup/claude1_protocol.py"
-  assert_file_content "old provider policy" "$backup/claude1_provider.py"
-  assert_file_content "old shell" "$backup/zsh-functions.sh"
-  assert_file_content "old zshrc" "$backup/zshrc"
+  local expected="$(expected_call claude-hub-kit)"
+  [[ "$(<"$root/pip.log")" == "${expected}"$'\n'"${expected}" ]] ||
+    fail "repeated Linux fixture did not make two identical upgrade calls"
+  assert_no_legacy_writes "$root"
 
-  pass "existing targets and .zshrc are backed up before replacement"
+  pass "Linux fresh and repeated runs both use pip --upgrade"
 }
 
-make_dependency_path() {
-  local home="$1"
-  shift
-  local bin_path="$home/dependency-bin"
-  command mkdir -p -- "$bin_path"
-  command ln -s "$SYSTEM_DIRNAME" "$bin_path/dirname"
-  local name
-  for name in "$@"; do
-    write_command "$bin_path/$name"
-  done
-  print -r -- "$bin_path"
+test_desktop_installs_only_the_desktop_extra() {
+  local root="$(make_fixture desktop python3)"
+  local output
+  output="$(run_install "$root" --desktop 2>&1)"
+
+  [[ "$(<"$root/pip.log")" == "$(expected_call 'claude-hub-kit[desktop]')" ]] ||
+    fail "--desktop did not install the desktop extra"
+  assert_success_output \
+    "$output" "$root/bin/python3" "claude-hub-kit[desktop]"
+  assert_no_legacy_writes "$root"
+
+  pass "--desktop maps to the published desktop extra"
 }
 
-assert_missing_dependency() {
-  local label="$1"
-  local expected="$2"
-  local home="$3"
-  local bin_path="$4"
+test_missing_python_fails_before_pip() {
+  local root="${TEMP_ROOT}/missing-python"
+  command mkdir -p -- "$root/bin" "$root/home"
+  : > "$root/pip.log"
+  local output exit_code
+
+  set +e
+  output="$(run_install "$root" 2>&1)"
+  exit_code=$?
+  set -e
+
+  [[ $exit_code -eq 1 ]] || fail "missing Python should exit 1"
+  [[ "$output" == *"找不到 Python 3.11"* ]] ||
+    fail "missing Python error is not actionable"
+  [[ ! -s "$root/pip.log" ]] || fail "missing Python reached pip"
+  assert_no_legacy_writes "$root"
+
+  pass "missing Python fails before pip or configuration access"
+}
+
+test_missing_pip_fails_before_install() {
+  local root="$(make_fixture missing-pip python3)"
   local output exit_code
 
   set +e
   output="$(
-    HOME="$home" CLAUDE1_INSTALL_ROOT="$home/install" PATH="$bin_path" \
-      /bin/sh "$INSTALLER" 2>&1
+    FAKE_PIP_AVAILABLE=0 run_install "$root" 2>&1
   )"
   exit_code=$?
   set -e
 
-  [[ $exit_code -ne 0 ]] || fail "$label should fail installation"
-  [[ "$output" == *"$expected"* ]] ||
-    fail "$label error did not explain the missing dependency"
+  [[ $exit_code -eq 1 ]] || fail "missing pip should exit 1"
+  [[ "$output" == *"均没有 pip"* ]] ||
+    fail "missing pip error is not actionable"
+  [[ ! -s "$root/pip.log" ]] || fail "missing pip attempted installation"
+  assert_no_legacy_writes "$root"
+
+  pass "missing pip fails before installation"
 }
 
-test_missing_dependencies_are_clear() {
-  local home_zsh="${TEMP_ROOT}/missing-zsh"
-  command mkdir -p -- "$home_zsh/.cc-switch"
-  command touch "$home_zsh/.cc-switch/cc-switch.db"
-  local path_zsh="$(make_dependency_path "$home_zsh" python3 claude)"
-  assert_missing_dependency "missing zsh" "找不到 zsh" "$home_zsh" "$path_zsh"
+test_old_python_is_skipped_for_a_compatible_fallback() {
+  local root="${TEMP_ROOT}/python-fallback"
+  command mkdir -p -- "$root/bin" "$root/home"
+  write_fake_python "$root/bin/python3"
+  write_fake_python "$root/bin/python"
+  : > "$root/pip.log"
 
-  local home_python="${TEMP_ROOT}/missing-python"
-  command mkdir -p -- "$home_python/.cc-switch"
-  command touch "$home_python/.cc-switch/cc-switch.db"
-  local path_python="$(make_dependency_path "$home_python" zsh claude)"
-  assert_missing_dependency "missing Python" "找不到 python3" "$home_python" "$path_python"
+  local output
+  output="$(
+    (
+      unset HOME
+      PATH="$root/bin" \
+        FAKE_PIP_LOG="$root/pip.log" \
+        FAKE_PIP_AVAILABLE=1 \
+        FAKE_PYTHON_TOO_OLD=0 \
+        FAKE_OLD_COMMAND="$root/bin/python3" \
+        /bin/sh "$INSTALLER"
+    ) 2>&1
+  )"
 
-  local home_claude="${TEMP_ROOT}/missing-claude"
-  command mkdir -p -- "$home_claude/.cc-switch"
-  command touch "$home_claude/.cc-switch/cc-switch.db"
-  local path_claude="$(make_dependency_path "$home_claude" zsh python3)"
-  assert_missing_dependency "missing Claude Code" "找不到 claude" \
-    "$home_claude" "$path_claude"
+  [[ "$(<"$root/pip.log")" == "$(expected_call claude-hub-kit)" ]] ||
+    fail "compatible fallback did not invoke pip"
+  [[ "$output" == *"$root/bin/python -m pip install --upgrade claude-hub-kit"* ]] ||
+    fail "installer did not skip the incompatible python3 fixture"
 
-  local home_db="${TEMP_ROOT}/missing-db"
-  command mkdir -p -- "$home_db"
-  local path_db="$(make_dependency_path "$home_db" zsh python3 claude)"
-  assert_missing_dependency "missing CC Switch DB" "CC Switch 数据库" \
-    "$home_db" "$path_db"
-
-  pass "missing hard dependencies have actionable errors"
+  pass "compatible Python selection is deterministic"
 }
 
-test_first_install_is_safe
-test_repeated_install_is_idempotent
-test_existing_files_are_backed_up
-test_missing_dependencies_are_clear
+test_python_without_pip_is_skipped_for_a_working_pair() {
+  local root="${TEMP_ROOT}/pip-fallback"
+  command mkdir -p -- "$root/bin" "$root/home"
+  write_fake_python "$root/bin/python3"
+  write_fake_python "$root/bin/python"
+  : > "$root/pip.log"
+
+  local output
+  output="$(
+    (
+      unset HOME
+      PATH="$root/bin" \
+        FAKE_PIP_LOG="$root/pip.log" \
+        FAKE_PIP_AVAILABLE=1 \
+        FAKE_PYTHON_TOO_OLD=0 \
+        FAKE_NO_PIP_COMMAND="$root/bin/python3" \
+        /bin/sh "$INSTALLER"
+    ) 2>&1
+  )"
+
+  [[ "$(<"$root/pip.log")" == "$(expected_call claude-hub-kit)" ]] ||
+    fail "Python/pip fallback did not invoke fake pip"
+  [[ "$output" == *"$root/bin/python -m pip install --upgrade claude-hub-kit"* ]] ||
+    fail "installer did not select the Python with working pip"
+
+  pass "Python discovery selects a compatible interpreter/pip pair"
+}
+
+test_existing_legacy_configuration_is_untouched() {
+  local root="$(make_fixture existing-config python3)"
+  command mkdir -p -- \
+    "$root/home/.cc-switch" \
+    "$root/home/.claude" \
+    "$root/home/.config/claude-hub"
+  print -r -- "fixture zsh config" > "$root/home/.zshrc"
+  print -r -- "fixture database placeholder" \
+    > "$root/home/.cc-switch/cc-switch.db"
+  print -r -- '{"fixture":"claude-settings-placeholder"}' \
+    > "$root/home/.claude/settings.json"
+  print -r -- '{"fixture":"provider-profile-placeholder"}' \
+    > "$root/home/.config/claude-hub/profiles.json"
+
+  local before_tree
+  before_tree="$(
+    command find "$root/home" -type f -print -exec cksum {} \; |
+      LC_ALL=C command sort
+  )"
+
+  HOME="$root/home" \
+    PATH="$root/bin" \
+    FAKE_PIP_LOG="$root/pip.log" \
+    FAKE_PIP_AVAILABLE=1 \
+    FAKE_PYTHON_TOO_OLD=0 \
+    /bin/sh "$INSTALLER" >/dev/null 2>&1
+
+  local after_tree
+  after_tree="$(
+    command find "$root/home" -type f -print -exec cksum {} \; |
+      LC_ALL=C command sort
+  )"
+  [[ "$after_tree" == "$before_tree" ]] ||
+    fail "installer modified or created legacy configuration"
+  [[ "$(<"$root/pip.log")" == "$(expected_call claude-hub-kit)" ]] ||
+    fail "configuration fixture did not reach fake pip"
+
+  pass "existing Provider, Claude, shell, and profile files stay untouched"
+}
+
+test_unknown_argument_is_usage_error_without_pip() {
+  local root="$(make_fixture unknown-argument python3)"
+  local output exit_code
+  local private_argument="fixture-private-argument"
+
+  set +e
+  output="$(run_install "$root" "$private_argument" 2>&1)"
+  exit_code=$?
+  set -e
+
+  [[ $exit_code -eq 2 ]] || fail "unknown argument should exit 2"
+  [[ "$output" == *"未知参数。"* ]] ||
+    fail "unknown argument error is unclear"
+  [[ "$output" != *"$private_argument"* ]] ||
+    fail "unknown argument was echoed"
+  [[ ! -s "$root/pip.log" ]] || fail "unknown argument reached pip"
+  assert_no_legacy_writes "$root"
+
+  pass "unknown arguments fail closed without pip"
+}
+
+test_macos_fresh_install_uses_python3_and_core_package
+test_linux_repeated_run_keeps_upgrade_semantics
+test_desktop_installs_only_the_desktop_extra
+test_missing_python_fails_before_pip
+test_missing_pip_fails_before_install
+test_old_python_is_skipped_for_a_compatible_fallback
+test_python_without_pip_is_skipped_for_a_working_pair
+test_existing_legacy_configuration_is_untouched
+test_unknown_argument_is_usage_error_without_pip
 
 print -- "1..${PASSED}"

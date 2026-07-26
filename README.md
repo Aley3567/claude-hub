@@ -8,40 +8,29 @@ Claude Code 会话里沿用原生 `/model` 切换渠道和模型。
 [维护与兼容指南](docs/维护与兼容指南.md)。提交和推送前建议先运行
 `./scripts/install-git-guards.sh`，启用凭证、私有渠道名和本机配置拦截。
 
-默认安装只新增 `claude1` 和 `claude1-direct` 两个 zsh 函数，不会替换普通
-`claude`。
+默认安装提供 `claude-hub`、`claude1` 和 `switchctl` 三个 Python 包入口，
+不会改写普通 `claude`、shell 配置或本机 Provider 配置。
 
 ## 第一次使用：3 步完成
 
 ### 1. 准备依赖
 
-安装并确认以下组件可用：
-
-- zsh；
-- Python 3.11 或更高版本；
-- Claude Code CLI，终端中可以运行 `claude`；
-- CC Switch，至少配置一个 Claude provider，并已生成
-  `~/.cc-switch/cc-switch.db`。
-
-`claude-hub` 是可选功能。需要会话内 `/model` 切换时再安装
-[uv](https://docs.astral.sh/uv/)；没有 uv 不影响普通的 provider 选择。
+安装器只要求 Python 3.11 或更高版本，以及该 Python 可用的 pip。安装时不要求
+HOME、zsh、Claude Code 或 CC Switch，也不会读取它们的配置。
 
 ### 2. 安装
 
 ```bash
-git clone https://github.com/Aley3567/claude1.git
-cd claude1
+git clone https://github.com/Aley3567/claude-hub.git
+cd claude-hub
 ./install.sh
-source ~/.zshrc
 ```
 
-安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
-`~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub、共享协议桥、Provider capability/隔离策略和可选
-Turn Guard 五份 Python 文件。已有目标文件和
-`~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
-行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
-与凭证。
+这等价于用检测到的 Python 执行
+`python -m pip install --upgrade claude-hub-kit`。再次运行会升级现有安装；
+需要桌面依赖时显式运行 `./install.sh --desktop`，安装
+`claude-hub-kit[desktop]`。安装器会在执行前显示经过 shell 安全引用的准确
+命令。
 
 ### 3. 选择渠道
 
@@ -231,33 +220,11 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
 会在请求发生时从 CC Switch DB 只读获取对应 provider 的凭证，不修改 DB、
 provider 或 current 状态。
 
-## 安装位置与备份
+## 安装位置
 
-默认位置：
-
-```text
-~/.claude/
-├── scripts/
-│   ├── claude-provider-once.py
-│   ├── claude-hub.py
-│   ├── claude1_protocol.py
-│   ├── claude1_provider.py
-│   └── claude1-turn-guard.py
-├── claude1/
-│   └── zsh-functions.sh
-└── backups/
-    └── <时间>-<进程号>/
-```
-
-隔离测试或自定义安装位置时可以显式注入目录：
-
-```bash
-HOME=/tmp/claude1-home \
-CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
-./install.sh
-```
-
-安装器始终从 `$HOME/.cc-switch/cc-switch.db` 检查 CC Switch 是否已经就绪。
+包与三个命令入口的安装位置由所选 Python/pip 环境决定，与直接运行
+`python -m pip install --upgrade claude-hub-kit` 一致。`install.sh` 不建立
+独立安装目录、不备份或改写 HOME，也不检查 CC Switch。
 
 ## 项目结构
 
@@ -271,7 +238,7 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |
-| `install.sh` | 幂等安装与改写前备份 |
+| `install.sh` | 核心包与显式 desktop extra 的 pip 兼容包装器 |
 | `tests/` | launcher、Hub、shell 与安装器的隔离测试 |
 | `docs/product-research.md` | 产品边界、同类产品研究与验收合同 |
 | `docs/release-verification.md` | 0.1.0 的测试、实机隔离与发布验证记录 |
