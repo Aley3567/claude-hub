@@ -11,6 +11,9 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
     strategy:
       # Report every OS/Python result instead of cancelling sibling jobs.
       fail-fast: false
