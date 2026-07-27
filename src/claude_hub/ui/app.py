@@ -209,7 +209,12 @@ class ClaudeHubTUI:
         # Find currently selected (current marker or MRU)
         selected_id = next((p.provider_id for p in providers if p.is_current), None)
         
-        self.provider_list = ProviderListWidget(providers, inspections, selected_id)
+        # Enable single-channel mode when only one provider is available
+        single_mode = len(providers) == 1
+        
+        self.provider_list = ProviderListWidget(
+            providers, inspections, selected_id, single_mode=single_mode
+        )
         self.current_state = "selecting"
     
     def show_model_editor(self, provider_id: str) -> None:

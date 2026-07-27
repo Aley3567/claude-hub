@@ -168,22 +168,6 @@ class LogoAnimator:
         """Get last frame update time for performance monitoring."""
         return self._last_update_time
     
-    def should_stop(self) -> bool:
-        """Check if animation should stop.
-        
-        Returns:
-            True if animation is complete or interrupted
-        """
-        return not self.is_running or self.user_interrupted
-    
     def interrupt(self) -> None:
         """User pressed a key - stop animation immediately."""
         self.user_interrupted = True
-    
-    def get_elapsed_percentage(self) -> float:
-        """Return animation progress as percentage (0.0 to 1.0)."""
-        if not self.start_time:
-            return 0.0
-        
-        elapsed_ms = (time.monotonic() - self.start_time) * 1000
-        return min(elapsed_ms / self.MAX_ANIMATION_DURATION_MS, 1.0)
