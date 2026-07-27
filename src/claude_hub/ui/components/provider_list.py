@@ -15,20 +15,27 @@ class ProviderListWidget(Widget):
     def __init__(self, 
                  providers: tuple[ProviderRef, ...],
                  inspections: dict[str, ProviderInspection],
-                 selected_provider_id: str | None = None):
+                 selected_provider_id: str | None = None,
+                 single_mode: bool = False):  # NEW: Single channel direct mode
         """Initialize provider list.
         
         Args:
             providers: All available providers
             inspections: Mapping of provider_id -> inspection data
             selected_provider_id: Currently selected (cursor) provider
+            single_mode: If True, show left arrow for single-channel direct connect
         """
         self.providers = list(providers)
         self.inspections = inspections
-        self.selected_index = 0 if selected_provider_id is None else max(
-            0, next((i for i, p in enumerate(providers) 
-                    if p.provider_id == selected_provider_id), 0)
-        )
+        self.single_mode = len(providers) == 1  # Auto-detect single mode
+        if single_mode:
+            self.single_mode = True
+            self.selected_index = 0
+        else:
+            self.selected_index = 0 if selected_provider_id is None else max(
+                0, next((i for i, p in enumerate(providers) 
+                        if p.provider_id == selected_provider_id), 0)
+            )
         self.scroll_offset = 0
         self.focus = False
         self.max_display_rows = 10
@@ -64,25 +71,35 @@ class ProviderListWidget(Widget):
                     first_model = next(iter(models_dict.values()))
                     models_str = f" • {first_model[:20]}"
             
-            prefix = "▸ " if is_selected else "  "
-            
-            if is_selected:
-                line = f"{prefix}{display_idx}  {provider.display_name or provider.provider_id:<34}{models_str}"
+            # Build line based on mode
+            if self.single_mode:
+                # SINGLE CHANNEL: LEFT ARROW direct connect (no number)
+                left_arrow = "◀"
+                line = f"{left_arrow}  {provider.display_name or provider.provider_id:<45}{models_str}"
             else:
-                line = f"{prefix}{display_idx}  {provider.display_name or provider.provider_id:<34}"
+                # MULTI CHANNEL: NUMBERED LIST with selection
+                prefix = "▸ " if is_selected else "  "
+                line = f"{prefix}{display_idx}  {provider.display_name or provider.provider_id:<34}{models_str}"
             
             # Truncate if too long
             line = line[:76]
             lines.append(line.ljust(78) + "│")
-        
-        # Footer with stats
-        total = len(self.providers)
-        footer_lines = [
-            f"共{total}个 • ?更多操作 · q退出",
-            "",
-            "↑↓/j k 移动  ·  Enter启动  · 数字直达",
-        ]
-        
+                
+        # Footer based on mode
+        if self.single_mode:
+            footer_lines = [
+                "单渠道直连模式",
+                "",
+                "Enter 直连启动 · q 退出",
+            ]
+        else:
+            total = len(self.providers)
+            footer_lines = [
+                f"共{total}个 • ?更多操作 · q 退出",
+                "",
+                "↑↓/j k 移动  ·  Enter 启动  · 数字直达",
+            ]
+                
         lines.extend(f"└{line:^76}┘" for line in footer_lines)
         lines[-1] = "└" + lines[-1][1:-1] + "┘"
         

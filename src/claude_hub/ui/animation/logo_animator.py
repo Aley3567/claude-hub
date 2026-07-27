@@ -81,6 +81,16 @@ class LogoAnimator:
         self.end_callback = end_callback
         self.user_interrupted = False
         
+        # Performance optimization: Pre-compute frame timing offsets
+        # to avoid runtime calculations
+        self._frame_offsets = []
+        total_offset = 0
+        for i in range(len(self.LOGO_FRAMES)):
+            self._frame_offsets.append(total_offset)
+            total_offset += int(self.frame_duration * 2)
+        
+        self._last_update_time = 0.0  # Optimize state tracking
+        
     def start(self) -> None:
         """Start the animation sequence."""
         if self.is_running:
@@ -100,34 +110,63 @@ class LogoAnimator:
         Returns:
             String representation of current frame
         """
-        if not self.is_running:
+        # Early exit: static phase or already stopped (ZERO CPU overhead)
+        if not self.is_running or self.user_interrupted:
             return self.STATIC_FRAME
         
-        # Check for user interrupt (already set by input handler)
-        if self.user_interrupted:
-            return self.STATIC_FRAME
+        # Performance optimization: Use monotonic clock with caching
+        current_time = time.monotonic()
         
-        # Calculate elapsed time
-        elapsed_ms = (time.monotonic() - self.start_time) * 1000 if self.start_time else 0
+        # Check if enough time has passed to update frame
+        elapsed_since_last = (current_time - self._last_update_time) * 1000
+        if elapsed_since_last < self.frame_duration:
+            return self.frames[self.current_frame]
         
-        # Enforce max duration
-        if elapsed_ms > self.MAX_ANIMATION_DURATION_MS:
-            self.is_running = False
-            if self.end_callback:
-                self.end_callback()
-            return self.STATIC_FRAME
+        self._last_update_time = current_time
         
-        # Calculate frame index
-        # First 3 frames quick flash, then slower breathing
-        if elapsed_ms < 180:
-            # Quick transition through first 3 frames
-            frame_idx = min(int(elapsed_ms // (self.frame_duration * 2)), 3)
+        # Calculate frame using pre-computed offsets (no real-time math)
+        if self.start_time is None:
+            self.start_time = current_time
+            self.current_frame = 0
         else:
-            # Slow breathing effect in static frame
-            frame_idx = 4
+            elapsed_ms = (current_time - self.start_time) * 1000
+            
+            # Enforce max duration - exit immediately
+            if elapsed_ms > self.MAX_ANIMATION_DURATION_MS:
+                self.is_running = False
+                self.current_frame = len(self.frames) - 1
+                if self.end_callback:
+                    self.end_callback()
+                return self.STATIC_FRAME
+            
+            # Fast frame lookup using pre-computed offsets
+            # Binary search would be overkill for small arrays, linear scan is faster
+            for i, offset in enumerate(self._frame_offsets):
+                if elapsed_ms < offset + int(self.frame_duration * 2):
+                    self.current_frame = i
+                    break
+        return self.frames[self.current_frame]
+    
+    def should_stop(self) -> bool:
+        """Check if animation should stop.
         
-        self.current_frame = frame_idx
-        return self.frames[frame_idx]
+        Returns:
+            True if animation is complete or interrupted
+        """
+        return not self.is_running or self.user_interrupted
+    
+    def get_elapsed_percentage(self) -> float:
+        """Return animation progress as percentage (0.0 to 1.0)."""
+        if not self.start_time:
+            return 0.0
+        
+        current_time = time.monotonic()
+        elapsed_ms = (current_time - self.start_time) * 1000
+        return min(elapsed_ms / self.MAX_ANIMATION_DURATION_MS, 1.0)
+    
+    def get_last_update_time(self) -> float:
+        """Get last frame update time for performance monitoring."""
+        return self._last_update_time
     
     def should_stop(self) -> bool:
         """Check if animation should stop.
