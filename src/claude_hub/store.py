@@ -1,7 +1,7 @@
 """Provider storage boundary.
 
-Concrete adapters may read CC Switch or a standalone profile store in later
-tracer bullets.  Presentation layers depend only on this protocol.
+Concrete adapters may read CC Switch or a standalone profile store.
+Presentation layers depend only on this protocol.
 """
 
 from __future__ import annotations
@@ -19,6 +19,14 @@ class ProviderNotFoundError(ProviderStoreError):
     """Raised when a stable provider reference is unknown to the store."""
 
 
+class ProviderStoreUnavailableError(ProviderStoreError):
+    """Raised when a provider store is not safely readable."""
+
+
+class ProviderConfigCorruptError(ProviderStoreError):
+    """Raised when a provider's configuration is not valid JSON."""
+
+
 @runtime_checkable
 class ProviderStore(Protocol):
     """Minimal read-only store contract for the first tracer bullet."""
@@ -34,7 +42,9 @@ class ProviderStore(Protocol):
 
 
 __all__ = [
+    "ProviderConfigCorruptError",
     "ProviderNotFoundError",
     "ProviderStore",
     "ProviderStoreError",
+    "ProviderStoreUnavailableError",
 ]

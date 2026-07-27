@@ -28,7 +28,11 @@ from claude_hub.testing import InMemoryProviderStore  # noqa: E402
 
 class CoreContractTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.reference = ProviderRef(store="memory", provider_id="provider-01")
+        self.reference = ProviderRef(
+            store="memory",
+            provider_id="provider-01",
+            is_current=True,
+        )
         self.models = ModelMapping(
             default="model-default",
             fast="model-fast",
@@ -128,7 +132,10 @@ class CoreContractTests(unittest.TestCase):
         )
         for dto_type in (ProviderRef, ModelMapping, ProviderInspection):
             with self.subTest(dto=dto_type.__name__):
-                field_names = {field.name.casefold() for field in dataclasses.fields(dto_type)}
+                field_names = {
+                    field.name.casefold()
+                    for field in dataclasses.fields(dto_type)
+                }
                 for field_name in field_names:
                     self.assertFalse(
                         any(fragment in field_name for fragment in forbidden_fragments)
@@ -146,6 +153,43 @@ class CoreContractTests(unittest.TestCase):
         self.assertNotIn("model-default", representation)
         self.assertNotIn("provider-01", representation)
         self.assertIn("<redacted>", representation)
+
+    def test_absolute_paths_cannot_enter_public_identifiers(self) -> None:
+        for private_path in (
+            "/private/fixture/provider",
+            r"C:\private\fixture\provider",
+            r"\\fixture-host\private\provider",
+        ):
+            with self.subTest(style=private_path[:2]):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "not a public identifier",
+                ):
+                    ProviderRef(
+                        store="memory",
+                        provider_id=private_path,
+                    )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "not a public identifier",
+                ):
+                    ModelMapping(default=private_path)
+
+    def test_inspection_rejects_conflicting_current_markers(self) -> None:
+        reference = ProviderRef(
+            store="memory",
+            provider_id="fixture-provider",
+            is_current=False,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "^reference and inspection current markers must match$",
+        ):
+            ProviderInspection(
+                reference=reference,
+                is_current=True,
+            )
 
     def test_capability_properties_do_not_grant_unknown_schema_write(self) -> None:
         for capability in (
