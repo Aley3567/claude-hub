@@ -390,6 +390,8 @@ def _read_provider_rows(path: Path) -> dict:
             row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()
         }
         selected = ["name", "settings_config"]
+        if "id" in columns:
+            selected.insert(0, "id")
         selected.extend(
             column for column in ("meta", "provider_type") if column in columns
         )
@@ -397,10 +399,11 @@ def _read_provider_rows(path: Path) -> dict:
             f"SELECT {', '.join(selected)} FROM providers "
             "WHERE app_type='claude'"
         )
-        rows = {}
+        records: list[tuple[str, str, dict]] = []
         for raw_row in cursor.fetchall():
             values = dict(zip(selected, raw_row))
             name = values["name"]
+            provider_id = str(values.get("id") or name)
             settings_config = values["settings_config"]
             try:
                 settings = json.loads(settings_config)
@@ -433,7 +436,7 @@ def _read_provider_rows(path: Path) -> dict:
             )
             if not isinstance(token, str):
                 token = ""
-            rows[name] = {
+            record = {
                 "base_url": base,
                 "token": token,
                 "api_format": provider_api_format(
@@ -460,6 +463,15 @@ def _read_provider_rows(path: Path) -> dict:
                     for tier in ("opus", "sonnet", "haiku")
                 },
             }
+            records.append((provider_id, name, record))
+        name_counts: dict[str, int] = {}
+        for _provider_id, name, _record in records:
+            name_counts[name] = name_counts.get(name, 0) + 1
+        rows = {}
+        for provider_id, name, record in records:
+            rows[f"id:{provider_id}"] = record
+            if name_counts[name] == 1:
+                rows[name] = record
         return rows
     finally:
         conn.close()

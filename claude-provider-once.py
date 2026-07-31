@@ -245,41 +245,96 @@ def save_config(cfg: dict) -> bool:
         return False
 
 
-def sync_config(cfg: dict, db_names: list[str]) -> bool:
-    """Seed from CC Switch order, then append newly discovered providers.
+def sync_config(cfg: dict, db_providers: list[dict]) -> bool:
+    """Keep presentation config keyed by stable CC Switch provider ids.
 
-    Returns True if cfg was modified (caller decides whether to persist).
+    v1/v2 used provider names as keys, which made duplicate names collapse to
+    one row. v3 migrates the old metadata onto the first matching id, retains
+    hidden state for every duplicate, and requires separate aliases thereafter.
     """
-    providers = cfg.setdefault("providers", {})
+    old_providers = cfg.get("providers")
+    if not isinstance(old_providers, dict):
+        old_providers = {}
     changed = False
-    if not providers:
-        for name in db_names:
-            providers[name] = {"hidden": False}
-        changed = True
-    for name in db_names:
-        if name not in providers:
-            providers[name] = {"hidden": False}  # 新号默认出现在列表(opt-out)
+
+    if cfg.get("version", 1) < 3:
+        providers: dict[str, dict] = {}
+        seen_names: set[str] = set()
+        for provider in db_providers:
+            provider_id = str(provider["id"])
+            name = str(provider["name"])
+            legacy = old_providers.get(name)
+            meta = dict(legacy) if isinstance(legacy, dict) else {}
+            if "hidden" not in meta:
+                meta["hidden"] = meta.get("enabled") is False
+            meta.pop("enabled", None)
+            # One legacy name-level alias cannot safely identify two rows.
+            if name in seen_names:
+                meta.pop("alias", None)
+            meta["name"] = name
+            providers[provider_id] = meta
+            seen_names.add(name)
+        cfg["providers"] = providers
+        cfg["version"] = 3
+        return True
+
+    providers = old_providers
+    cfg["providers"] = providers
+    for provider in db_providers:
+        provider_id = str(provider["id"])
+        name = str(provider["name"])
+        meta = providers.get(provider_id)
+        if not isinstance(meta, dict):
+            providers[provider_id] = {"name": name, "hidden": False}
+            changed = True
+            continue
+        if meta.get("name") != name:
+            meta["name"] = name
+            changed = True
+        if "hidden" not in meta:
+            meta["hidden"] = False
+            changed = True
+        if "enabled" in meta:
+            meta.pop("enabled", None)
             changed = True
     return changed
 
 
-def migrate_hidden(cfg: dict) -> bool:
-    """v1(enabled) → v2(hidden)。旧的 enabled=false 视为「隐藏」，保持原菜单不变。"""
-    if cfg.get("version", 1) >= 2:
-        return False
-    for m in cfg.get("providers", {}).values():
-        if "hidden" not in m:
-            m["hidden"] = (m.get("enabled") is False)
-        m.pop("enabled", None)
-    cfg["version"] = 2
-    return True
-
-
 def provider_by_name(name: str) -> dict | None:
-    for r in db_claude_rows():
-        if r["name"] == name:
-            return _provider_from_row(r)
+    matches = [
+        _provider_from_row(row)
+        for row in db_claude_rows()
+        if row["name"] == name
+    ]
+    if len(matches) > 1:
+        selectors = "、".join(f"id:{provider['id']}" for provider in matches)
+        raise RuntimeError(
+            f"provider 名称 '{name}' 不唯一；请设置不同别名或使用 {selectors}"
+        )
+    return matches[0] if matches else None
+
+
+def provider_by_id(provider_id: str) -> dict | None:
+    for row in db_claude_rows():
+        if str(row["id"]) == provider_id:
+            return _provider_from_row(row)
     return None
+
+
+def current_provider() -> dict:
+    matches = [
+        _provider_from_row(row)
+        for row in db_claude_rows()
+        if "is_current" in row.keys() and bool(row["is_current"])
+    ]
+    if not matches:
+        raise RuntimeError("CC Switch DB 中没有 is_current=1 的 Claude provider")
+    if len(matches) > 1:
+        ids = "、".join(str(provider["id"]) for provider in matches)
+        raise RuntimeError(
+            f"CC Switch DB 中有多个 is_current=1 的 Claude provider: {ids}"
+        )
+    return matches[0]
 
 
 MANAGED_ENV_PREFIXES = (
@@ -340,7 +395,9 @@ def db_claude_rows() -> list[sqlite3.Row]:
         }
         selected = ["id", "name", "settings_config"]
         selected.extend(
-            column for column in ("meta", "provider_type") if column in columns
+            column
+            for column in ("meta", "provider_type", "is_current")
+            if column in columns
         )
         return conn.execute(
             f"SELECT {', '.join(selected)} FROM providers "
@@ -358,6 +415,7 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
         "settings_config": row["settings_config"],
         "meta": row["meta"] if "meta" in keys else "{}",
         "provider_type": row["provider_type"] if "provider_type" in keys else None,
+        "is_current": bool(row["is_current"]) if "is_current" in keys else False,
     }
 
 
@@ -379,24 +437,28 @@ def selected_provider_api_format(provider: dict) -> str:
 
 def list_providers() -> list[dict]:
     rows = db_claude_rows()
-    by_name = {r["name"]: _provider_from_row(r) for r in rows}
+    providers = [_provider_from_row(row) for row in rows]
+    by_id = {str(provider["id"]): provider for provider in providers}
     cfg = load_config()
-    changed = sync_config(cfg, list(by_name.keys()))
-    changed |= migrate_hidden(cfg)
+    changed = sync_config(cfg, providers)
     if changed:
         save_config(cfg)
-    visible = [n for n, meta in cfg["providers"].items() if not meta.get("hidden")]
+    visible = [
+        provider_id
+        for provider_id, meta in cfg["providers"].items()
+        if not meta.get("hidden")
+    ]
     ordered = []
-    for n in visible:
-        if n in by_name:
-            entry = dict(by_name[n])
-            alias = cfg["providers"][n].get("alias")
+    for provider_id in visible:
+        if provider_id in by_id:
+            entry = dict(by_id[provider_id])
+            alias = cfg["providers"][provider_id].get("alias")
             if alias:
                 entry["alias"] = alias
             ordered.append(entry)
     if not ordered:
         # 全被隐藏(或配置为空) —— 别把人困住，回退到全部。
-        ordered = list(by_name.values())
+        ordered = providers
     return ordered
 
 
@@ -613,11 +675,31 @@ def ensure_hub(port: int) -> None:
 
 
 def _provider_terms(provider: dict) -> list[str]:
-    terms = [str(provider.get("name", ""))]
+    terms = [
+        str(provider.get("name", "")),
+        f"id:{provider.get('id', '')}",
+    ]
     alias = provider.get("alias")
     if isinstance(alias, str) and alias.strip():
         terms.append(alias.strip())
     return terms
+
+
+def _provider_labels(providers: list[dict]) -> dict[str, str]:
+    counts: dict[str, int] = {}
+    for provider in providers:
+        name = str(provider.get("name", ""))
+        counts[name] = counts.get(name, 0) + 1
+    labels: dict[str, str] = {}
+    for provider in providers:
+        provider_id = str(provider.get("id", ""))
+        name = str(provider.get("name", ""))
+        labels[provider_id] = (
+            f"{name} [{_short_provider_id(provider_id)}]"
+            if counts.get(name, 0) > 1
+            else name
+        )
+    return labels
 
 
 def match_providers(providers: list[dict], hint: str) -> tuple[list[dict], bool]:
@@ -641,12 +723,13 @@ def match_providers(providers: list[dict], hint: str) -> tuple[list[dict], bool]
 
 
 def choose(providers: list[dict], hint: str | None) -> dict:
+    labels = _provider_labels(providers)
     if hint:
         matches, exact = match_providers(providers, hint)
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1 and exact:
-            names = "、".join(str(p["name"]) for p in matches)
+            names = "、".join(labels[str(p["id"])] for p in matches)
             raise RuntimeError(
                 f"名称或别名 '{hint}' 存在冲突: {names}；请修改其中一个别名"
             )
@@ -654,7 +737,7 @@ def choose(providers: list[dict], hint: str | None) -> dict:
             print("匹配到多个 provider，请选择:")
             for i, p in enumerate(matches, 1):
                 alias = f" ({p['alias']})" if p.get("alias") else ""
-                print(f"{i}. {p['name']}{alias}")
+                print(f"{i}. {labels[str(p['id'])]}{alias}")
             choice = input("> ").strip()
             if choice.isdigit():
                 idx = int(choice) - 1
@@ -665,7 +748,7 @@ def choose(providers: list[dict], hint: str | None) -> dict:
 
     print("选择本次 Claude Code provider:")
     for i, p in enumerate(providers, 1):
-        print(f"{i}. {p['name']}")
+        print(f"{i}. {labels[str(p['id'])]}")
     choice = input("> ").strip()
     if choice.isdigit():
         idx = int(choice) - 1
@@ -675,7 +758,7 @@ def choose(providers: list[dict], hint: str | None) -> dict:
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1 and exact:
-        names = "、".join(str(p["name"]) for p in matches)
+        names = "、".join(labels[str(p["id"])] for p in matches)
         raise RuntimeError(f"名称或别名 '{choice}' 存在冲突: {names}")
     raise RuntimeError("无效选择，已取消")
 
@@ -1190,12 +1273,14 @@ def _intro(win) -> int | None:
         win.nodelay(False)
 
 
-def _build_view(cfg, db_names, mru, show_hidden):
+def _build_view(cfg, db_ids, mru, show_hidden):
     """Keep config order stable; MRU only affects the initial cursor."""
     meta = cfg["providers"]
     return [
-        n for n in meta
-        if n in db_names and (show_hidden or not meta[n].get("hidden"))
+        provider_id
+        for provider_id in meta
+        if provider_id in db_ids
+        and (show_hidden or not meta[provider_id].get("hidden"))
     ]
 
 
@@ -1238,15 +1323,18 @@ def _digit_index(key: int) -> int | None:
 
 def _alias_conflict(
     meta: dict,
-    current_name: str,
+    current_id: str,
     candidate: str,
 ) -> str | None:
     folded = candidate.strip().casefold()
     if not folded:
         return None
-    for name, provider_meta in meta.items():
-        if name == current_name:
+    for provider_id, provider_meta in meta.items():
+        if provider_id == current_id:
             continue
+        if not isinstance(provider_meta, dict):
+            continue
+        name = str(provider_meta.get("name", provider_id))
         terms = [name]
         alias = provider_meta.get("alias") if isinstance(provider_meta, dict) else None
         if isinstance(alias, str) and alias.strip():
@@ -1256,25 +1344,25 @@ def _alias_conflict(
     return None
 
 
-def _set_alias(meta: dict, name: str, candidate: str) -> tuple[bool, str]:
+def _set_alias(meta: dict, provider_id: str, candidate: str) -> tuple[bool, str]:
     candidate = candidate.strip()
     if not candidate:
-        changed = bool(meta[name].pop("alias", None))
+        changed = bool(meta[provider_id].pop("alias", None))
         return (changed, "别名已清除" if changed else "未设置别名")
     if candidate.startswith("-"):
         return (False, "别名不能以 “-” 开头，否则会与命令参数冲突")
     if candidate.casefold() in RESERVED_SELECTOR_WORDS:
         return (False, f"“{candidate}”是 claude1 保留命令，请换一个别名")
-    conflict = _alias_conflict(meta, name, candidate)
+    conflict = _alias_conflict(meta, provider_id, candidate)
     if conflict:
         return (False, f"别名“{candidate}”已被 {conflict} 使用")
-    if meta[name].get("alias") == candidate:
+    if meta[provider_id].get("alias") == candidate:
         return (False, f"别名仍为 {candidate}")
-    meta[name]["alias"] = candidate
+    meta[provider_id]["alias"] = candidate
     return (True, f"别名已设为 {candidate}")
 
 
-def _edit_alias(win, name, meta) -> tuple[bool, str]:
+def _edit_alias(win, provider_id, meta) -> tuple[bool, str]:
     h, w = win.getmaxyx()
     prompt = "别名（留空清除）: "
     _safe_curs_set(1)
@@ -1298,7 +1386,7 @@ def _edit_alias(win, name, meta) -> tuple[bool, str]:
         except curses.error:
             pass
         _safe_curs_set(0)
-    return _set_alias(meta, name, s)
+    return _set_alias(meta, provider_id, s)
 
 
 def _confirm(win, msg) -> bool:
@@ -1325,6 +1413,26 @@ def _confirm(win, msg) -> bool:
             return choice
         elif ch == 27:
             return False
+
+
+def _short_provider_id(provider_id: object) -> str:
+    raw = str(provider_id)
+    return raw if len(raw) <= 12 else raw[:8]
+
+
+def _provider_meta_label(meta: dict, provider_id: str) -> str:
+    provider_meta = meta.get(provider_id)
+    if not isinstance(provider_meta, dict):
+        return provider_id
+    name = str(provider_meta.get("name") or provider_id)
+    duplicates = sum(
+        1
+        for other in meta.values()
+        if isinstance(other, dict) and str(other.get("name") or "") == name
+    )
+    if duplicates > 1:
+        return f"{name} [{_short_provider_id(provider_id)}]"
+    return name
 
 
 def _draw_launcher(
@@ -1418,8 +1526,9 @@ def _draw_launcher(
         _addstr(win, list_top, 2, "没有可用渠道", C.get("warning", 0))
     row_width = max(0, w - 4)
     for row_offset, i in enumerate(range(start, end)):
-        name = view[i]
-        m = meta[name]
+        provider_id = view[i]
+        m = meta[provider_id]
+        name = _provider_meta_label(meta, provider_id)
         hidden = m.get("hidden")
         rank = i + 1
         selected = (not hub_focus) and (i == idx)
@@ -1428,7 +1537,7 @@ def _draw_launcher(
         status: list[str] = []
         if m.get("alias"):
             status.append(str(m["alias"]))
-        if name == recent:
+        if provider_id == recent:
             status.append("最近")
         if hidden:
             status.append("已隐藏")
@@ -1576,8 +1685,8 @@ def _hub_workspace(
         _draw_hub_workspace(win, status, options, idx)
 
 
-def _launcher_main(win, cfg, db_names):
-    """返回要启动的 provider 名，或 None(退出不启动)。hide/alias 即时落盘。"""
+def _launcher_main(win, cfg, db_ids):
+    """返回要启动的 provider id，或 None(退出不启动)。hide/alias 即时落盘。"""
     _safe_curs_set(0)
     win.keypad(True)
     try:
@@ -1589,7 +1698,7 @@ def _launcher_main(win, cfg, db_names):
     mru = load_mru()
     meta = cfg["providers"]
     show_hidden = False
-    view = _build_view(cfg, db_names, mru, show_hidden)
+    view = _build_view(cfg, db_ids, mru, show_hidden)
     idx = _initial_index(view, mru)
     hub_view = _load_hub_view()
     hub_status, hub_options = hub_view if hub_view is not None else (None, [])
@@ -1651,20 +1760,21 @@ def _launcher_main(win, cfg, db_names):
                     save_config(cfg)
         elif ch == ord("x"):
             if not hub_focus and view:
-                name = view[idx]
-                nowh = meta[name].get("hidden")
+                provider_id = view[idx]
+                name = _provider_meta_label(meta, provider_id)
+                nowh = meta[provider_id].get("hidden")
                 verb = "恢复显示" if nowh else "隐藏"
                 ok = _confirm(win, f"{verb} {name}?")
                 if ok:
-                    meta[name]["hidden"] = not nowh
+                    meta[provider_id]["hidden"] = not nowh
                     save_config(cfg)
-                    preferred = name
-                    view = _build_view(cfg, db_names, mru, show_hidden)
+                    preferred = provider_id
+                    view = _build_view(cfg, db_ids, mru, show_hidden)
                     idx = _initial_index(view, mru, preferred)
         elif ch == ord("h"):  # 切换「显示隐藏项」
             preferred = view[idx] if view else None
             show_hidden = not show_hidden
-            view = _build_view(cfg, db_names, mru, show_hidden)
+            view = _build_view(cfg, db_ids, mru, show_hidden)
             idx = _initial_index(view, mru, preferred)
         elif ch == ord("?"):
             help_open = not help_open
@@ -1696,10 +1806,10 @@ def _launcher_main(win, cfg, db_names):
         )
 
 
-def _launcher_session(win, cfg, db_names):
+def _launcher_session(win, cfg, db_ids):
     """Run one chooser and remove its full-screen UI before curses restores."""
     try:
-        return _launcher_main(win, cfg, db_names)
+        return _launcher_main(win, cfg, db_ids)
     finally:
         try:
             win.erase()
@@ -1709,12 +1819,12 @@ def _launcher_session(win, cfg, db_names):
 
 
 def run_tui_launcher():
-    """打开 TUI 启动器。返回 ('launch', name) | ('quit', None) | ('no-tui', None)。"""
+    """打开 TUI 启动器。返回 ('launch', id) | ('quit', None) | ('no-tui', None)。"""
     rows = db_claude_rows()
-    db_names = {r["name"] for r in rows}
+    providers = [_provider_from_row(row) for row in rows]
+    db_ids = {str(provider["id"]) for provider in providers}
     cfg = load_config()
-    changed = sync_config(cfg, [r["name"] for r in rows])
-    changed |= migrate_hidden(cfg)
+    changed = sync_config(cfg, providers)
     if changed:
         save_config(cfg)
     if curses is None or not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1723,7 +1833,7 @@ def run_tui_launcher():
     if not _tui_size_supported(terminal.lines, terminal.columns):
         return ("no-tui", None)
     try:
-        result = curses.wrapper(_launcher_session, cfg, db_names)
+        result = curses.wrapper(_launcher_session, cfg, db_ids)
     except Exception as exc:
         print(f"[claude1] 图形界面无法启动({exc})", file=sys.stderr)
         return ("no-tui", None)
@@ -1767,6 +1877,15 @@ def set_sticky(word: str) -> int:
     except OSError as exc:
         print(f"[claude1] 无法写入粘性后端: {exc}", file=sys.stderr)
         return 1
+    if os.environ.get("CLAUDE1_STICKY_INTEGRATION") != "1":
+        print(
+            f"[claude1] 已保存粘性后端 = {kind}，但当前 shell 未启用普通 claude 路由。"
+        )
+        print(
+            "[claude1] 如需让普通 claude 读取该选择，请运行 "
+            "`./install.sh --enable-sticky` 后重新 source ~/.zshrc。"
+        )
+        return 0
     if kind == "hub":
         print(
             "[claude1] 粘性后端 = hub —— 之后普通 claude 走多渠道网关，"
@@ -1781,7 +1900,7 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     """拆成 (backend, provider_hint, claude_args)。
 
     backend: 'anyrouter' | 'current' | 'direct' | 'hub' | None
-    provider_hint: 匹配 CC-Switch provider 的子串（None => 弹菜单）
+    provider_hint: 匹配 CC-Switch provider 的名称、别名或 id（None => 弹菜单）
     claude_args: 展开后的 overlay + 其余原样透传给 claude
     """
     backend: str | None = None
@@ -2107,7 +2226,7 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 
 用法:
   claude1                              打开渠道选择器
-  claude1 <名称或别名> [Claude 参数]   直接启动一个渠道
+  claude1 <名称/别名/id:ID> [Claude 参数] 直接启动一个渠道
   claude1 hub [--model 渠道,模型]      进入可用 /model 热切换的 Hub
   claude1 list [--all]                 查看渠道，不启动 Claude
   claude1 doctor                       做本机只读检查，不连接上游
@@ -2123,41 +2242,38 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 
 def cli_list_providers(show_all: bool = False) -> int:
     rows = db_claude_rows()
-    by_name = {
-        row["name"]: {
-            "name": row["name"],
-            "settings_config": row["settings_config"],
-        }
-        for row in rows
-    }
+    providers = [_provider_from_row(row) for row in rows]
+    by_id = {str(provider["id"]): provider for provider in providers}
+    labels = _provider_labels(providers)
     cfg = load_config()
-    changed = sync_config(cfg, list(by_name))
-    changed |= migrate_hidden(cfg)
+    changed = sync_config(cfg, providers)
     if changed:
         save_config(cfg)
-    names = [
-        name
-        for name, meta in cfg["providers"].items()
-        if name in by_name and (show_all or not meta.get("hidden"))
+    provider_ids = [
+        provider_id
+        for provider_id, meta in cfg["providers"].items()
+        if provider_id in by_id and (show_all or not meta.get("hidden"))
     ]
-    if not names:
+    if not provider_ids:
         print("claude1: 没有可显示的 CC Switch Claude 渠道")
         return 1
 
-    recent = _recent_name(names, load_mru())
+    recent = _recent_name(provider_ids, load_mru())
     print("claude1 渠道（顺序与选择器一致）\n")
-    for index, name in enumerate(names, 1):
-        meta = cfg["providers"][name]
+    for index, provider_id in enumerate(provider_ids, 1):
+        meta = cfg["providers"][provider_id]
         details: list[str] = []
         if meta.get("alias"):
             details.append(f"别名 {meta['alias']}")
-        if name == recent:
+        if provider_id == recent:
             details.append("最近")
         if meta.get("hidden"):
             details.append("已隐藏")
         suffix = f"  {' · '.join(details)}" if details else ""
-        print(f"  {index:>2}  {name}{suffix}")
-    print(f"\n共 {len(names)} 个；运行 `claude1 <名称或别名>` 可直接启动。")
+        print(f"  {index:>2}  {labels[provider_id]}{suffix}")
+    print(
+        f"\n共 {len(provider_ids)} 个；运行 `claude1 <名称、别名或 id:ID>` 可直接启动。"
+    )
     return 0
 
 
@@ -2221,6 +2337,32 @@ def cli_doctor() -> int:
     return 0 if failures == 0 else 1
 
 
+def launch_provider(
+    selected: dict,
+    claude_args: list[str],
+    *,
+    backend_kind: str = "provider",
+) -> int:
+    settings = build_settings(selected)
+    add_anyrouter_observer(settings, selected["name"])
+    record_use(str(selected["id"]))
+    record_backend(backend_kind, selected["name"])
+    if backend_kind == "current":
+        print(f"[claude1] 本次使用 CC Switch 当前 provider: {selected['name']}")
+    else:
+        print(f"[claude1] 本次使用 provider: {selected['name']}")
+    api_format = selected_provider_api_format(selected)
+    if api_format != "anthropic":
+        return launch_with_protocol_bridge(
+            selected,
+            settings,
+            api_format,
+            claude_args,
+        )
+    ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
+    return launch_with_settings(settings, claude_args)
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] in ("help", "-h", "--help"):
         print(CLAUDE1_USAGE)
@@ -2256,7 +2398,11 @@ def main(argv: list[str]) -> int:
     if backend == "anyrouter":
         return exec_settings_backend(ANYROUTER_SETTINGS, "anyrouter", claude_args)
     if backend == "current":
-        return exec_plain_claude("current", claude_args)
+        return launch_provider(
+            current_provider(),
+            claude_args,
+            backend_kind="current",
+        )
     if backend == "direct":
         return exec_plain_claude("direct", claude_args)
     if backend == "hub":
@@ -2283,26 +2429,12 @@ def main(argv: list[str]) -> int:
         elif action == "hub":
             return exec_hub(["--model", payload, *claude_args])
         else:
-            selected = provider_by_name(payload)
+            selected = provider_by_id(payload)
             if selected is None:
-                print(f"[claude1] 找不到 provider: {payload}", file=sys.stderr)
+                print(f"[claude1] 找不到 provider id: {payload}", file=sys.stderr)
                 return 1
 
-    settings = build_settings(selected)
-    add_anyrouter_observer(settings, selected["name"])
-    record_use(selected["name"])
-    record_backend("provider", selected["name"])
-    print(f"[claude1] 本次使用 provider: {selected['name']}")
-    api_format = selected_provider_api_format(selected)
-    if api_format != "anthropic":
-        return launch_with_protocol_bridge(
-            selected,
-            settings,
-            api_format,
-            claude_args,
-        )
-    ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
-    return launch_with_settings(settings, claude_args)
+    return launch_provider(selected, claude_args)
 
 
 if __name__ == "__main__":
