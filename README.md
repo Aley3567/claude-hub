@@ -37,7 +37,8 @@ source ~/.zshrc
 
 安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub 和共享协议桥三份 Python 文件。已有目标文件和
+安装器实际复制启动器、Hub、共享协议桥和 statusline 模型解析器四份 Python
+文件。已有目标文件和
 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
@@ -57,7 +58,7 @@ claude1
 claude1                         # 打开渠道选择器
 claude1 mimo                    # 按 provider 名或唯一别名直达
 claude1 direct                  # 本次直接启动原生 Claude Code
-claude1 current                 # 本次使用 CC Switch 当前渠道
+claude1 current                 # 本次使用 DB is_current 标记的 CC Switch 当前渠道
 claude1 any                     # 本次使用已有的 AnyRouter settings
 claude1 hub                     # 本次通过可选 claude-hub 启动
 claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
@@ -72,8 +73,10 @@ CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 渠道时先清除界面，按 `q` 或 `Esc` 退出则清屏后只留下简短的 Bye 欢迎语。
 需要完全跳过开场动画时使用 `CLAUDE1_NO_ANIMATION=1`。
 
-Provider 名称匹配不区分大小写；如果多个名称都匹配，会要求再次选择，避免
-静默走错渠道。别名不能与 `hub`、`list`、`doctor` 等保留命令冲突。
+Provider 名称匹配不区分大小写；如果 CC Switch 中存在重名 provider，列表会
+附加短 id，直接按名称启动会拒绝歧义，可改用独立别名或
+`claude1 id:<provider-id>`。别名不能与 `hub`、`list`、`doctor` 等保留命令
+冲突。隐藏、别名和最近使用状态均按 provider id 保存，重命名不会丢失设置。
 
 ## 默认隔离边界
 
@@ -86,9 +89,38 @@ Provider 名称匹配不区分大小写；如果多个名称都匹配，会要�
   token。
 
 仓库中的 `zsh-sticky-integration.sh` 是显式 opt-in 功能，默认安装器不会复制
-或 source 它。只有手动接入该文件后，`claude1 use <backend>` 写入的
-`~/.cc-switch/claude1-backend` 才会改变普通 `claude` 的后续路由。无需这项
-行为时不要接入该文件。
+或 source 它。需要让 `claude1 use <backend>` 改变普通 `claude` 的后续路由
+时，显式运行：
+
+```bash
+./install.sh --enable-sticky
+source ~/.zshrc
+claude1 use hub
+```
+
+未启用时，`claude1 use` 只保存选择并明确提示普通 `claude` 尚未接管，不再
+输出已经生效的误导性承诺。无需这项行为时不要传 `--enable-sticky`。
+
+`claude1 current` 与 statusline 的 CC Switch 回退都以数据库中唯一的
+`providers.is_current=1` 为准；`~/.cc-switch/settings.json` 只视为缓存，不再
+作为启动器的当前 provider 真相源。零个或多个 current 标记会 fail closed。
+
+## 可选：在自定义 statusline 中显示实际上游模型
+
+安装器会复制一个不接管布局的模型解析器：
+`~/.claude/scripts/statusline-model.py`。它读取 Claude Code 传给 statusLine
+命令的同一个 JSON，并只输出实际模型名。已有 statusline 可以复用：
+
+```bash
+input=$(cat)
+model=$(printf '%s' "$input" | ~/.claude/scripts/statusline-model.py)
+```
+
+解析器优先使用最新 assistant 响应模型，并忽略回合末的 attachment、工具结果、
+mode、permission-mode、last-prompt、file-history 和 system 统计元条目；回退
+时按 stdin `.model.id` 与各 slot 的实际值精确比对，不再靠
+`opus`/`sonnet`/`haiku` 关键词猜测。通过 CC Switch 本地代理时，slot 映射只
+读取唯一的 DB current provider。
 
 ## 可选：启用 claude-hub
 
@@ -103,6 +135,9 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
    chmod 600 ~/.cc-switch/claude-hub.json ~/.cc-switch/cc-switch.db
    ${EDITOR:-vi} ~/.cc-switch/claude-hub.json
    ```
+
+   如果 CC Switch 中有重名 provider，Hub 不接受歧义名称；把 channel 的
+   `provider` 写成 `id:<provider-id>`。
 
 3. 生成并保存一个仅供本机 Claude Code 连接 Hub 使用的 token，再启动。Hub
    持续运行期间应复用同一个 token：
@@ -134,7 +169,8 @@ provider 或 current 状态。
 ├── scripts/
 │   ├── claude-provider-once.py
 │   ├── claude-hub.py
-│   └── claude1_protocol.py
+│   ├── claude1_protocol.py
+│   └── statusline-model.py
 ├── claude1/
 │   └── zsh-functions.sh
 └── backups/
@@ -158,6 +194,7 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `claude-provider-once.py` | 一次性 provider 选择、TUI 与 Claude Code 启动 |
 | `claude-hub.py` | 可选的本地 Anthropic gateway |
 | `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
+| `statusline-model.py` | 自定义 statusline 可复用的实际上游模型解析 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |

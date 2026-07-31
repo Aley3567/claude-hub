@@ -10,6 +10,16 @@ claude1() {
   local python="${CLAUDE1_PYTHON:-python3}"
   local python_path=""
 
+  # Personal Claude Code patch helpers may be defined earlier in ~/.zshrc.
+  # Keep this managed function as the single launcher entrypoint while
+  # preserving those optional preflight hooks.
+  if (( ${+functions[_claude_ensure_toolsearch_patch]} )); then
+    _claude_ensure_toolsearch_patch
+  fi
+  if (( ${+functions[_claude_ensure_ghostty_progress_patch]} )); then
+    _claude_ensure_ghostty_progress_patch
+  fi
+
   if [[ ! -f "$launcher" || ! -r "$launcher" ]]; then
     print -u2 -- "[claude1] launcher script not found or unreadable: $launcher"
     print -u2 -- "[claude1] install claude-provider-once.py there or set CLAUDE1_SCRIPT."
@@ -37,6 +47,12 @@ claude1() {
     fi
   done
 
+  # Make the cleanup local to this function so the caller's shell environment
+  # is preserved after claude1 exits.
+  local CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+  local CLAUDE_CODE_WORKFLOWS
+  unset CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+  unset CLAUDE_CODE_WORKFLOWS
   CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" \
     "$python_path" "$launcher" "${args[@]}"
 }

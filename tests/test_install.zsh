@@ -68,6 +68,11 @@ managed_line_count() {
   command grep -c '# claude1 managed source' "$file_path" 2>/dev/null || true
 }
 
+sticky_line_count() {
+  local file_path="$1"
+  command grep -c '# claude1 managed sticky source' "$file_path" 2>/dev/null || true
+}
+
 test_first_install_is_safe() {
   local home="$(make_home first)"
   print -r -- 'claude() { print -- "kept-claude"; }' > "$home/.zshrc"
@@ -84,6 +89,9 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude1_protocol.py" \
     "$home/install root/scripts/claude1_protocol.py" ||
     fail "protocol bridge was not installed"
+  command cmp -s "$REPO_ROOT/statusline-model.py" \
+    "$home/install root/scripts/statusline-model.py" ||
+    fail "statusline model resolver was not installed"
   command cmp -s "$REPO_ROOT/zsh-functions.sh" \
     "$home/install root/claude1/zsh-functions.sh" ||
     fail "safe shell integration was not installed"
@@ -135,12 +143,45 @@ test_repeated_install_is_idempotent() {
   pass "repeated install is idempotent"
 }
 
+test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall() {
+  local home="$(make_home sticky)"
+  print -r -- '# user config' > "$home/.zshrc"
+  print -r -- 'direct' > "$home/.cc-switch/claude1-backend"
+
+  run_install "$home" --enable-sticky >/dev/null 2>&1
+
+  command cmp -s "$REPO_ROOT/zsh-sticky-integration.sh" \
+    "$home/install root/claude1/zsh-sticky-integration.sh" ||
+    fail "sticky integration was not installed after explicit opt-in"
+  [[ "$(sticky_line_count "$home/.zshrc")" == "1" ]] ||
+    fail "sticky source line was not added exactly once"
+
+  local output="$(
+    HOME="$home" PATH="$home/bin:/usr/bin:/bin" \
+      "$SYSTEM_ZSH" -f -c 'source "$HOME/.zshrc"; claude sample'
+  )"
+  [[ "$output" == "ordinary-claude" ]] ||
+    fail "opt-in install did not route ordinary claude through sticky backend"
+
+  print -r -- '# stale sticky integration' > \
+    "$home/install root/claude1/zsh-sticky-integration.sh"
+  run_install "$home" >/dev/null 2>&1
+  [[ "$(sticky_line_count "$home/.zshrc")" == "1" ]] ||
+    fail "safe reinstall removed or duplicated an existing sticky opt-in"
+  command cmp -s "$REPO_ROOT/zsh-sticky-integration.sh" \
+    "$home/install root/claude1/zsh-sticky-integration.sh" ||
+    fail "safe reinstall did not update an existing sticky opt-in"
+
+  pass "explicit sticky install reconnects claude1 use state"
+}
+
 test_existing_files_are_backed_up() {
   local home="$(make_home backup)"
   command mkdir -p -- "$home/install root/scripts" "$home/install root/claude1"
   print -r -- 'old launcher' > "$home/install root/scripts/claude-provider-once.py"
   print -r -- 'old hub' > "$home/install root/scripts/claude-hub.py"
   print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
+  print -r -- 'old statusline model' > "$home/install root/scripts/statusline-model.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
   command mkdir -p -- "$home/dotfiles"
   print -r -- 'old zshrc' > "$home/dotfiles/zshrc"
@@ -155,6 +196,7 @@ test_existing_files_are_backed_up() {
   assert_file_content "old launcher" "$backup/claude-provider-once.py"
   assert_file_content "old hub" "$backup/claude-hub.py"
   assert_file_content "old protocol" "$backup/claude1_protocol.py"
+  assert_file_content "old statusline model" "$backup/statusline-model.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
   assert_file_content "old zshrc" "$backup/zshrc"
 
@@ -225,6 +267,7 @@ test_missing_dependencies_are_clear() {
 
 test_first_install_is_safe
 test_repeated_install_is_idempotent
+test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall
 test_existing_files_are_backed_up
 test_missing_dependencies_are_clear
 
