@@ -8,6 +8,8 @@
 # To opt out again in the current shell:
 #   unfunction claude
 
+export CLAUDE1_STICKY_INTEGRATION=1
+
 claude() {
   local state_file="${CLAUDE1_STICKY_FILE:-$HOME/.cc-switch/claude1-backend}"
   local backend="direct"

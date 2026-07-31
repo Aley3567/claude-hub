@@ -4,10 +4,12 @@ set -eu
 
 PROGRAM="claude1"
 MANAGED_MARKER="# claude1 managed source"
+STICKY_MARKER="# claude1 managed sticky source"
+ENABLE_STICKY=0
 
 usage() {
   cat <<'EOF'
-用法: ./install.sh
+用法: ./install.sh [--enable-sticky]
 
 安装 claude1 到当前用户目录，并把安全的 zsh 集成接入 ~/.zshrc。
 
@@ -16,23 +18,26 @@ usage() {
   CLAUDE1_INSTALL_ROOT    安装目录（默认: $HOME/.claude）
 
 安装器不会读取或复制 CC Switch 配置、数据库内容或任何凭证，也不会启用
-zsh-sticky-integration.sh。
+zsh-sticky-integration.sh，除非显式传入 --enable-sticky。
 EOF
 }
 
-case "${1:-}" in
-  -h|--help)
-    usage
-    exit 0
-    ;;
-  "")
-    ;;
-  *)
-    printf '%s\n' "[claude1] 未知参数: $1" >&2
-    usage >&2
-    exit 2
-    ;;
-esac
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --enable-sticky)
+      ENABLE_STICKY=1
+      ;;
+    *)
+      printf '%s\n' "[claude1] 未知参数: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [ -z "${HOME:-}" ]; then
   printf '%s\n' "[claude1] 安装失败：HOME 未设置。" >&2
@@ -44,6 +49,10 @@ INSTALL_ROOT=${CLAUDE1_INSTALL_ROOT:-"$HOME/.claude"}
 CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db"
 ZSHRC="$HOME/.zshrc"
 ZSHRC_TARGET="$ZSHRC"
+MANAGE_STICKY=$ENABLE_STICKY
+if [ -f "$ZSHRC" ] && grep -Fq "$STICKY_MARKER" "$ZSHRC" 2>/dev/null; then
+  MANAGE_STICKY=1
+fi
 
 require_command() {
   command_name=$1
@@ -77,6 +86,7 @@ for source_file in \
   "$SCRIPT_DIR/claude-provider-once.py" \
   "$SCRIPT_DIR/claude-hub.py" \
   "$SCRIPT_DIR/claude1_protocol.py" \
+  "$SCRIPT_DIR/statusline-model.py" \
   "$SCRIPT_DIR/zsh-functions.sh"
 do
   if [ ! -f "$source_file" ] || [ ! -r "$source_file" ]; then
@@ -84,11 +94,22 @@ do
     exit 1
   fi
 done
+if [ "$MANAGE_STICKY" -eq 1 ] &&
+  { [ ! -f "$SCRIPT_DIR/zsh-sticky-integration.sh" ] ||
+    [ ! -r "$SCRIPT_DIR/zsh-sticky-integration.sh" ]; }; then
+  printf '%s\n' \
+    "[claude1] 安装失败：仓库文件缺失或不可读：$SCRIPT_DIR/zsh-sticky-integration.sh" \
+    >&2
+  exit 1
+fi
 
 if [ -L "$INSTALL_ROOT/scripts/claude-provider-once.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude-hub.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_protocol.py" ] ||
-  [ -L "$INSTALL_ROOT/claude1/zsh-functions.sh" ]; then
+  [ -L "$INSTALL_ROOT/scripts/statusline-model.py" ] ||
+  [ -L "$INSTALL_ROOT/claude1/zsh-functions.sh" ] ||
+  { [ "$MANAGE_STICKY" -eq 1 ] &&
+    [ -L "$INSTALL_ROOT/claude1/zsh-sticky-integration.sh" ]; }; then
   printf '%s\n' \
     "[claude1] 安装失败：目标脚本包含符号链接。为避免改写链接目标，请先手动处理后重试。" \
     >&2
@@ -99,6 +120,7 @@ for target_path in \
   "$INSTALL_ROOT/scripts/claude-provider-once.py" \
   "$INSTALL_ROOT/scripts/claude-hub.py" \
   "$INSTALL_ROOT/scripts/claude1_protocol.py" \
+  "$INSTALL_ROOT/scripts/statusline-model.py" \
   "$INSTALL_ROOT/claude1/zsh-functions.sh"
 do
   if [ -e "$target_path" ] && [ ! -f "$target_path" ]; then
@@ -106,6 +128,14 @@ do
     exit 1
   fi
 done
+if [ "$MANAGE_STICKY" -eq 1 ] &&
+  [ -e "$INSTALL_ROOT/claude1/zsh-sticky-integration.sh" ] &&
+  [ ! -f "$INSTALL_ROOT/claude1/zsh-sticky-integration.sh" ]; then
+  printf '%s\n' \
+    "[claude1] 安装失败：目标不是普通文件：$INSTALL_ROOT/claude1/zsh-sticky-integration.sh" \
+    >&2
+  exit 1
+fi
 
 if [ -L "$ZSHRC" ]; then
   if [ ! -e "$ZSHRC" ]; then
@@ -126,13 +156,16 @@ INSTALL_ROOT=$(CDPATH= cd "$INSTALL_ROOT" && pwd -P)
 LAUNCHER_TARGET="$INSTALL_ROOT/scripts/claude-provider-once.py"
 HUB_TARGET="$INSTALL_ROOT/scripts/claude-hub.py"
 PROTOCOL_TARGET="$INSTALL_ROOT/scripts/claude1_protocol.py"
+STATUSLINE_MODEL_TARGET="$INSTALL_ROOT/scripts/statusline-model.py"
 SHELL_TARGET="$INSTALL_ROOT/claude1/zsh-functions.sh"
+STICKY_TARGET="$INSTALL_ROOT/claude1/zsh-sticky-integration.sh"
 
 shell_quote() {
   python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]), end="")' "$1"
 }
 
 SOURCE_LINE="export CLAUDE1_SCRIPT=$(shell_quote "$LAUNCHER_TARGET") CLAUDE1_HUB_SCRIPT=$(shell_quote "$HUB_TARGET"); source $(shell_quote "$SHELL_TARGET") $MANAGED_MARKER"
+STICKY_SOURCE_LINE="source $(shell_quote "$STICKY_TARGET") $STICKY_MARKER"
 
 file_mode() {
   if mode=$(stat -c '%a' "$1" 2>/dev/null); then
@@ -169,10 +202,23 @@ zshrc_needs_update() {
   return 0
 }
 
+sticky_zshrc_needs_update() {
+  [ "$MANAGE_STICKY" -eq 1 ] || return 1
+  [ -f "$ZSHRC_TARGET" ] || return 0
+  exact_count=$(grep -Fxc "$STICKY_SOURCE_LINE" "$ZSHRC_TARGET" 2>/dev/null || true)
+  marker_count=$(grep -Fc "$STICKY_MARKER" "$ZSHRC_TARGET" 2>/dev/null || true)
+  if [ "$exact_count" = "1" ] && [ "$marker_count" = "1" ]; then
+    return 1
+  fi
+  return 0
+}
+
 NEED_LAUNCHER=0
 NEED_HUB=0
 NEED_PROTOCOL=0
+NEED_STATUSLINE_MODEL=0
 NEED_SHELL=0
+NEED_STICKY=0
 NEED_ZSHRC=0
 needs_install "$SCRIPT_DIR/claude-provider-once.py" "$LAUNCHER_TARGET" 755 &&
   NEED_LAUNCHER=1
@@ -180,9 +226,16 @@ needs_install "$SCRIPT_DIR/claude-hub.py" "$HUB_TARGET" 755 &&
   NEED_HUB=1
 needs_install "$SCRIPT_DIR/claude1_protocol.py" "$PROTOCOL_TARGET" 644 &&
   NEED_PROTOCOL=1
+needs_install "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755 &&
+  NEED_STATUSLINE_MODEL=1
 needs_install "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644 &&
   NEED_SHELL=1
+if [ "$MANAGE_STICKY" -eq 1 ]; then
+  needs_install "$SCRIPT_DIR/zsh-sticky-integration.sh" "$STICKY_TARGET" 644 &&
+    NEED_STICKY=1
+fi
 zshrc_needs_update && NEED_ZSHRC=1
+sticky_zshrc_needs_update && NEED_ZSHRC=1
 
 BACKUP_DIR=""
 ensure_backup_dir() {
@@ -220,8 +273,14 @@ fi
 if [ "$NEED_PROTOCOL" -eq 1 ]; then
   backup_existing "$PROTOCOL_TARGET" "claude1_protocol.py"
 fi
+if [ "$NEED_STATUSLINE_MODEL" -eq 1 ]; then
+  backup_existing "$STATUSLINE_MODEL_TARGET" "statusline-model.py"
+fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   backup_existing "$SHELL_TARGET" "zsh-functions.sh"
+fi
+if [ "$NEED_STICKY" -eq 1 ]; then
+  backup_existing "$STICKY_TARGET" "zsh-sticky-integration.sh"
 fi
 if [ "$NEED_ZSHRC" -eq 1 ]; then
   backup_existing "$ZSHRC_TARGET" "zshrc"
@@ -247,8 +306,14 @@ fi
 if [ "$NEED_PROTOCOL" -eq 1 ]; then
   install_file "$SCRIPT_DIR/claude1_protocol.py" "$PROTOCOL_TARGET" 644
 fi
+if [ "$NEED_STATUSLINE_MODEL" -eq 1 ]; then
+  install_file "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755
+fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   install_file "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644
+fi
+if [ "$NEED_STICKY" -eq 1 ]; then
+  install_file "$SCRIPT_DIR/zsh-sticky-integration.sh" "$STICKY_TARGET" 644
 fi
 
 if [ "$NEED_ZSHRC" -eq 1 ]; then
@@ -261,10 +326,19 @@ if [ "$NEED_ZSHRC" -eq 1 ]; then
     if [ "$existing_mode" != "unknown" ]; then
       zshrc_mode=$existing_mode
     fi
-    awk -v marker="$MANAGED_MARKER" 'index($0, marker) == 0 { print }' \
-      "$ZSHRC_TARGET" > "$temporary"
+    if [ "$MANAGE_STICKY" -eq 1 ]; then
+      awk -v marker="$MANAGED_MARKER" -v sticky="$STICKY_MARKER" \
+        'index($0, marker) == 0 && index($0, sticky) == 0 { print }' \
+        "$ZSHRC_TARGET" > "$temporary"
+    else
+      awk -v marker="$MANAGED_MARKER" 'index($0, marker) == 0 { print }' \
+        "$ZSHRC_TARGET" > "$temporary"
+    fi
   fi
   printf '%s\n' "$SOURCE_LINE" >> "$temporary"
+  if [ "$MANAGE_STICKY" -eq 1 ]; then
+    printf '%s\n' "$STICKY_SOURCE_LINE" >> "$temporary"
+  fi
   chmod "$zshrc_mode" "$temporary"
   mv "$temporary" "$ZSHRC_TARGET"
 fi
@@ -273,6 +347,10 @@ printf '%s\n' \
   "[claude1] 已安装启动器：$LAUNCHER_TARGET" \
   "[claude1] 已安装可选 Hub：$HUB_TARGET" \
   "[claude1] 已接入 zsh：$ZSHRC"
+if [ "$MANAGE_STICKY" -eq 1 ]; then
+  printf '%s\n' \
+    "[claude1] 已显式启用普通 claude 的粘性路由：$STICKY_TARGET"
+fi
 
 if [ -n "$BACKUP_DIR" ]; then
   printf '%s\n' "[claude1] 原文件备份：$BACKUP_DIR"

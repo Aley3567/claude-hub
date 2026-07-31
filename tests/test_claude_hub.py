@@ -492,6 +492,36 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(self.db_file.stat().st_mtime_ns, source_mtime)
         self.assertTrue(all(not path.exists() for path in source_sidecars))
 
+    def test_duplicate_provider_names_require_id_selectors(self):
+        duplicate_db = self.root / "duplicates.db"
+        connection = sqlite3.connect(duplicate_db)
+        try:
+            connection.execute(
+                "CREATE TABLE providers ("
+                "id TEXT, name TEXT, app_type TEXT, settings_config TEXT)"
+            )
+            settings = json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://fixture.invalid/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                    }
+                }
+            )
+            connection.executemany(
+                "INSERT INTO providers VALUES (?, 'Duplicated', 'claude', ?)",
+                [("first", settings), ("second", settings)],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        providers = hub._read_provider_rows(duplicate_db)
+
+        self.assertNotIn("Duplicated", providers)
+        self.assertIn("id:first", providers)
+        self.assertIn("id:second", providers)
+
     def test_config_and_database_permissions_fail_closed(self):
         self.config_file.chmod(0o644)
         hub.reset_caches()

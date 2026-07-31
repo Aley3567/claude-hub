@@ -114,13 +114,18 @@ class LauncherTuiLogicTests(unittest.TestCase):
             env = isolated_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 cfg = {"version": 1, "providers": {}}
-                db_order = ["Third Party A", "团队渠道", "Third Party B"]
+                db_order = [
+                    {"id": "a", "name": "Third Party A"},
+                    {"id": "b", "name": "团队渠道"},
+                    {"id": "c", "name": "Third Party B"},
+                ]
 
                 self.assertTrue(launcher.sync_config(cfg, db_order))
-                self.assertEqual(list(cfg["providers"]), db_order)
+                self.assertEqual(list(cfg["providers"]), ["a", "b", "c"])
+                self.assertEqual(cfg["version"], 3)
                 self.assertTrue(
                     all(
-                        meta == {"hidden": False}
+                        meta["hidden"] is False
                         for meta in cfg["providers"].values()
                     )
                 )
@@ -131,19 +136,19 @@ class LauncherTuiLogicTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 cfg = {
                     "providers": {
-                        "Alpha": {"hidden": False},
-                        "Beta": {"hidden": False},
-                        "Gamma": {"hidden": False},
+                        "a": {"name": "Alpha", "hidden": False},
+                        "b": {"name": "Beta", "hidden": False},
+                        "c": {"name": "Gamma", "hidden": False},
                     }
                 }
-                mru = {"Alpha": 10.0, "Gamma": 30.0, "Beta": 20.0}
+                mru = {"a": 10.0, "c": 30.0, "b": 20.0}
 
                 view = launcher._build_view(
-                    cfg, {"Alpha", "Beta", "Gamma"}, mru, False
+                    cfg, {"a", "b", "c"}, mru, False
                 )
 
-                self.assertEqual(view, ["Alpha", "Beta", "Gamma"])
-                self.assertEqual(launcher._recent_name(view, mru), "Gamma")
+                self.assertEqual(view, ["a", "b", "c"])
+                self.assertEqual(launcher._recent_name(view, mru), "c")
                 self.assertEqual(launcher._initial_index(view, mru), 2)
 
     def test_alias_matching_and_casefolded_conflict_validation(self) -> None:
@@ -151,8 +156,8 @@ class LauncherTuiLogicTests(unittest.TestCase):
             env = isolated_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 providers = [
-                    {"name": "Alpha Gateway", "alias": "Fast"},
-                    {"name": "Beta Gateway", "alias": "Safe"},
+                    {"id": "a", "name": "Alpha Gateway", "alias": "Fast"},
+                    {"id": "b", "name": "Beta Gateway", "alias": "Safe"},
                 ]
                 matches, exact = launcher.match_providers(providers, "fAsT")
                 self.assertTrue(exact)
@@ -162,33 +167,66 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 )
 
                 meta = {
-                    "Alpha Gateway": {"alias": "Fast"},
-                    "Beta Gateway": {"alias": "Safe"},
-                    "Codex": {},
+                    "a": {"name": "Alpha Gateway", "alias": "Fast"},
+                    "b": {"name": "Beta Gateway", "alias": "Safe"},
+                    "c": {"name": "Codex"},
                 }
-                changed, message = launcher._set_alias(meta, "Codex", "FAST")
+                changed, message = launcher._set_alias(meta, "c", "FAST")
                 self.assertFalse(changed)
                 self.assertIn("Alpha Gateway", message)
                 changed, message = launcher._set_alias(
-                    meta, "Codex", "bEtA GaTeWaY"
+                    meta, "c", "bEtA GaTeWaY"
                 )
                 self.assertFalse(changed)
                 self.assertIn("Beta Gateway", message)
-                self.assertNotIn("alias", meta["Codex"])
-                changed, message = launcher._set_alias(meta, "Codex", "hub")
+                self.assertNotIn("alias", meta["c"])
+                changed, message = launcher._set_alias(meta, "c", "hub")
                 self.assertFalse(changed)
                 self.assertIn("保留命令", message)
-                changed, message = launcher._set_alias(meta, "Codex", "--help")
+                changed, message = launcher._set_alias(meta, "c", "--help")
                 self.assertFalse(changed)
                 self.assertIn("命令参数", message)
+
+    def test_duplicate_names_migrate_to_stable_ids_without_collapsing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                cfg = {
+                    "version": 2,
+                    "providers": {
+                        "Duplicated": {"hidden": False, "alias": "primary"}
+                    },
+                }
+                providers = [
+                    {"id": "first-id", "name": "Duplicated"},
+                    {"id": "second-id", "name": "Duplicated"},
+                ]
+
+                self.assertTrue(launcher.sync_config(cfg, providers))
+                self.assertEqual(
+                    list(cfg["providers"]),
+                    ["first-id", "second-id"],
+                )
+                self.assertEqual(cfg["providers"]["first-id"]["alias"], "primary")
+                self.assertNotIn("alias", cfg["providers"]["second-id"])
+                self.assertEqual(
+                    launcher._provider_meta_label(cfg["providers"], "first-id"),
+                    "Duplicated [first-id]",
+                )
+                with self.assertRaisesRegex(RuntimeError, "存在冲突"):
+                    launcher.choose(providers, "Duplicated")
+                self.assertEqual(
+                    launcher.choose(providers, "id:second-id")["id"],
+                    "second-id",
+                )
 
     def test_exact_legacy_alias_collision_fails_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 providers = [
-                    {"name": "Alpha", "alias": "same"},
-                    {"name": "Beta", "alias": "SAME"},
+                    {"id": "a", "name": "Alpha", "alias": "same"},
+                    {"id": "b", "name": "Beta", "alias": "SAME"},
                 ]
                 with self.assertRaisesRegex(RuntimeError, "存在冲突"):
                     launcher.choose(providers, "same")
@@ -640,6 +678,68 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     0o600,
                 )
 
+    def test_current_provider_uses_unique_db_marker_and_main_launches_that_row(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            rows = [
+                {
+                    "id": "old",
+                    "name": "Old",
+                    "settings_config": '{"env": {}}',
+                    "is_current": 0,
+                },
+                {
+                    "id": "live",
+                    "name": "Live",
+                    "settings_config": '{"env": {}}',
+                    "is_current": 1,
+                },
+            ]
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(
+                        launcher, "db_claude_rows", return_value=rows
+                    ),
+                    mock.patch.object(
+                        launcher, "launch_provider", return_value=0
+                    ) as launch_provider,
+                ):
+                    self.assertEqual(launcher.main(["current", "-p", "ok"]), 0)
+
+                selected = launch_provider.call_args.args[0]
+                self.assertEqual(selected["id"], "live")
+                self.assertEqual(launch_provider.call_args.args[1], ["-p", "ok"])
+                self.assertEqual(
+                    launch_provider.call_args.kwargs["backend_kind"],
+                    "current",
+                )
+
+    def test_current_provider_fails_closed_for_zero_or_multiple_db_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            base = {
+                "name": "Fixture",
+                "settings_config": '{"env": {}}',
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher,
+                    "db_claude_rows",
+                    return_value=[{**base, "id": "none", "is_current": 0}],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "没有 is_current=1"):
+                        launcher.current_provider()
+                with mock.patch.object(
+                    launcher,
+                    "db_claude_rows",
+                    return_value=[
+                        {**base, "id": "one", "is_current": 1},
+                        {**base, "id": "two", "is_current": 1},
+                    ],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "多个 is_current=1"):
+                        launcher.current_provider()
+
 
 class LauncherSafetyTests(unittest.TestCase):
     def test_recent_provider_state_is_written_atomically_and_privately(self) -> None:
@@ -781,6 +881,31 @@ class LauncherSafetyTests(unittest.TestCase):
                 if path.name.startswith(f".{sticky.name}.")
             ]
             self.assertEqual(leftovers, [])
+
+    def test_use_does_not_claim_ordinary_claude_changed_without_shell_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.set_sticky("hub"), 0)
+
+            self.assertIn("已保存粘性后端 = hub", output.getvalue())
+            self.assertIn("当前 shell 未启用", output.getvalue())
+            self.assertNotIn("之后普通 claude", output.getvalue())
+
+    def test_use_confirms_routing_when_shell_opt_in_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(
+                Path(raw_home),
+                CLAUDE1_STICKY_INTEGRATION="1",
+            )
+            with loaded_launcher(env) as launcher:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.set_sticky("hub"), 0)
+
+            self.assertIn("之后普通 claude 走多渠道网关", output.getvalue())
 
     def test_temporary_settings_are_0600_and_removed_after_fake_claude(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1224,7 +1349,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(len(options), 6)
 
     def _run_home(self, launcher, keys):
-        cfg = {"providers": {"Alpha": {"hidden": False}}}
+        cfg = {"providers": {"alpha-id": {"name": "Alpha", "hidden": False}}}
         window = ScriptedWindow(keys)
         launcher._logo_pairs[:] = [0]
         with (
@@ -1233,7 +1358,7 @@ class HubWorkspaceTests(unittest.TestCase):
             mock.patch.object(launcher, "load_mru", return_value={}),
             mock.patch.object(launcher, "hub_healthy", return_value=True),
         ):
-            return launcher._launcher_main(window, cfg, {"Alpha"})
+            return launcher._launcher_main(window, cfg, {"alpha-id"})
 
     def test_enter_opens_hub_and_launches_default_model(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1267,7 +1392,7 @@ class HubWorkspaceTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 # No hub config: digit still selects the provider directly.
                 result = self._run_home(launcher, [ord("1")])
-                self.assertEqual(result, "Alpha")
+                self.assertEqual(result, "alpha-id")
 
     def test_main_launches_hub_backend_from_tui_selection(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

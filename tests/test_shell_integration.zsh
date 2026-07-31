@@ -101,6 +101,31 @@ test_default_reports_missing_launcher() {
   pass "claude1 reports a missing launcher clearly"
 }
 
+test_default_preserves_preflight_hooks_and_cleans_experimental_env() {
+  local home="$(make_home preflight)"
+  local log="${home}/calls.log"
+  print -r -- '#!/bin/sh' > "$home/bin/python3"
+  print -r -- 'printf "python3:%s\n" "$*" >> "$CALL_LOG"' >> "$home/bin/python3"
+  print -r -- 'printf "child-env:%s:%s\n" "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS-unset}" "${CLAUDE_CODE_WORKFLOWS-unset}" >> "$CALL_LOG"' >> "$home/bin/python3"
+  command chmod +x "$home/bin/python3"
+
+  HOME="$home" CALL_LOG="$log" PATH="$home/bin:/usr/bin:/bin" \
+    DEFAULT_SCRIPT_PATH="$DEFAULT_INTEGRATION" \
+    CLAUDE1_SCRIPT="$home/launcher.py" \
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS="must-not-leak" \
+    CLAUDE_CODE_WORKFLOWS="must-not-leak" \
+    zsh -f -c '
+      _claude_ensure_toolsearch_patch() { print -r -- toolsearch >> "$CALL_LOG"; }
+      _claude_ensure_ghostty_progress_patch() { print -r -- ghostty >> "$CALL_LOG"; }
+      source "$DEFAULT_SCRIPT_PATH"
+      claude1 sample
+      print -r -- "after:${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS}:${CLAUDE_CODE_WORKFLOWS}" >> "$CALL_LOG"
+    '
+
+  assert_line $'toolsearch\nghostty\npython3:'"${home}"$'/launcher.py sample\nchild-env:unset:unset\nafter:must-not-leak:must-not-leak' "$log"
+  pass "managed claude1 preserves optional preflights and scopes env cleanup"
+}
+
 run_sticky_case() {
   local home="$1"
   local backend="$2"
@@ -198,6 +223,7 @@ test_opt_in_rejects_unknown_backend() {
 test_default_does_not_override_claude
 test_default_preserves_existing_claude_function
 test_default_reports_missing_launcher
+test_default_preserves_preflight_hooks_and_cleans_experimental_env
 test_opt_in_routes
 test_opt_in_reports_missing_direct_binary
 test_opt_in_reports_missing_launcher
