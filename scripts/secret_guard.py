@@ -61,13 +61,17 @@ PUBLIC_PROVIDER_LABELS = {
     "codex",
     "deepseek",
     "direct",
+    "fable",
     "glm",
     "gpt",
     "grok",
+    "haiku",
     "hub",
     "kimi",
     "mimo",
     "openai",
+    "opus",
+    "sonnet",
 }
 GENERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (

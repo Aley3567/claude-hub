@@ -61,7 +61,8 @@ claude1 mimo                    # 按 provider 名或唯一别名直达
 claude1 direct                  # 本次直接启动原生 Claude Code
 claude1 current                 # 本次使用 DB is_current 标记的 CC Switch 当前渠道
 claude1 any                     # 本次使用已有的 AnyRouter settings
-claude1 hub                     # 本次通过可选 claude-hub 启动
+claude1 hub                     # 按 launch_slot 直启可选 claude-hub
+claude1 hub --slot sonnet       # 从指定 Fable/Opus/Sonnet/Haiku 槽位启动
 claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
 claude1 list                    # 稳定顺序列出可见渠道
 claude1 doctor                  # 本机只读检查，不连接 provider
@@ -134,7 +135,8 @@ mode、permission-mode、last-prompt、file-history 和 system 统计元条目�
 ## 可选：启用 claude-hub
 
 Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监听本机
-`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。
+`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。启动页聚焦 Hub 时，
+Enter 按配置的 `launch_slot` 直接启动，按 `→` 才进入 Slots / Channels 管理页。
 
 1. 安装 uv。
 2. 从仓库复制示例配置，并将 provider 名改成 CC Switch 中的真实名称：
@@ -145,8 +147,16 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
    ${EDITOR:-vi} ~/.cc-switch/claude-hub.json
    ```
 
-   如果 CC Switch 中有重名 provider，Hub 不接受歧义名称；把 channel 的
-   `provider` 写成 `id:<provider-id>`。
+   `model_slots` 把 Fable、Opus、Sonnet、Haiku 四个原生槽位绑定到已声明的
+   `渠道,模型`；`launch_slot` 决定默认直启槽位，`effort_by_slot` 分别保存每个
+   槽位的默认 effort。`default_channel` 仍只负责裸模型请求的网关回退路由，
+   不等同于启动默认值。
+
+   channel 的 `provider` 建议写成 `id:<provider-id>`；Hub 的 Channels 添加向导
+   会始终保存稳定 id，不保存凭证。向导优先复用 CC Switch 的协议元数据；无法
+   判断时会要求选择 Anthropic、OpenAI Chat 或 OpenAI Responses，避免静默使用
+   错误协议。旧配置首次打开时会原子迁移到 v2，并在同目录留下一份
+   `claude-hub.json.bak-migrate-*` 私有备份。
 
 3. 生成并保存一个仅供本机 Claude Code 连接 Hub 使用的 token，再启动。Hub
    持续运行期间应复用同一个 token：
@@ -165,9 +175,12 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
 不会显示上游地址或 token。Hub 会要求配置、CC Switch 数据库以及当前存在的
 `-wal`、`-shm` 文件权限不超过 `0600`；检查失败时按输出修正后再启动。
 
-进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Hub
-会在请求发生时从 CC Switch DB 只读获取对应 provider 的凭证，不修改 DB、
-provider 或 current 状态。
+进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Slots
+页可用 `←`、`→` 或 `e` 修改当前槽位的默认 effort，用 `b` 将模型池里的模型绑定
+到某个槽位；Channels 页可添加或删除未被回退路由和槽位引用的渠道。槽位默认
+effort 通过本次会话的临时 settings 注入，不会用环境变量锁死，进入会话后仍可用
+原生 `/effort` 调整。Hub 会在请求发生时从 CC Switch DB 只读获取对应 provider
+的凭证，不修改 DB、provider 或 current 状态。
 
 ## 可选：查看 token 用量与缓存命中率
 

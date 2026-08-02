@@ -211,6 +211,9 @@ class SecretGuardTests(unittest.TestCase):
     def test_public_vendor_labels_are_not_private_fingerprints(self) -> None:
         self.assertTrue(secret_guard.is_public_provider_label("Claude-Hub"))
         self.assertTrue(secret_guard.is_public_provider_label("OpenAI"))
+        for slot in ("Fable", "Opus", "Sonnet", "Haiku"):
+            with self.subTest(slot=slot):
+                self.assertTrue(secret_guard.is_public_provider_label(slot))
         self.assertFalse(secret_guard.is_public_provider_label("my-company-route"))
 
     def test_loopback_urls_are_not_private_upstream_fingerprints(self) -> None:

@@ -630,6 +630,11 @@ class LauncherTuiLogicTests(unittest.TestCase):
                         "missing,sonnet",
                         {"fast": {}},
                     )
+                with self.assertRaisesRegex(RuntimeError, "没有模型"):
+                    launcher._normalize_hub_model(
+                        "fast,unknown",
+                        {"fast": {"models": ["sonnet-next"]}},
+                    )
                 with self.assertRaisesRegex(RuntimeError, "只能指定一次"):
                     launcher._extract_hub_model(
                         ["--model=a,one", "--model", "b,two"]
@@ -1807,9 +1812,8 @@ class LauncherSafetyTests(unittest.TestCase):
                         "glm,glm-fixture",
                     )
                     self.assertEqual(settings["effortLevel"], "xhigh")
-                    self.assertEqual(
-                        settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
-                        "xhigh",
+                    self.assertNotIn(
+                        "CLAUDE_CODE_EFFORT_LEVEL", settings["env"]
                     )
                     for tier in launcher.MODEL_SLOT_TIERS:
                         self.assertEqual(
@@ -1991,6 +1995,7 @@ class ScriptedWindow:
         self._keys = list(keys)
         self._size = size
         self.timeouts: list[int] = []
+        self.added: list[tuple] = []
 
     def getmaxyx(self):
         return self._size
@@ -2007,8 +2012,8 @@ class ScriptedWindow:
     def erase(self):
         return
 
-    def addstr(self, *_args):
-        return
+    def addstr(self, *args):
+        self.added.append(args)
 
     def refresh(self):
         return
@@ -2035,6 +2040,24 @@ HUB_FIXTURE = {
     },
 }
 
+HUB_V2_FIXTURE = {
+    **HUB_FIXTURE,
+    "version": 2,
+    "launch_slot": "fable",
+    "model_slots": {
+        "fable": "any,claude-fixture-5[1m]",
+        "opus": "grok,grok-4.5",
+        "sonnet": "glm,glm-5.2",
+        "haiku": "gpt,gpt-5.6-sol",
+    },
+    "effort_by_slot": {
+        "fable": "xhigh",
+        "opus": "high",
+        "sonnet": "medium",
+        "haiku": "low",
+    },
+}
+
 
 class HubWorkspaceTests(unittest.TestCase):
     def _hub_env(self, home: Path, write_config: bool = True) -> dict[str, str]:
@@ -2049,12 +2072,15 @@ class HubWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
-                status, options = launcher.build_hub_view(HUB_FIXTURE)
+                status, options = launcher.build_hub_view(HUB_V2_FIXTURE)
                 self.assertEqual(status.channel_count, 4)
                 self.assertEqual(status.model_count, 6)
                 self.assertEqual(status.default_channel, "glm")
                 self.assertEqual(status.default_model, "glm-5.2")
-                self.assertEqual(status.summary, "4 渠道 · 6 模型")
+                self.assertEqual(
+                    status.summary,
+                    "4 槽 · 4 渠道 · 默认 any,claude-fixture-5[1m] · xhigh",
+                )
 
                 self.assertTrue(options[0].is_default)
                 self.assertEqual(options[0].selector, "glm,glm-5.2")
@@ -2072,6 +2098,237 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(
                     by_selector["any,claude-fixture-5[1m]"].status_label, "1M"
                 )
+
+    def test_loading_v1_config_migrates_once_and_keeps_route_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            legacy = {
+                **HUB_FIXTURE,
+                "version": 1,
+                "effort_level": "xhigh",
+                "model_slots": {
+                    "fable": "any,claude-fixture-5[1m]",
+                    "opus": "grok,grok-4.5",
+                    "sonnet": "glm,glm-5.2",
+                    "haiku": "gpt,gpt-5.6-sol",
+                },
+                "future_field": {"preserved": True},
+            }
+            config.write_text(json.dumps(legacy), encoding="utf-8")
+            config.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                migrated = launcher.load_hub_config(migrate=True)
+                first_backups = list(config.parent.glob("hub.json.bak-migrate-*"))
+                reloaded = launcher.load_hub_config(migrate=True)
+                second_backups = list(config.parent.glob("hub.json.bak-migrate-*"))
+
+            self.assertEqual(migrated, reloaded)
+            self.assertEqual(migrated["version"], 2)
+            self.assertEqual(migrated["default_channel"], "glm")
+            self.assertEqual(migrated["launch_slot"], "fable")
+            self.assertEqual(
+                migrated["effort_by_slot"],
+                {
+                    "fable": "xhigh",
+                    "opus": "high",
+                    "sonnet": "high",
+                    "haiku": "high",
+                },
+            )
+            self.assertNotIn("effort_level", migrated)
+            self.assertEqual(migrated["future_field"], {"preserved": True})
+            self.assertEqual(len(first_backups), 1)
+            self.assertEqual(second_backups, first_backups)
+            self.assertEqual(json.loads(first_backups[0].read_text()), legacy)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(first_backups[0].stat().st_mode), 0o600)
+
+    def test_v1_migration_accepts_legacy_aliases_and_normalizes_models(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home, write_config=False)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "default_channel": "1.legacy",
+                        "channels": {
+                            "1.legacy": {
+                                "provider": "Legacy",
+                                "models": [" spaced-model "],
+                            },
+                            "empty.channel": {"provider": "Empty", "models": []},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                migrated = launcher.load_hub_config(migrate=True)
+
+            self.assertEqual(
+                migrated["channels"]["1.legacy"]["models"], ["spaced-model"]
+            )
+            self.assertEqual(migrated["channels"]["empty.channel"]["models"], [])
+            self.assertEqual(
+                migrated["model_slots"]["fable"], "1.legacy,spaced-model"
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX lock-file safety")
+    def test_hub_config_lock_refuses_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.chmod(0o600)
+            target = home / "do-not-chmod"
+            target.write_text("fixture", encoding="utf-8")
+            target.chmod(0o644)
+            config.with_name(config.name + ".lock").symlink_to(target)
+
+            with loaded_launcher(env) as launcher:
+                with self.assertRaises(OSError):
+                    launcher.load_hub_config(migrate=True)
+
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_workspace_has_four_native_slots_then_only_unbound_models(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                slots, pool = launcher.build_hub_workspace(HUB_V2_FIXTURE)
+
+            self.assertEqual([item.slot for item in slots], list(launcher.HUB_SLOT_ORDER))
+            self.assertEqual(
+                [item.selector for item in slots],
+                [
+                    "any,claude-fixture-5[1m]",
+                    "grok,grok-4.5",
+                    "glm,glm-5.2",
+                    "gpt,gpt-5.6-sol",
+                ],
+            )
+            self.assertEqual(
+                [item.effort for item in slots], ["xhigh", "high", "medium", "low"]
+            )
+            self.assertEqual(
+                [item.selector for item in pool],
+                ["gpt,gpt-5.6-luna", "any,claude-opus-4-6"],
+            )
+
+    def test_exec_hub_slot_uses_that_slots_model_and_initial_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            env["FIXTURE_HUB_TOKEN"] = "fixture-local-token"
+            config = {
+                **HUB_V2_FIXTURE,
+                "local_token_env": "FIXTURE_HUB_TOKEN",
+            }
+            config_path = Path(env["CLAUDE1_HUB_CONFIG"])
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            config_path.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher, "launch_with_settings", return_value=0
+                    ) as launch,
+                ):
+                    self.assertEqual(
+                        launcher.exec_hub(["--slot", "sonnet", "-p", "hello"]),
+                        0,
+                    )
+
+            settings, forwarded = launch.call_args.args
+            self.assertEqual(forwarded, ["-p", "hello"])
+            self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "glm,glm-5.2")
+            self.assertEqual(settings["effortLevel"], "medium")
+            self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", settings["env"])
+            self.assertEqual(
+                settings["env"][
+                    "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES"
+                ],
+                "thinking,adaptive_thinking,effort,xhigh_effort",
+            )
+            self.assertEqual(
+                settings["env"][
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES"
+                ],
+                "thinking,adaptive_thinking,effort,xhigh_effort",
+            )
+
+    def test_exec_hub_model_inherits_unique_slot_effort_and_forwards_cli_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            env["FIXTURE_HUB_TOKEN"] = "fixture-local-token"
+            config = {
+                **HUB_V2_FIXTURE,
+                "local_token_env": "FIXTURE_HUB_TOKEN",
+            }
+            path = Path(env["CLAUDE1_HUB_CONFIG"])
+            path.write_text(json.dumps(config), encoding="utf-8")
+            path.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher, "launch_with_settings", return_value=0
+                    ) as launch,
+                ):
+                    launcher.exec_hub(
+                        [
+                            "--model",
+                            "any,claude-fixture-5[1m]",
+                            "--effort",
+                            "low",
+                        ]
+                    )
+
+            settings, forwarded = launch.call_args.args
+            self.assertEqual(settings["effortLevel"], "xhigh")
+            self.assertEqual(forwarded, ["--effort", "low"])
+            self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", settings["env"])
+
+    def test_resume_prefers_launch_slot_effort_when_selectors_are_duplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            env["FIXTURE_HUB_TOKEN"] = "fixture-local-token"
+            selector = "glm,glm-5.2"
+            config = {
+                **HUB_V2_FIXTURE,
+                "local_token_env": "FIXTURE_HUB_TOKEN",
+                "model_slots": {
+                    slot: selector
+                    for slot in ("fable", "opus", "sonnet", "haiku")
+                },
+            }
+            path = Path(env["CLAUDE1_HUB_CONFIG"])
+            path.write_text(json.dumps(config), encoding="utf-8")
+            path.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher, "_resume_session_selector", return_value=selector
+                    ),
+                    mock.patch.object(
+                        launcher, "launch_with_settings", return_value=0
+                    ) as launch,
+                ):
+                    self.assertEqual(launcher.exec_hub(["--continue"]), 0)
+
+            settings, _args = launch.call_args.args
+            self.assertEqual(settings["effortLevel"], "xhigh")
 
     def test_hub_model_family_classification(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2114,30 +2371,432 @@ class HubWorkspaceTests(unittest.TestCase):
         ):
             return launcher._launcher_main(window, cfg, {"alpha-id"})
 
-    def test_enter_opens_hub_and_launches_default_model(self) -> None:
+    def test_enter_launches_configured_slot_without_opening_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
             with loaded_launcher(env) as launcher:
-                # Enter (home -> hub workspace), Enter (launch default).
-                result = self._run_home(launcher, [10, 10])
+                result = self._run_home(launcher, [10])
                 self.assertIsInstance(result, launcher.HubLaunch)
-                self.assertEqual(result.option.selector, "glm,glm-5.2")
+                self.assertEqual(result.slot, "fable")
+                self.assertIsNone(result.option)
 
-    def test_hub_workspace_down_then_enter_launches_second_model(self) -> None:
+    def test_right_opens_slots_and_enter_preserves_the_selected_slot(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
             with loaded_launcher(env) as launcher:
-                # Enter -> hub, j (down), Enter -> launch second option.
-                result = self._run_home(launcher, [10, ord("j"), 10])
-                self.assertIsInstance(result, launcher.HubLaunch)
-                self.assertEqual(result.option.selector, "gpt,gpt-5.6-sol")
+                result = self._run_home(
+                    launcher, [launcher.curses.KEY_RIGHT, ord("j"), 10]
+                )
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.slot, "opus")
+            self.assertIsNone(result.option)
+
+    def test_tab_round_trip_restores_the_previous_slot_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(
+                    launcher,
+                    [
+                        launcher.curses.KEY_RIGHT,
+                        ord("j"),
+                        ord("\t"),
+                        ord("\t"),
+                        10,
+                    ],
+                )
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.slot, "opus")
+
+    def test_workspace_effort_key_persists_the_highlighted_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(
+                    launcher,
+                    [launcher.curses.KEY_RIGHT, ord("e"), 27, ord("q")],
+                )
+
+            self.assertIsNone(result)
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["effort_by_slot"]["fable"], "low")
+            self.assertEqual(persisted["effort_by_slot"]["opus"], "high")
+
+    def test_workspace_effort_conflict_reloads_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                real_mutate = launcher.mutate_hub_config
+                first = True
+
+                def racing_mutate(mutator):
+                    nonlocal first
+                    if first:
+                        first = False
+                        external = json.loads(config.read_text(encoding="utf-8"))
+                        external["effort_by_slot"]["fable"] = "medium"
+                        config.write_text(json.dumps(external), encoding="utf-8")
+                        config.chmod(0o600)
+                        raise ValueError("槽位 effort 已被另一窗口修改，请重试")
+                    return real_mutate(mutator)
+
+                with mock.patch.object(
+                    launcher, "mutate_hub_config", side_effect=racing_mutate
+                ):
+                    self._run_home(
+                        launcher,
+                        [launcher.curses.KEY_RIGHT, ord("e"), ord("e"), 27, ord("q")],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["effort_by_slot"]["fable"], "high")
+
+    def test_channels_tab_launches_the_highlighted_channels_first_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(
+                    launcher,
+                    [launcher.curses.KEY_RIGHT, ord("\t"), 10],
+                )
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertIsNone(result.slot)
+            self.assertEqual(result.option.selector, "glm,glm-5.2")
+
+    def test_pool_binding_updates_one_slot_and_removes_model_from_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(
+                    launcher,
+                    [
+                        launcher.curses.KEY_RIGHT,
+                        ord("j"), ord("j"), ord("j"), ord("j"),
+                        ord("b"), ord("h"), ord("y"), 10,
+                        27, ord("q"),
+                    ],
+                )
+                persisted = launcher.load_hub_config()
+                _slots, pool = launcher.build_hub_workspace(persisted)
+
+            self.assertIsNone(result)
+            self.assertEqual(
+                persisted["model_slots"]["haiku"], "gpt,gpt-5.6-luna"
+            )
+            self.assertNotIn(
+                "gpt,gpt-5.6-luna", [option.selector for option in pool]
+            )
+
+    def test_adding_channel_persists_stable_provider_id_without_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "provider-stable-id",
+                "name": "Renamable Provider",
+                "settings_config": json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "new-model",
+                            "ANTHROPIC_AUTH_TOKEN": "fixture-private-value",
+                        }
+                    }
+                ),
+                "meta": "{}",
+            }
+            with loaded_launcher(env) as launcher:
+                updated = launcher.add_hub_channel(
+                    provider,
+                    alias="new_channel",
+                    model="new-model",
+                )
+
+            self.assertEqual(
+                updated["channels"]["new_channel"],
+                {"provider": "id:provider-stable-id", "models": ["new-model"]},
+            )
+            serialized = config.read_text(encoding="utf-8")
+            self.assertNotIn("fixture-private-value", serialized)
+
+    def test_slot_binding_compare_and_swap_refuses_a_stale_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {"id": "new-id", "name": "New"}
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(ValueError, "另一窗口"):
+                    launcher.add_hub_channel(
+                        provider,
+                        alias="new-channel",
+                        model="new-model",
+                        slot="fable",
+                        expected_slot_selector="stale,selector",
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("new-channel", persisted["channels"])
+
+    def test_hub_provider_picker_scrolls_to_the_selected_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            providers = [
+                {"id": f"p{i}", "name": f"Provider {i}"} for i in range(6)
+            ]
+            window = ScriptedWindow(
+                [ord("j"), ord("j"), 10],
+                size=(6, 80),
+            )
+            with loaded_launcher(env) as launcher:
+                launcher.C = {}
+                selected = launcher._choose_hub_provider(window, providers)
+
+            self.assertEqual(selected["id"], "p2")
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("▸ Provider 2", rendered)
+
+    def test_compact_hub_home_keeps_one_provider_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            window = ScriptedWindow([], size=(8, 80))
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher.C = {}
+                launcher._logo_pairs[:] = [0]
+                status, _options = launcher.build_hub_view(HUB_V2_FIXTURE)
+                self.assertLessEqual(
+                    sum(launcher._hub_columns(32)) + 4,
+                    32 - 4,
+                )
+                launcher._draw_launcher(
+                    window,
+                    cfg,
+                    ["alpha-id"],
+                    0,
+                    False,
+                    {},
+                    hub_status=status,
+                    hub_focus=True,
+                )
+
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("Alpha", rendered)
+
+    def test_workspace_failure_is_shown_and_home_reloads_after_back(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            window = ScriptedWindow(
+                [
+                    # Enter workspace, Channels, try deleting fallback, then back.
+                    # The confirmation consumes y.
+                    261, ord("\t"), ord("d"), ord("y"), 10, 27, ord("q")
+                ]
+            )
+            with loaded_launcher(env) as launcher:
+                window._keys[0] = launcher.curses.KEY_RIGHT
+                cfg = {
+                    "providers": {
+                        "alpha-id": {"name": "Alpha", "hidden": False}
+                    }
+                }
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "hub_healthy", return_value=True),
+                    mock.patch.object(
+                        launcher, "_load_hub_view", wraps=launcher._load_hub_view
+                    ) as load_view,
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"alpha-id"})
+                    )
+
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("fallback", rendered)
+            self.assertGreaterEqual(load_view.call_count, 2)
+
+    def test_channels_add_wizard_uses_provider_defaults_and_adds_to_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "new-provider-id",
+                "name": "New Provider",
+                "settings_config": json.dumps(
+                    {"env": {"ANTHROPIC_MODEL": "new-model"}}
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    result = self._run_home(
+                        launcher,
+                        [
+                            launcher.curses.KEY_RIGHT,
+                            ord("\t"), ord("a"),
+                            10,  # provider
+                            10,  # generated alias
+                            10,  # provider model
+                            ord("p"),  # pool only
+                            27, ord("q"),
+                        ],
+                    )
+
+            self.assertIsNone(result)
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["new-provider"],
+                {"provider": "id:new-provider-id", "models": ["new-model"]},
+            )
+
+    def test_channels_add_wizard_prompts_when_api_format_cannot_be_inferred(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "unknown-format-id",
+                "name": "Unknown Format",
+                "settings_config": json.dumps(
+                    {"env": {"ANTHROPIC_MODEL": "unknown-model"}}
+                ),
+                "meta": "{}",
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            launcher.curses.KEY_RIGHT,
+                            ord("\t"),
+                            ord("a"),
+                            10,
+                            10,
+                            10,
+                            ord("c"),
+                            ord("p"),
+                            27,
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["unknown-format"],
+                {
+                    "provider": "id:unknown-format-id",
+                    "models": ["unknown-model"],
+                    "api_format": "openai_chat",
+                },
+            )
+
+    def test_channel_delete_refuses_route_or_slot_references(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(ValueError, "fallback"):
+                    launcher.remove_hub_channel("glm")
+                with self.assertRaisesRegex(ValueError, "槽位"):
+                    launcher.remove_hub_channel("grok")
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertIn("glm", persisted["channels"])
+            self.assertIn("grok", persisted["channels"])
+
+    def test_channels_delete_removes_confirmed_unbound_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {"id": "removable-id", "name": "Removable"}
+            with loaded_launcher(env) as launcher:
+                launcher.add_hub_channel(
+                    provider, alias="removable", model="temporary-model"
+                )
+                result = self._run_home(
+                    launcher,
+                    [
+                        launcher.curses.KEY_RIGHT, ord("\t"),
+                        ord("j"), ord("j"), ord("j"), ord("j"),
+                        ord("d"), ord("y"), 10,
+                        27, ord("q"),
+                    ],
+                )
+
+            self.assertIsNone(result)
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertNotIn("removable", persisted["channels"])
 
     def test_hub_workspace_esc_returns_home_then_quit(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
-                # Enter -> hub, Esc -> home, q -> quit launcher.
-                result = self._run_home(launcher, [10, 27, ord("q")])
+                result = self._run_home(
+                    launcher, [launcher.curses.KEY_RIGHT, 27, ord("q")]
+                )
                 self.assertIsNone(result)
 
     def test_home_has_no_hub_entry_without_config(self) -> None:
@@ -2164,6 +2823,23 @@ class HubWorkspaceTests(unittest.TestCase):
                 ):
                     self.assertEqual(launcher.main([]), 0)
                 exec_hub.assert_called_once_with(["--model", "gpt,gpt-5.6-sol"])
+
+    def test_main_launches_hub_slot_from_tui_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "run_tui_launcher",
+                        return_value=("hub-slot", "fable"),
+                    ),
+                    mock.patch.object(
+                        launcher, "exec_hub", return_value=0
+                    ) as exec_hub,
+                ):
+                    self.assertEqual(launcher.main([]), 0)
+                exec_hub.assert_called_once_with(["--slot", "fable"])
 
     def test_run_tui_launcher_maps_hub_launch_to_hub_action(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2201,6 +2877,34 @@ class HubWorkspaceTests(unittest.TestCase):
                 ):
                     self.assertEqual(
                         launcher.run_tui_launcher(), ("hub", "glm,glm-5.2")
+                    )
+
+    def test_run_tui_launcher_preserves_slot_launch_context(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "db_claude_rows", return_value=[]),
+                    mock.patch.object(
+                        launcher,
+                        "load_config",
+                        return_value={"version": 2, "providers": {}},
+                    ),
+                    mock.patch.object(launcher.sys.stdin, "isatty", return_value=True),
+                    mock.patch.object(launcher.sys.stdout, "isatty", return_value=True),
+                    mock.patch.object(
+                        launcher.shutil,
+                        "get_terminal_size",
+                        return_value=os.terminal_size((120, 40)),
+                    ),
+                    mock.patch.object(
+                        launcher.curses,
+                        "wrapper",
+                        return_value=launcher.HubLaunch(slot="fable"),
+                    ),
+                ):
+                    self.assertEqual(
+                        launcher.run_tui_launcher(), ("hub-slot", "fable")
                     )
 
 
