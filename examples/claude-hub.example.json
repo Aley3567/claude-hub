@@ -1,17 +1,31 @@
 {
+  "version": 2,
   "port": 18787,
   "local_token_env": "CLAUDE_HUB_LOCAL_TOKEN",
   "default_channel": "primary",
+  "launch_slot": "fable",
+  "model_slots": {
+    "fable": "primary,claude-opus-4-20250514",
+    "opus": "primary,claude-opus-4-20250514",
+    "sonnet": "primary,claude-sonnet-4-20250514",
+    "haiku": "proxy-channel,claude-sonnet-4-20250514"
+  },
+  "effort_by_slot": {
+    "fable": "xhigh",
+    "opus": "high",
+    "sonnet": "high",
+    "haiku": "high"
+  },
   "channels": {
     "primary": {
-      "provider": "CC Switch provider name",
+      "provider": "id:cc-switch-provider-id",
       "models": [
         "claude-sonnet-4-20250514",
         "claude-opus-4-20250514"
       ]
     },
     "proxy-channel": {
-      "provider": "Another CC Switch provider",
+      "provider": "id:another-cc-switch-provider-id",
       "api_format": "openai_chat",
       "models": [
         "claude-sonnet-4-20250514"

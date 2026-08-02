@@ -18,6 +18,7 @@ import json
 import hmac
 import math
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -1047,6 +1048,294 @@ _HUB_FAMILY_COLOR = {
     "其他": "violet",
 }
 
+HUB_CONFIG_VERSION = 2
+HUB_SLOT_ORDER = ("fable", "opus", "sonnet", "haiku")
+HUB_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+HUB_DEFAULT_EFFORTS = {
+    "fable": "xhigh",
+    "opus": "high",
+    "sonnet": "high",
+    "haiku": "high",
+}
+
+
+@contextmanager
+def _hub_config_lock():
+    """Serialize Hub config migrations and interactive edits."""
+    if os.name != "posix":
+        yield
+        return
+    import fcntl
+
+    lock_path = HUB_CONFIG.with_name(HUB_CONFIG.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("hub 配置锁必须是普通文件")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _hub_config_text(config: dict) -> str:
+    return json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+
+
+def _read_hub_config_text() -> str:
+    """Read the config without following a swapped symlink or special file."""
+    expected = HUB_CONFIG.lstat()
+    if not stat.S_ISREG(expected.st_mode):
+        raise ValueError("hub 配置必须是普通文件")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(HUB_CONFIG, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise OSError("hub 配置在读取期间发生变化")
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _validate_hub_slot_selector(
+    selector: object,
+    channels: dict,
+    field: str,
+) -> str:
+    if not isinstance(selector, str):
+        raise ValueError(f"{field} 必须是 <渠道,模型>")
+    alias, separator, model = selector.strip().partition(",")
+    alias, model = alias.strip().lower(), model.strip()
+    channel = channels.get(alias)
+    models = channel.get("models") if isinstance(channel, dict) else None
+    if (
+        not separator
+        or not alias
+        or not model
+        or not isinstance(models, list)
+        or model not in models
+    ):
+        raise ValueError(f"{field} 必须引用 channels 中已声明的模型")
+    return f"{alias},{model}"
+
+
+def normalize_hub_config(raw: object) -> dict:
+    """Normalize a v1/v2 Hub document without performing I/O.
+
+    ``default_channel`` remains the gateway's bare-model fallback route;
+    ``launch_slot`` independently controls which native Claude slot the
+    launcher starts. Unknown fields are preserved for forward compatibility.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("hub 配置根必须是对象")
+    config = json.loads(json.dumps(raw))
+    version = config.get("version", 1)
+    if type(version) is not int or version not in (1, HUB_CONFIG_VERSION):
+        raise ValueError(f"不支持的 hub 配置版本: {version}")
+    channels = config.get("channels")
+    if not isinstance(channels, dict) or not channels:
+        raise ValueError("hub 配置缺少 channels")
+    for alias, channel in channels.items():
+        if (
+            not isinstance(alias, str)
+            or not alias.strip()
+            or alias != alias.strip().lower()
+        ):
+            raise ValueError(f"hub 渠道别名无效: {alias!r}")
+        models = channel.get("models") if isinstance(channel, dict) else None
+        if (
+            not isinstance(models, list)
+            or any(not isinstance(model, str) or not model.strip() for model in models)
+        ):
+            raise ValueError(f"channels.{alias}.models 必须是非空模型字符串列表")
+        channel["models"] = [model.strip() for model in models]
+    default_channel = config.get("default_channel")
+    if not isinstance(default_channel, str):
+        raise ValueError("hub 配置缺少 default_channel")
+    default_channel = default_channel.strip().lower()
+    default = channels.get(default_channel)
+    default_models = default.get("models") if isinstance(default, dict) else None
+    if (
+        not isinstance(default_models, list)
+        or not default_models
+        or not isinstance(default_models[0], str)
+        or not default_models[0].strip()
+    ):
+        raise ValueError("hub default_channel 必须引用有模型的渠道")
+    config["default_channel"] = default_channel
+    fallback_selector = f"{default_channel},{default_models[0].strip()}"
+
+    raw_slots = config.get("model_slots")
+    if raw_slots is None:
+        raw_slots = {}
+    if not isinstance(raw_slots, dict):
+        raise ValueError("hub model_slots 必须是对象")
+    slots: dict[str, str] = {}
+    for slot in HUB_SLOT_ORDER:
+        slots[slot] = _validate_hub_slot_selector(
+            raw_slots.get(slot, fallback_selector),
+            channels,
+            f"model_slots.{slot}",
+        )
+    config["model_slots"] = slots
+
+    launch_slot = config.get("launch_slot", "fable")
+    if not isinstance(launch_slot, str) or launch_slot.casefold() not in HUB_SLOT_ORDER:
+        raise ValueError("hub launch_slot 必须是 fable、opus、sonnet 或 haiku")
+    config["launch_slot"] = launch_slot.casefold()
+
+    raw_efforts = config.get("effort_by_slot")
+    if raw_efforts is None:
+        raw_efforts = {}
+    if not isinstance(raw_efforts, dict):
+        raise ValueError("hub effort_by_slot 必须是对象")
+    efforts: dict[str, str] = {}
+    for slot in HUB_SLOT_ORDER:
+        effort = raw_efforts.get(slot, HUB_DEFAULT_EFFORTS[slot])
+        if effort not in HUB_EFFORT_LEVELS:
+            raise ValueError(
+                f"effort_by_slot.{slot} 必须是 low、medium、high 或 xhigh"
+            )
+        efforts[slot] = effort
+    config["effort_by_slot"] = efforts
+    config["version"] = HUB_CONFIG_VERSION
+    config.pop("effort_level", None)
+    return config
+
+
+def _hub_migration_backup_path() -> Path:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    base = HUB_CONFIG.with_name(f"{HUB_CONFIG.name}.bak-migrate-{timestamp}")
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}-{suffix}")
+        suffix += 1
+    return candidate
+
+
+def load_hub_config(*, migrate: bool = False) -> dict:
+    """Load and validate Hub config, optionally migrating it atomically once."""
+    if not HUB_CONFIG.is_file():
+        raise ValueError(f"hub 配置不存在: {HUB_CONFIG}")
+    if not migrate:
+        return normalize_hub_config(json.loads(_read_hub_config_text()))
+    with _hub_config_lock():
+        original_text = _read_hub_config_text()
+        raw = json.loads(original_text)
+        normalized = normalize_hub_config(raw)
+        if normalized != raw:
+            _atomic_private_write(_hub_migration_backup_path(), original_text)
+            _atomic_private_write(HUB_CONFIG, _hub_config_text(normalized))
+        return normalized
+
+
+def mutate_hub_config(mutator) -> dict:
+    """Apply one config mutation against the latest on-disk v2 document."""
+    with _hub_config_lock():
+        original_text = _read_hub_config_text()
+        raw = json.loads(original_text)
+        config = normalize_hub_config(raw)
+        migration_needed = config != raw
+        mutator(config)
+        normalized = normalize_hub_config(config)
+        if normalized != raw:
+            if migration_needed:
+                _atomic_private_write(_hub_migration_backup_path(), original_text)
+            _atomic_private_write(HUB_CONFIG, _hub_config_text(normalized))
+        return normalized
+
+
+def add_hub_channel(
+    provider: dict,
+    *,
+    alias: str,
+    model: str,
+    slot: str | None = None,
+    expected_slot_selector: str | None = None,
+    api_format: str | None = None,
+) -> dict:
+    """Add one credential-free channel referencing a stable CC Switch id."""
+    alias = alias.strip().casefold()
+    model = model.strip()
+    provider_id = str(provider.get("id") or "").strip()
+    if re.fullmatch(r"[a-z][a-z0-9_-]*", alias) is None:
+        raise ValueError("渠道 alias 必须匹配 [a-z][a-z0-9_-]*")
+    if not provider_id:
+        raise ValueError("provider 缺少稳定 id")
+    if not model or "," in model:
+        raise ValueError("model 必须是非空且不能包含逗号")
+    if slot is not None and slot not in HUB_SLOT_ORDER:
+        raise ValueError("slot 必须是 fable、opus、sonnet 或 haiku")
+    if expected_slot_selector is not None and slot is None:
+        raise ValueError("expected_slot_selector 只能与 slot 一起使用")
+    if api_format is not None and api_format not in {
+        "anthropic",
+        "openai_chat",
+        "openai_responses",
+    }:
+        raise ValueError("api_format 无效")
+
+    def add(latest: dict) -> None:
+        if alias in latest["channels"]:
+            raise ValueError(f"hub 渠道已存在: {alias}")
+        latest["channels"][alias] = {
+            "provider": f"id:{provider_id}",
+            "models": [model],
+        }
+        if api_format is not None:
+            latest["channels"][alias]["api_format"] = api_format
+        if slot is not None:
+            if (
+                expected_slot_selector is not None
+                and latest["model_slots"][slot] != expected_slot_selector
+            ):
+                raise ValueError("槽位已被另一窗口修改，请重新确认")
+            latest["model_slots"][slot] = f"{alias},{model}"
+
+    return mutate_hub_config(add)
+
+
+def remove_hub_channel(alias: str) -> dict:
+    """Remove an unreferenced channel while preserving routing invariants."""
+    alias = alias.strip().lower()
+
+    def remove(latest: dict) -> None:
+        if alias not in latest["channels"]:
+            raise ValueError(f"hub 渠道不存在: {alias}")
+        if len(latest["channels"]) <= 1:
+            raise ValueError("不能删除最后一个 hub 渠道")
+        if alias == latest["default_channel"]:
+            raise ValueError("不能删除 gateway fallback 渠道")
+        referenced = [
+            slot
+            for slot, selector in latest["model_slots"].items()
+            if selector.partition(",")[0] == alias
+        ]
+        if referenced:
+            raise ValueError(f"渠道仍被槽位引用: {', '.join(referenced)}")
+        del latest["channels"][alias]
+
+    return mutate_hub_config(remove)
+
 
 def _hub_model_family(model: str) -> str:
     """Derive the display family (Claude / GPT / GLM / …) from a model name."""
@@ -1104,18 +1393,62 @@ class HubStatus:
     channel_count: int
     model_count: int
     healthy: bool | None = None
+    launch_slot: str = "fable"
+    launch_selector: str = ""
+    launch_effort: str = "high"
+    slot_summary: str = ""
 
     @property
     def summary(self) -> str:
-        """Main-screen one-liner: `N 渠道 · M 模型`."""
-        return f"{self.channel_count} 渠道 · {self.model_count} 模型"
+        """Main-screen one-liner for the slot-aware Hub entry."""
+        return (
+            f"{len(HUB_SLOT_ORDER)} 槽 · {self.channel_count} 渠道"
+            f" · 默认 {self.launch_selector} · {self.launch_effort}"
+        )
 
 
 @dataclass(frozen=True)
 class HubLaunch:
     """Launcher result signalling the user picked a hub model to start."""
 
+    option: HubModelOption | None = None
+    slot: str | None = None
+
+
+@dataclass(frozen=True)
+class HubSlotOption:
+    """One native Claude model slot with its persisted startup effort."""
+
+    slot: str
+    selector: str
+    effort: str
     option: HubModelOption
+
+
+def build_hub_workspace(
+    hub_cfg: dict,
+) -> tuple[list[HubSlotOption], list[HubModelOption]]:
+    """Build the four native slots and the unbound channel-model pool."""
+    config = normalize_hub_config(hub_cfg)
+    _status, options = build_hub_view(config)
+    by_selector = {option.selector: option for option in options}
+    slots: list[HubSlotOption] = []
+    bound: set[str] = set()
+    for slot in HUB_SLOT_ORDER:
+        selector = config["model_slots"][slot]
+        option = by_selector.get(selector)
+        if option is None:  # normalize_hub_config should make this unreachable.
+            raise ValueError(f"model_slots.{slot} 未出现在 channels")
+        slots.append(
+            HubSlotOption(
+                slot=slot,
+                selector=selector,
+                effort=config["effort_by_slot"][slot],
+                option=option,
+            )
+        )
+        bound.add(selector)
+    return slots, [option for option in options if option.selector not in bound]
 
 
 def build_hub_channels(hub_cfg: dict) -> list[HubChannel]:
@@ -1156,6 +1489,7 @@ def build_hub_view(hub_cfg: dict) -> tuple[HubStatus, list[HubModelOption]]:
     The default model is listed first; remaining models follow in channel then
     model order. Families/statuses are derived, never read from config.
     """
+    hub_cfg = normalize_hub_config(hub_cfg)
     channels = build_hub_channels(hub_cfg)
     by_alias = {channel.alias: channel for channel in channels}
     requested_default = hub_cfg.get("default_channel")
@@ -1183,12 +1517,23 @@ def build_hub_view(hub_cfg: dict) -> tuple[HubStatus, list[HubModelOption]]:
                 continue
             ordered.append(make_option(channel, model))
 
+    launch_slot = hub_cfg["launch_slot"]
+    launch_selector = hub_cfg["model_slots"][launch_slot]
+    labels = {"fable": "F", "opus": "O", "sonnet": "S", "haiku": "H"}
+    slot_summary = " · ".join(
+        f"{labels[slot]} {hub_cfg['model_slots'][slot].partition(',')[2]}"
+        for slot in HUB_SLOT_ORDER
+    )
     status = HubStatus(
         port=_hub_port(hub_cfg),
         default_channel=default_alias,
         default_model=default_model,
         channel_count=len(channels),
         model_count=sum(len(channel.models) for channel in channels),
+        launch_slot=launch_slot,
+        launch_selector=launch_selector,
+        launch_effort=hub_cfg["effort_by_slot"][launch_slot],
+        slot_summary=slot_summary,
     )
     return status, ordered
 
@@ -1202,9 +1547,7 @@ def _load_hub_view() -> tuple[HubStatus, list[HubModelOption]] | None:
     if not HUB_CONFIG.is_file():
         return None
     try:
-        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
-        if not isinstance(hub_cfg, dict):
-            return None
+        hub_cfg = load_hub_config(migrate=True)
         return build_hub_view(hub_cfg)
     except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
         return None
@@ -1738,13 +2081,16 @@ def _draw_launcher(
         )
     guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
     if hub_status is not None and not notice:
-        guide = "↑↓ / jk 移动 · Enter 进入 Hub / 启动渠道 · 数字直达渠道"
+        guide = "↑↓ / jk 移动 · Enter 直启 Hub / 启动渠道 · → 管理 Hub · 数字直达渠道"
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
     _addstr(win, head + 2, 2, guide, guide_attr)
     row_cursor = head + 4
     if hub_status is not None:
-        _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
-        row_cursor += 1
+        footer_row = max(0, h - 1)
+        compact_hub = footer_row - (row_cursor + 4) < 1
+        if not compact_hub:
+            _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
+            row_cursor += 1
         entry = (
             f"◆ Claude-Hub · 多渠道会话 · {hub_status.summary}"
             " · 会话内 /model 切换"
@@ -1766,9 +2112,11 @@ def _draw_launcher(
                 _truncate_display(entry, entry_width),
                 C.get("orange", 0) | curses.A_BOLD,
             )
-        row_cursor += 2
-        _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
         row_cursor += 1
+        if not compact_hub:
+            row_cursor += 1
+            _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
+            row_cursor += 1
     list_top = row_cursor
     footer_row = max(0, h - 1)
     capacity = max(0, footer_row - list_top)
@@ -1828,31 +2176,41 @@ def _draw_launcher(
     win.refresh()
 
 
-def _hub_columns(width: int) -> tuple[int, int, int, int]:
-    """Fixed column widths for 类型 / 渠道 / 模型 / 状态; model takes the slack."""
+def _hub_columns(width: int) -> tuple[int, int, int, int, int]:
+    """Responsive widths for slot / channel / model / effort / status."""
     usable = max(0, width - 4)
-    family = 14
-    channel = 10
-    status = 8
-    model = max(6, usable - family - channel - status - 3)
-    return (family, channel, model, status)
+    family, channel, model, effort, status = 6, 5, 4, 5, 4
+    extra = max(0, usable - 4 - sum((family, channel, model, effort, status)))
+    growth = min(10 - channel, extra)
+    channel, extra = channel + growth, extra - growth
+    growth = min(10 - family, extra)
+    family, extra = family + growth, extra - growth
+    growth = min(8 - effort, extra)
+    effort, extra = effort + growth, extra - growth
+    growth = min(8 - status, extra)
+    status, extra = status + growth, extra - growth
+    model += extra
+    return (family, channel, model, effort, status)
 
 
-def _hub_row_text(values: tuple[str, str, str, str], cols: tuple[int, int, int, int]) -> str:
+def _hub_row_text(values: tuple[str, ...], cols: tuple[int, ...]) -> str:
     return " ".join(_pad_display(value, width) for value, width in zip(values, cols))
 
 
 def _draw_hub_workspace(
     win,
     status: "HubStatus",
-    options: list["HubModelOption"],
+    rows: list["HubSlotOption | HubModelOption | HubChannel"],
     idx: int,
+    tab: str = "slots",
+    notice: str | None = None,
 ) -> None:
-    """Render the second-level Hub model picker (类型 / 渠道 / 模型 / 状态)."""
+    """Render native slots followed by the unbound model pool."""
     win.erase()
     h, w = win.getmaxyx()
     _addstr(win, 0, 2, "Claude1  ›  Claude-Hub", C.get("dim", 0))
-    _addstr(win, 1, 2, "选择 Hub 模型", C.get("lime", 0) | curses.A_BOLD)
+    tabs = "[Slots]   Channels" if tab == "slots" else " Slots   [Channels]"
+    _addstr(win, 1, 2, tabs, C.get("lime", 0) | curses.A_BOLD)
     if status.healthy is True:
         badge, badge_attr = "● 已就绪", C.get("lime", 0) | curses.A_BOLD
     elif status.healthy is False:
@@ -1862,26 +2220,50 @@ def _draw_hub_workspace(
     _addstr(win, 2, 2, badge, badge_attr)
     meta = (
         f"127.0.0.1:{status.port} · {status.channel_count} 渠道"
-        f" · {status.model_count} 模型 · 默认 {status.default_channel}"
+        f" · {status.model_count} 模型 · 默认 {status.launch_selector}"
+        f" · {status.launch_effort}"
     )
     _addstr(win, 2, 4 + _dwidth(badge), meta, C.get("dim", 0))
 
     cols = _hub_columns(w)
-    header = _hub_row_text(("  类型", "渠道", "模型", "状态"), cols)
+    header = _hub_row_text(("  槽位", "渠道", "模型", "effort", "状态"), cols)
     _addstr(win, 4, 2, header, C.get("dim", 0))
     list_top = 5
     footer_row = max(0, h - 1)
     capacity = max(0, footer_row - list_top)
-    start, end = _visible_window(len(options), idx, capacity)
+    start, end = _visible_window(len(rows), idx, capacity)
     for offset, i in enumerate(range(start, end)):
-        option = options[i]
+        item = rows[i]
+        if isinstance(item, HubSlotOption):
+            option = item.option
+            kind = item.slot.title()
+            effort = item.effort
+            state = "默认" if item.slot == status.launch_slot else "已绑定"
+        elif isinstance(item, HubChannel):
+            option = HubModelOption(
+                family=_hub_model_family(item.models[0]),
+                channel=item.alias,
+                model=item.models[0],
+                is_default=(item.alias == status.default_channel),
+                via_proxy=item.via_proxy,
+                is_1m="[1m]" in item.models[0].casefold(),
+            )
+            kind = "渠道"
+            effort = "—"
+            state = "默认" if option.is_default else "可用"
+        else:
+            option = item
+            kind = "池"
+            effort = "—"
+            state = option.status_label
         marker = "▸" if i == idx else " "
         text = _hub_row_text(
             (
-                f"{marker} {option.family}",
+                f"{marker} {kind}",
                 option.channel,
                 option.model,
-                option.status_label,
+                effort,
+                state,
             ),
             cols,
         )
@@ -1897,16 +2279,229 @@ def _draw_hub_workspace(
         else:
             family_color = _HUB_FAMILY_COLOR.get(option.family, "violet")
             _addstr(win, row, 2, text, C.get(family_color, 0) | curses.A_BOLD)
-    foot = "Esc 返回 Claude1 · ↑↓ / jk 选择 · Enter 启动 · q 退出"
-    _addstr(win, footer_row, 2, foot, C.get("dim", 0))
+    foot = notice or (
+        "Esc 返回 · ↑↓/jk 选择 · a 添加 · d 删除 · Enter 启动 · Tab 槽位"
+        if tab == "channels"
+        else "Esc 返回 · ↑↓/jk 选择 · ←/→/e effort · b 绑定 · Enter 启动 · Tab 渠道"
+    )
+    _addstr(
+        win,
+        footer_row,
+        2,
+        foot,
+        C.get("warning", 0) if notice else C.get("dim", 0),
+    )
     win.refresh()
+
+
+def _choose_hub_slot(win, prompt: str) -> str | None:
+    """Read one native slot shortcut for a binding operation."""
+    h, _w = win.getmaxyx()
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        f"{prompt} · f Fable / o Opus / s Sonnet / h Haiku · Esc 取消",
+        C.get("warning", 0),
+    )
+    win.refresh()
+    shortcuts = {"f": "fable", "o": "opus", "s": "sonnet", "h": "haiku"}
+    while True:
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        slot = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
+        if slot is not None:
+            return slot
+
+
+def _prompt_hub_text(win, label: str, initial: str) -> str | None:
+    """Small getch-based text field that works with the launcher's test seam."""
+    value = initial
+    while True:
+        h, w = win.getmaxyx()
+        _addstr(win, max(0, h - 1), 0, " " * max(0, w - 1))
+        _addstr(
+            win,
+            max(0, h - 1),
+            2,
+            _truncate_display(f"{label}: {value}", max(0, w - 4)),
+            C.get("warning", 0),
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (10, 13, curses.KEY_ENTER):
+            return value.strip()
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+        elif 32 <= ch <= 126:
+            value += chr(ch)
+
+
+def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
+    if not providers:
+        return None
+    idx = 0
+    while True:
+        win.erase()
+        _addstr(win, 0, 2, "Claude1 › Hub › 添加渠道", C.get("dim", 0))
+        _addstr(win, 1, 2, "Step 1/3 选择 CC Switch provider", C.get("lime", 0))
+        capacity = max(1, win.getmaxyx()[0] - 4)
+        start, end = _visible_window(len(providers), idx, capacity)
+        for row, provider_index in enumerate(range(start, end)):
+            provider = providers[provider_index]
+            marker = "▸" if provider_index == idx else " "
+            _addstr(
+                win,
+                3 + row,
+                2,
+                f"{marker} {provider.get('name') or provider.get('id')}",
+                C.get("sel", 0) if row == idx else C.get("base", 0),
+            )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(providers)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(providers)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return providers[idx]
+
+
+def _hub_alias_slug(name: object) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", str(name).casefold()).strip("-_")
+    if not slug or not slug[0].isalpha():
+        slug = f"channel-{slug}".rstrip("-")
+    return slug or "channel"
+
+
+def _infer_hub_provider_api_format(provider: dict) -> str | None:
+    """Return a metadata-backed format, or None when passthrough is uncertain."""
+    try:
+        settings = json.loads(provider.get("settings_config") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        settings = {}
+    try:
+        meta = json.loads(provider.get("meta") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    provider_type = provider.get("provider_type") or meta.get("providerType")
+    if provider_type == "codex_oauth":
+        return "openai_responses"
+    for value in (meta.get("apiFormat"), settings.get("api_format")):
+        if value in {"anthropic", "openai_chat", "openai_responses"}:
+            return str(value)
+    legacy = settings.get("openrouter_compat_mode")
+    if legacy is True or legacy == 1 or (
+        isinstance(legacy, str) and legacy.strip().casefold() in {"1", "true"}
+    ):
+        return "openai_chat"
+    return None
+
+
+def _choose_hub_api_format(win) -> str | None:
+    """Ask only when CC Switch metadata cannot determine the upstream protocol."""
+    h, _w = win.getmaxyx()
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        "协议未知：a Anthropic · c OpenAI Chat · r OpenAI Responses · Esc 取消",
+        C.get("warning", 0),
+    )
+    win.refresh()
+    choices = {
+        "a": "anthropic",
+        "c": "openai_chat",
+        "r": "openai_responses",
+    }
+    while True:
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        choice = choices.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
+        if choice is not None:
+            return choice
+
+
+def _hub_add_channel_wizard(win) -> dict | None:
+    """Run the three-step provider/identity/slot channel wizard."""
+    provider = _choose_hub_provider(win, list_providers())
+    if provider is None:
+        return None
+    try:
+        settings = json.loads(provider.get("settings_config") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        settings = {}
+    alias = _prompt_hub_text(win, "Step 2/3 alias", _hub_alias_slug(provider.get("name")))
+    if alias is None:
+        return None
+    inferred_api_format = _infer_hub_provider_api_format(provider)
+    format_label = inferred_api_format or "需选择协议"
+    model = _prompt_hub_text(
+        win,
+        f"Step 2/3 model · {format_label}",
+        _provider_models(settings)[0],
+    )
+    if model is None:
+        return None
+    api_format = None
+    if inferred_api_format is None:
+        api_format = _choose_hub_api_format(win)
+        if api_format is None:
+            return None
+    h, _w = win.getmaxyx()
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        "Step 3/3  p 只进池 · f/o/s/h 绑定槽 · Esc 取消",
+        C.get("warning", 0),
+    )
+    win.refresh()
+    while True:
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (ord("p"), ord("P")):
+            slot = None
+            break
+        shortcuts = {"f": "fable", "o": "opus", "s": "sonnet", "h": "haiku"}
+        slot = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
+        if slot is not None:
+            break
+    expected_slot_selector = None
+    if slot is not None:
+        latest = load_hub_config()
+        expected_slot_selector = latest["model_slots"][slot]
+        if not _confirm(
+            win,
+            f"用 {alias},{model} 替换 {slot} 的 {expected_slot_selector}?",
+        ):
+            return None
+    return add_hub_channel(
+        provider,
+        alias=alias,
+        model=model,
+        slot=slot,
+        expected_slot_selector=expected_slot_selector,
+        api_format=api_format,
+    )
 
 
 def _hub_workspace(
     win,
     status: "HubStatus",
     options: list["HubModelOption"],
-) -> tuple[str, "HubModelOption | None"]:
+) -> tuple[str, "HubLaunch | None"]:
     """Run the Hub model picker loop.
 
     Returns (outcome, option) where outcome is:
@@ -1914,28 +2509,185 @@ def _hub_workspace(
       "back"   — Esc, return to the Claude1 home screen,
       "quit"   — q or terminal EOF, exit the launcher entirely.
     """
-    idx = 0
+    config = load_hub_config(migrate=True)
+    slots, pool = build_hub_workspace(config)
+    channels = build_hub_channels(config)
+    tab = "slots"
+    rows: list[HubSlotOption | HubModelOption | HubChannel] = [*slots, *pool]
+    idx = next(
+        (index for index, item in enumerate(slots) if item.slot == status.launch_slot),
+        0,
+    )
+    tab_indices = {"slots": idx, "channels": 0}
+    notice: str | None = None
     # Draw once while probing so a down hub does not freeze the screen silently.
-    _draw_hub_workspace(win, status, options, idx)
+    _draw_hub_workspace(win, status, rows, idx, tab)
     status = replace(status, healthy=hub_healthy(status.port))
-    _draw_hub_workspace(win, status, options, idx)
+    _draw_hub_workspace(win, status, rows, idx, tab)
     while True:
         ch = win.getch()
+        notice = None
         if ch == -1:
             return ("quit", None)
         if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(options)
+            idx = (idx - 1) % len(rows)
         elif ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(options)
+            idx = (idx + 1) % len(rows)
+        elif ch == ord("\t"):
+            tab_indices[tab] = idx
+            tab = "channels" if tab == "slots" else "slots"
+            rows = list(channels) if tab == "channels" else [*slots, *pool]
+            idx = max(0, min(tab_indices[tab], len(rows) - 1))
+        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("e")):
+            item = rows[idx]
+            if not isinstance(item, HubSlotOption):
+                continue
+            direction = -1 if ch == curses.KEY_LEFT else 1
+            current_index = HUB_EFFORT_LEVELS.index(item.effort)
+            next_effort = HUB_EFFORT_LEVELS[
+                (current_index + direction) % len(HUB_EFFORT_LEVELS)
+            ]
+
+            def set_effort(latest: dict) -> None:
+                if latest["effort_by_slot"][item.slot] != item.effort:
+                    raise ValueError("槽位 effort 已被另一窗口修改，请重试")
+                latest["effort_by_slot"][item.slot] = next_effort
+
+            try:
+                config = mutate_hub_config(set_effort)
+            except ValueError as exc:
+                notice = str(exc)
+                try:
+                    config = load_hub_config()
+                    slots, pool = build_hub_workspace(config)
+                    channels = build_hub_channels(config)
+                    rows = [*slots, *pool]
+                    idx = next(
+                        index
+                        for index, slot_item in enumerate(slots)
+                        if slot_item.slot == item.slot
+                    )
+                    refreshed, _unused = build_hub_view(config)
+                    status = replace(refreshed, healthy=status.healthy)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    notice = "Hub 配置已变化且重新加载失败"
+            except (OSError, json.JSONDecodeError):
+                notice = "Hub 配置保存失败"
+            else:
+                slots, pool = build_hub_workspace(config)
+                channels = build_hub_channels(config)
+                rows = [*slots, *pool]
+                refreshed, _unused = build_hub_view(config)
+                status = replace(refreshed, healthy=status.healthy)
+        elif ch == ord("b") and tab == "slots":
+            item = rows[idx]
+            if isinstance(item, (HubSlotOption, HubChannel)):
+                continue
+            target_slot = _choose_hub_slot(win, f"绑定 {item.selector}")
+            if target_slot is None:
+                continue
+            current_selector = config["model_slots"][target_slot]
+            if current_selector != item.selector and not _confirm(
+                win,
+                f"用 {item.selector} 替换 {target_slot} 的 {current_selector}?",
+            ):
+                continue
+
+            def bind_slot(latest: dict) -> None:
+                if latest["model_slots"][target_slot] != current_selector:
+                    raise ValueError("槽位已被另一窗口修改，请重新确认")
+                latest["model_slots"][target_slot] = item.selector
+
+            try:
+                config = mutate_hub_config(bind_slot)
+            except ValueError as exc:
+                notice = str(exc)
+                try:
+                    config = load_hub_config()
+                    slots, pool = build_hub_workspace(config)
+                    channels = build_hub_channels(config)
+                    rows = [*slots, *pool]
+                    idx = next(
+                        (
+                            index
+                            for index, pool_item in enumerate(rows)
+                            if isinstance(pool_item, HubModelOption)
+                            and pool_item.selector == item.selector
+                        ),
+                        max(0, min(idx, len(rows) - 1)),
+                    )
+                    refreshed, _unused = build_hub_view(config)
+                    status = replace(refreshed, healthy=status.healthy)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    notice = "Hub 配置已变化且重新加载失败"
+            except (OSError, json.JSONDecodeError):
+                notice = "Hub 配置保存失败"
+            else:
+                slots, pool = build_hub_workspace(config)
+                channels = build_hub_channels(config)
+                rows = [*slots, *pool]
+                idx = next(
+                    index for index, slot_item in enumerate(slots)
+                    if slot_item.slot == target_slot
+                )
+                refreshed, _unused = build_hub_view(config)
+                status = replace(refreshed, healthy=status.healthy)
+        elif ch == ord("a") and tab == "channels":
+            try:
+                updated = _hub_add_channel_wizard(win)
+            except ValueError as exc:
+                notice = str(exc)
+                updated = None
+            except (OSError, RuntimeError, json.JSONDecodeError, sqlite3.Error):
+                notice = "Hub 渠道添加失败"
+                updated = None
+            if updated is not None:
+                config = updated
+                slots, pool = build_hub_workspace(config)
+                channels = build_hub_channels(config)
+                rows = list(channels)
+                idx = max(0, len(rows) - 1)
+                refreshed, _unused = build_hub_view(config)
+                status = replace(refreshed, healthy=status.healthy)
+        elif ch == ord("d") and tab == "channels":
+            item = rows[idx]
+            if not isinstance(item, HubChannel):
+                continue
+            if not _confirm(win, f"删除 Hub 渠道 {item.alias}?"):
+                continue
+            try:
+                config = remove_hub_channel(item.alias)
+            except ValueError as exc:
+                notice = str(exc)
+            except (OSError, json.JSONDecodeError):
+                notice = "Hub 渠道删除失败"
+            else:
+                slots, pool = build_hub_workspace(config)
+                channels = build_hub_channels(config)
+                rows = list(channels)
+                idx = max(0, min(idx, len(rows) - 1))
+                refreshed, _unused = build_hub_view(config)
+                status = replace(refreshed, healthy=status.healthy)
         elif ch in (10, 13, curses.KEY_ENTER):
-            return ("launch", options[idx])
+            item = rows[idx]
+            if isinstance(item, HubSlotOption):
+                return ("launch", HubLaunch(slot=item.slot))
+            if isinstance(item, HubChannel):
+                _status, all_options = build_hub_view(config)
+                selector = f"{item.alias},{item.models[0]}"
+                option = next(
+                    option for option in all_options if option.selector == selector
+                )
+                return ("launch", HubLaunch(option=option))
+            return ("launch", HubLaunch(option=item))
         elif ch == 27:
             return ("back", None)
         elif ch == ord("q"):
             return ("quit", None)
         else:
             continue
-        _draw_hub_workspace(win, status, options, idx)
+        tab_indices[tab] = idx
+        _draw_hub_workspace(win, status, rows, idx, tab, notice)
 
 
 def _launcher_main(win, cfg, db_ids):
@@ -2043,14 +2795,19 @@ def _launcher_main(win, cfg, db_ids):
             help_open = not help_open
         elif ch in (10, 13, curses.KEY_ENTER):
             if hub_focus and hub_status is not None:
-                outcome, option = _hub_workspace(win, hub_status, hub_options)
-                if outcome == "launch" and option is not None:
-                    return HubLaunch(option)
-                if outcome == "quit":
-                    return None
-                # "back": stay on the home screen and redraw below.
+                return HubLaunch(slot=hub_status.launch_slot)
             elif view:
                 return view[idx]
+        elif ch == curses.KEY_RIGHT and hub_focus and hub_status is not None:
+            outcome, launch = _hub_workspace(win, hub_status, hub_options)
+            if outcome == "launch" and launch is not None:
+                return launch
+            if outcome == "quit":
+                return None
+            # "back": refresh mutations made in the workspace before redraw.
+            refreshed_hub_view = _load_hub_view()
+            if refreshed_hub_view is not None:
+                hub_status, hub_options = refreshed_hub_view
         elif ch in (27, ord("q")):
             return None
         idx = 0 if not view else max(0, min(idx, len(view) - 1))
@@ -2103,6 +2860,10 @@ def run_tui_launcher():
     if result is None:
         return ("quit", None)
     if isinstance(result, HubLaunch):
+        if result.slot is not None:
+            return ("hub-slot", result.slot)
+        if result.option is None:
+            raise RuntimeError("Hub 启动结果缺少槽位或模型")
         return ("hub", result.option.selector)
     return ("launch", result)
 
@@ -2433,17 +3194,49 @@ def _extract_hub_model(claude_args: list[str]) -> tuple[str | None, list[str]]:
     return requested, forwarded
 
 
+def _extract_hub_slot(claude_args: list[str]) -> tuple[str | None, list[str]]:
+    """Consume claude1's Hub-only --slot option without touching other args."""
+    requested: str | None = None
+    forwarded: list[str] = []
+    index = 0
+    while index < len(claude_args):
+        arg = claude_args[index]
+        if arg == "--":
+            forwarded.extend(claude_args[index:])
+            break
+        if arg == "--slot":
+            if index + 1 >= len(claude_args):
+                raise RuntimeError("hub --slot 后需要 fable、opus、sonnet 或 haiku")
+            value = claude_args[index + 1]
+            index += 2
+        elif arg.startswith("--slot="):
+            value = arg.split("=", 1)[1]
+            index += 1
+        else:
+            forwarded.append(arg)
+            index += 1
+            continue
+        if requested is not None:
+            raise RuntimeError("hub --slot 只能指定一次")
+        requested = value.strip().casefold()
+    return requested, forwarded
+
+
 def _normalize_hub_model(value: str, channels: dict) -> str:
     raw = value.strip()
     if raw.startswith("anthropic/"):
         raw = raw[len("anthropic/") :]
     alias, separator, model = raw.partition(",")
-    alias, model = alias.strip().casefold(), model.strip()
+    alias, model = alias.strip().lower(), model.strip()
     if not separator or not alias or not model:
         raise RuntimeError("hub 模型格式应为 <渠道,模型>，例如 fast,sonnet")
     if alias not in channels:
         available = "、".join(str(item) for item in channels)
         raise RuntimeError(f"hub 中没有渠道 '{alias}'；可用渠道: {available}")
+    channel = channels[alias]
+    models = channel.get("models") if isinstance(channel, dict) else None
+    if not isinstance(models, list) or model not in models:
+        raise RuntimeError(f"hub 渠道 '{alias}' 中没有模型 '{model}'")
     return f"{alias},{model}"
 
 
@@ -2496,7 +3289,7 @@ def _resume_session_selector(
         return None
 
     alias, separator, model = last_model.partition(",")
-    alias, model = alias.strip().casefold(), model.strip()
+    alias, model = alias.strip().lower(), model.strip()
     if separator and alias in channels and model:
         return f"{alias},{model}"
 
@@ -2530,16 +3323,9 @@ def _hub_model_slots(
     return slots
 
 
-def _hub_effort_level(hub_cfg: dict) -> str | None:
-    """Return the optional Claude Code effort pin for a Hub session."""
-    raw = hub_cfg.get("effort_level")
-    if raw is None:
-        return None
-    if not isinstance(raw, str) or raw not in {"low", "medium", "high", "xhigh"}:
-        raise RuntimeError(
-            "hub 配置中的 effort_level 必须是 low、medium、high 或 xhigh"
-        )
-    return raw
+def _unique_slot_for_selector(selector: str, slot_models: dict[str, str]) -> str | None:
+    matches = [slot.casefold() for slot, model in slot_models.items() if model == selector]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _hub_effort_capabilities(effort_level: str | None) -> str:
@@ -2552,23 +3338,22 @@ def _hub_effort_capabilities(effort_level: str | None) -> str:
     """
     if effort_level is None:
         return ""
-    capabilities = ["thinking", "adaptive_thinking", "effort"]
-    if effort_level == "xhigh":
-        capabilities.append("xhigh_effort")
+    capabilities = ["thinking", "adaptive_thinking", "effort", "xhigh_effort"]
     return ",".join(capabilities)
 
 
 def exec_hub(claude_args: list[str]) -> int:
     """Launch one Claude session through the isolated multi-channel hub."""
     requested_model, claude_args = _extract_hub_model(claude_args)
+    requested_slot, claude_args = _extract_hub_slot(claude_args)
+    if requested_model is not None and requested_slot is not None:
+        raise RuntimeError("hub --model 与 --slot 不能同时指定")
     if not HUB_CONFIG.is_file():
         raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
     try:
-        hub_cfg = json.loads(HUB_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        hub_cfg = load_hub_config(migrate=True)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"hub 配置无法读取: {HUB_CONFIG}: {exc}") from exc
-    if not isinstance(hub_cfg, dict):
-        raise RuntimeError(f"hub 配置格式无效: {HUB_CONFIG}")
 
     port = _hub_port(hub_cfg)
     token_env = _hub_token_env_name(hub_cfg)
@@ -2588,19 +3373,31 @@ def exec_hub(claude_args: list[str]) -> int:
     ):
         raise RuntimeError("hub 配置中的 default_channel 或默认模型无效")
 
-    resume_model = (
-        _resume_session_selector(claude_args, channels)
-        if requested_model is None
-        else None
-    )
-    main_model = (
-        _normalize_hub_model(requested_model, channels)
-        if requested_model is not None
-        else resume_model or f"{default_channel},{models[0]}"
-    )
-    slot_models = _hub_model_slots(hub_cfg, channels, main_model)
-    effort_level = _hub_effort_level(hub_cfg)
-    effort_capabilities = _hub_effort_capabilities(effort_level)
+    fallback_model = f"{default_channel},{models[0]}"
+    slot_models = _hub_model_slots(hub_cfg, channels, fallback_model)
+    launch_slot = hub_cfg["launch_slot"]
+    efforts = hub_cfg["effort_by_slot"]
+    selected_slot: str | None = None
+    if requested_slot is not None:
+        if requested_slot not in HUB_SLOT_ORDER:
+            raise RuntimeError("hub --slot 必须是 fable、opus、sonnet 或 haiku")
+        selected_slot = requested_slot
+        main_model = slot_models[requested_slot.upper()]
+    elif requested_model is not None:
+        main_model = _normalize_hub_model(requested_model, channels)
+        selected_slot = _unique_slot_for_selector(main_model, slot_models)
+    else:
+        resume_model = _resume_session_selector(claude_args, channels)
+        if resume_model is not None:
+            main_model = resume_model
+            if slot_models[launch_slot.upper()] == main_model:
+                selected_slot = launch_slot
+            else:
+                selected_slot = _unique_slot_for_selector(main_model, slot_models)
+        else:
+            selected_slot = launch_slot
+            main_model = slot_models[launch_slot.upper()]
+    effort_level = efforts[selected_slot] if selected_slot is not None else "high"
     ensure_hub(port, token=token, token_env=token_env)
     settings_env = {
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
@@ -2609,22 +3406,19 @@ def exec_hub(claude_args: list[str]) -> int:
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
-    if effort_level is not None:
-        # The environment pin also reaches ordinary subagents/workflow agents;
-        # the top-level setting keeps Claude Code's UI and persisted session
-        # metadata aligned with the effective value.
-        settings_env["CLAUDE_CODE_EFFORT_LEVEL"] = effort_level
     for tier, selector in slot_models.items():
         model_key = f"ANTHROPIC_DEFAULT_{tier}_MODEL"
         alias, _, upstream_model = selector.partition(",")
         settings_env[model_key] = selector
         settings_env[f"{model_key}_NAME"] = upstream_model
         settings_env[f"{model_key}_DESCRIPTION"] = f"Claude-Hub · {alias}"
-        settings_env[f"{model_key}_SUPPORTED_CAPABILITIES"] = effort_capabilities
+        slot_effort = efforts[tier.casefold()]
+        settings_env[f"{model_key}_SUPPORTED_CAPABILITIES"] = (
+            _hub_effort_capabilities(slot_effort)
+        )
     _seal_model_slots(settings_env)
     settings = {"env": settings_env}
-    if effort_level is not None:
-        settings["effortLevel"] = effort_level
+    settings["effortLevel"] = effort_level
     record_backend("hub")
     aliases = ", ".join(str(alias) for alias in channels)
     print(
@@ -2639,7 +3433,8 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 用法:
   claude1                              打开渠道选择器
   claude1 <名称/别名/id:ID> [Claude 参数] 直接启动一个渠道
-  claude1 hub [--model 渠道,模型]      进入可用 /model 热切换的 Hub
+  claude1 hub [--slot 槽位 | --model 渠道,模型]
+                                       进入可用 /model 热切换的 Hub
   claude1 list [--all]                 查看渠道，不启动 Claude
   claude1 doctor [--fix]               检查本机配置；--fix 清理子代理模型固定值
   claude1 usage [--day|--week|--month] 查看 token 用量与缓存命中率曲线
@@ -3246,6 +4041,8 @@ def main(argv: list[str]) -> int:
             return 0
         elif action == "hub":
             return exec_hub(["--model", payload, *claude_args])
+        elif action == "hub-slot":
+            return exec_hub(["--slot", payload, *claude_args])
         else:
             selected = provider_by_id(payload)
             if selected is None:

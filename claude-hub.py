@@ -74,6 +74,8 @@ LOG_MAX_BYTES = 10 * 1024 * 1024
 USAGE_LOG_MAX_BYTES = 10 * 1024 * 1024
 MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
+HUB_SLOT_ORDER = ("fable", "opus", "sonnet", "haiku")
+HUB_EFFORT_LEVELS = {"low", "medium", "high", "xhigh"}
 UPSTREAM_SESSION_KEY = web.AppKey("upstream_session", aiohttp.ClientSession)
 DB_SNAPSHOT_RETRIES = 5
 SSE_LINE_LIMIT = 64 * 1024
@@ -407,6 +409,10 @@ def validate_config(raw: object) -> dict:
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a JSON object")
 
+    version = raw.get("version", 1)
+    if type(version) is not int or version not in (1, 2):
+        raise ConfigError("version must be 1 or 2")
+
     channels_raw = raw.get("channels")
     if not isinstance(channels_raw, dict) or not channels_raw:
         raise ConfigError("channels must be a non-empty object")
@@ -472,6 +478,46 @@ def validate_config(raw: object) -> dict:
     if default_channel not in channels:
         raise ConfigError(f"default_channel '{default_channel}' is not present in channels")
 
+    launch_slot = None
+    model_slots = None
+    effort_by_slot = None
+    if version == 2:
+        launch_slot = raw.get("launch_slot")
+        if launch_slot not in HUB_SLOT_ORDER:
+            raise ConfigError("launch_slot must be fable, opus, sonnet, or haiku")
+        model_slots = raw.get("model_slots")
+        if not isinstance(model_slots, dict):
+            raise ConfigError("model_slots must be an object")
+        normalized_slots: dict[str, str] = {}
+        for slot in HUB_SLOT_ORDER:
+            selector = model_slots.get(slot)
+            if not isinstance(selector, str):
+                raise ConfigError(f"model_slots.{slot} must be channel,model")
+            alias, separator, model = selector.strip().partition(",")
+            alias, model = alias.strip().lower(), model.strip()
+            if (
+                not separator
+                or alias not in channels
+                or model not in channels[alias]["models"]
+            ):
+                raise ConfigError(
+                    f"model_slots.{slot} must reference a declared channel model"
+                )
+            normalized_slots[slot] = f"{alias},{model}"
+        model_slots = normalized_slots
+        effort_by_slot = raw.get("effort_by_slot")
+        if not isinstance(effort_by_slot, dict):
+            raise ConfigError("effort_by_slot must be an object")
+        normalized_efforts: dict[str, str] = {}
+        for slot in HUB_SLOT_ORDER:
+            effort = effort_by_slot.get(slot)
+            if effort not in HUB_EFFORT_LEVELS:
+                raise ConfigError(
+                    f"effort_by_slot.{slot} must be low, medium, high, or xhigh"
+                )
+            normalized_efforts[slot] = effort
+        effort_by_slot = normalized_efforts
+
     token_env = raw.get("local_token_env", ENV_LOCAL_TOKEN)
     token_env = _require_nonempty_string(token_env, "local_token_env")
     local_token = os.environ.get(token_env) or raw.get("local_token")
@@ -484,37 +530,17 @@ def validate_config(raw: object) -> dict:
     if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
         raise ConfigError("proxy must be a non-empty string or null")
 
-    effort_level = raw.get("effort_level")
-    if effort_level is not None and effort_level not in {
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-    }:
-        raise ConfigError("effort_level must be low, medium, high, or xhigh")
-
     return {
+        "version": version,
         "port": _config_port(raw.get("port")),
         "local_token": local_token,
         "default_channel": default_channel,
         "channels": channels,
         "proxy": proxy.strip() if isinstance(proxy, str) else None,
-        "effort_level": effort_level,
+        "launch_slot": launch_slot,
+        "model_slots": model_slots,
+        "effort_by_slot": effort_by_slot,
     }
-
-
-def _apply_effort_pin(payload: dict, cfg: dict, *, is_count: bool) -> None:
-    """Force every generative request through this Hub to one effort level."""
-    effort_level = cfg.get("effort_level")
-    if effort_level is None or is_count:
-        return
-    output_config = payload.get("output_config")
-    if output_config is None:
-        output_config = {}
-        payload["output_config"] = output_config
-    elif not isinstance(output_config, dict):
-        raise ValueError("output_config must be a JSON object")
-    output_config["effort"] = effort_level
 
 
 def get_config() -> dict:
@@ -632,7 +658,7 @@ def _read_provider_rows(path: Path) -> dict:
                         and value.strip()
                         else None
                     )
-                    for tier in ("opus", "sonnet", "haiku")
+                    for tier in ("opus", "sonnet", "haiku", "fable")
                 },
             }
             records.append((provider_id, name, record))
@@ -816,7 +842,7 @@ def route(
     provider = _match_channel_provider(channel, providers)
     model_lower = model.lower()
     if provider:
-        for tier in ("opus", "sonnet", "haiku"):
+        for tier in ("opus", "sonnet", "haiku", "fable"):
             mapped = provider["model_map"].get(tier)
             if tier in model_lower and mapped:
                 return alias, mapped
@@ -1694,11 +1720,6 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     model_in = payload.get("model")
     if not isinstance(model_in, str) or not model_in.strip():
         return anthropic_error(400, "model must be a non-empty string")
-    try:
-        _apply_effort_pin(payload, cfg, is_count=is_count)
-    except ValueError as exc:
-        return anthropic_error(400, str(exc))
-
     started = time.monotonic()
     try:
         providers = await asyncio.to_thread(get_providers)

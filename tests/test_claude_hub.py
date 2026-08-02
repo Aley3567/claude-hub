@@ -419,29 +419,84 @@ class ClaudeHubTests(unittest.TestCase):
         with self.assertRaisesRegex(hub.ConfigError, "port must be an integer"):
             hub.get_config()
 
-    def test_config_effort_pin_forces_all_generative_requests(self):
+    def test_config_validation_rejects_non_integer_version(self):
+        for version in (True, 1.0):
+            with self.subTest(version=version):
+                self._write_config(version=version)
+                hub.reset_caches()
+                with self.assertRaisesRegex(hub.ConfigError, "version must be 1 or 2"):
+                    hub.get_config()
+
+    def test_gateway_preserves_request_effort_even_with_legacy_config_field(self):
         self._write_config(effort_level="xhigh")
         hub.reset_caches()
-        cfg = hub.get_config()
+        upstream = _FakeUpstream(
+            429,
+            {"Content-Type": "application/json"},
+            [b'{"type":"error","error":{"type":"rate_limit_error"}}'],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "output_config": {"effort": "low"},
+            },
+            session=session,
+        )
 
-        inherited = {}
-        hub._apply_effort_pin(inherited, cfg, is_count=False)
-        self.assertEqual(inherited["output_config"]["effort"], "xhigh")
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(hub.handle_messages(request))
 
-        explicit_lower = {"output_config": {"effort": "low"}}
-        hub._apply_effort_pin(explicit_lower, cfg, is_count=False)
-        self.assertEqual(explicit_lower["output_config"]["effort"], "xhigh")
+        forwarded = json.loads(session.calls[0][1]["data"])
+        self.assertEqual(forwarded["output_config"]["effort"], "low")
 
-        count_payload = {}
-        hub._apply_effort_pin(count_payload, cfg, is_count=True)
-        self.assertNotIn("output_config", count_payload)
-
-    def test_config_validation_rejects_invalid_effort_level(self):
-        self._write_config(effort_level="maximum")
+    def test_config_validation_rejects_invalid_v2_slot_effort(self):
+        self._write_config(
+            version=2,
+            launch_slot="fable",
+            model_slots={
+                "fable": "fast,claude-sonnet-4",
+                "opus": "fast,claude-opus-4",
+                "sonnet": "fast,claude-sonnet-4",
+                "haiku": "fast,claude-sonnet-4",
+            },
+            effort_by_slot={
+                "fable": "maximum",
+                "opus": "high",
+                "sonnet": "high",
+                "haiku": "high",
+            },
+        )
         hub.reset_caches()
 
-        with self.assertRaisesRegex(hub.ConfigError, "effort_level must be"):
+        with self.assertRaisesRegex(hub.ConfigError, "effort_by_slot.fable"):
             hub.get_config()
+
+    def test_config_validation_accepts_complete_v2_slot_schema(self):
+        self._write_config(
+            version=2,
+            launch_slot="fable",
+            model_slots={
+                "fable": "fast,claude-opus-4",
+                "opus": "fast,claude-opus-4",
+                "sonnet": "fast,claude-sonnet-4",
+                "haiku": "fast,claude-sonnet-4",
+            },
+            effort_by_slot={
+                "fable": "xhigh",
+                "opus": "high",
+                "sonnet": "medium",
+                "haiku": "low",
+            },
+        )
+        hub.reset_caches()
+
+        cfg = hub.get_config()
+        self.assertEqual(cfg["version"], 2)
+        self.assertEqual(cfg["launch_slot"], "fable")
+        self.assertEqual(cfg["model_slots"]["sonnet"], "fast,claude-sonnet-4")
+        self.assertEqual(cfg["effort_by_slot"]["fable"], "xhigh")
 
     def test_legacy_base_url_channel_resolves_existing_provider_read_only(self):
         self._write_config(
@@ -490,6 +545,19 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(
             hub.route("claude-opus-4", cfg),
             ("fast", "upstream-opus"),
+        )
+
+    def test_bare_fable_model_uses_the_fallback_providers_fable_mapping(self):
+        cfg = hub.get_config()
+        providers = {
+            "Fixture HTTPS": {
+                "model_map": {"fable": "upstream-fable"},
+            }
+        }
+
+        self.assertEqual(
+            hub.route("claude-fable-5", cfg, providers),
+            ("fast", "upstream-fable"),
         )
 
     def test_local_auth_accepts_bearer_raw_and_api_key(self):
