@@ -59,11 +59,27 @@ test_default_does_not_override_claude() {
       source "$DEFAULT_SCRIPT_PATH"
       (( ! ${+functions[claude]} )) || exit 40
       command claude untouched
-      CLAUDE1_SCRIPT="$HOME/launcher.py" claude1 -dp hello
+      CLAUDE1_SCRIPT="$HOME/launcher.py" claude1 hello
     '
 
-  assert_line $'claude:untouched\npython3:'"${home}"$'/launcher.py --dangerously-skip-permissions hello' "$log"
+  assert_line $'claude:untouched\npython3:'"${home}"$'/launcher.py hello' "$log"
   pass "default integration leaves ordinary claude untouched"
+}
+
+test_default_rejects_hidden_dangerous_shorthand() {
+  local home="$(make_home no-dp)"
+  local output exit_code
+  set +e
+  output="$(
+    HOME="$home" PATH="$home/bin:/usr/bin:/bin" DEFAULT_SCRIPT_PATH="$DEFAULT_INTEGRATION" \
+      CLAUDE1_SCRIPT="$home/launcher.py" \
+      zsh -f -c 'source "$DEFAULT_SCRIPT_PATH"; claude1 -dp' 2>&1
+  )"
+  exit_code=$?
+  set -e
+  [[ $exit_code -eq 2 ]] || fail "-dp should be rejected"
+  [[ "$output" == *"not supported"* ]] || fail "-dp rejection is unclear"
+  pass "claude1 rejects the hidden dangerous shorthand"
 }
 
 test_default_preserves_existing_claude_function() {
@@ -161,6 +177,30 @@ test_opt_in_routes() {
   pass "opt-in integration routes every supported sticky backend"
 }
 
+test_opt_in_replaces_existing_claude_alias_and_reads_launcher_sticky_path() {
+  local home="$(make_home alias)"
+  local state="$home/custom-backend"
+  print -r -- "hub" > "$state"
+  local log="$home/calls.log"
+  HOME="$home" CALL_LOG="$log" PATH="$home/bin:/usr/bin:/bin" \
+    DEFAULT_SCRIPT_PATH="$DEFAULT_INTEGRATION" STICKY_SCRIPT_PATH="$STICKY_INTEGRATION" \
+    CLAUDE1_SCRIPT="$home/launcher.py" CLAUDE1_BACKEND_STICKY="$state" \
+    zsh -f -c 'alias claude="print stale"; source "$DEFAULT_SCRIPT_PATH"; source "$STICKY_SCRIPT_PATH"; claude sample'
+  assert_line "python3:${home}/launcher.py hub sample" "$log"
+  pass "sticky integration replaces aliases and reads launcher sticky path"
+}
+
+test_direct_falls_back_to_default_claude_binary() {
+  local home="$(make_home direct-fallback)"
+  command mkdir -p -- "$home/.local/bin"
+  command cp "$home/bin/claude" "$home/.local/bin/claude"
+  local log="$home/calls.log"
+  HOME="$home" CALL_LOG="$log" PATH="/usr/bin:/bin" DEFAULT_SCRIPT_PATH="$DEFAULT_INTEGRATION" \
+    zsh -f -c 'source "$DEFAULT_SCRIPT_PATH"; claude1-direct sample'
+  assert_line "claude:sample" "$log"
+  pass "claude1-direct falls back to the default Claude binary"
+}
+
 test_opt_in_reports_missing_direct_binary() {
   local home="$(make_home missing-direct)"
   local output exit_code
@@ -221,10 +261,13 @@ test_opt_in_rejects_unknown_backend() {
 }
 
 test_default_does_not_override_claude
+test_default_rejects_hidden_dangerous_shorthand
 test_default_preserves_existing_claude_function
 test_default_reports_missing_launcher
 test_default_preserves_preflight_hooks_and_cleans_experimental_env
 test_opt_in_routes
+test_opt_in_replaces_existing_claude_alias_and_reads_launcher_sticky_path
+test_direct_falls_back_to_default_claude_binary
 test_opt_in_reports_missing_direct_binary
 test_opt_in_reports_missing_launcher
 test_opt_in_rejects_unknown_backend

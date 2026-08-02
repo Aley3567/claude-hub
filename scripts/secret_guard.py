@@ -14,27 +14,43 @@ location, and a short one-way finding id.
 from __future__ import annotations
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 
-ALLOW_MARKER = "secret-guard: allow"
+ALLOW_MARKER_RE = re.compile(
+    r"(?i)\bsecret-guard:\s*allow\s+"
+    r"(?P<category>[a-z0-9-]+)"
+    r"(?:\s+(?P<finding_id>[0-9a-f]{10}))?\b"
+)
 ZERO_SHA = "0" * 40
 SENSITIVE_KEY_RE = re.compile(
     r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|bearer|credential|"
     r"password|passwd|private[_-]?key|secret|session[_-]?token)"
 )
 PLACEHOLDER_RE = re.compile(
-    r"(?i)(example|fixture|fake|dummy|sample|placeholder|changeme|redacted|"
-    r"xxxx+|your[_-]|test[_-]?(?:key|token|secret)|\$\{|<[^>]+>)"
+    r"""(?x)^(?:
+        (?i:(?:example|fixture|fake|dummy|sample|placeholder|changeme|redacted)
+        (?:[_-][a-z0-9]+)*)
+        |[xX]{4,}
+        |(?i:your(?:[_-][a-z0-9]+)+)
+        |(?i:test[_-]?(?:key|token|secret)(?:[_-][a-z0-9]+)*)
+        |[A-Z][A-Z0-9_]*_(?:KEY|TOKEN|SECRET)
+        |\$\{[^}]+\}
+        |<[^>]+>
+        |(?i:updated-wal-token)
+    )$"""
 )
 PUBLIC_PROVIDER_LABELS = {
     "anthropic",
@@ -88,19 +104,22 @@ GENERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "literal-bearer-token",
-        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b"),
+        re.compile(
+            r"(?i)\bBearer[ \t]+([A-Za-z0-9._~+/=-]{16,})"
+            r"(?=$|[^A-Za-z0-9._~+/=-])"
+        ),
     ),
     (
         "generic-secret-assignment",
         re.compile(
             r"""(?ix)
             ["']?
-            (?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|
+            (?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|passwd|
                private[_-]?key|secret|session[_-]?token)
             ["']?
             \s*(?:=|:)\s*
             ["']
-            ([A-Za-z0-9._~+/=-]{16,})
+            ([^'"\s]{16,})
             ["']
             """
         ),
@@ -141,7 +160,17 @@ def run_git(*args: str, input_bytes: bytes | None = None) -> bytes:
 
 
 def is_placeholder(value: str) -> bool:
-    return not value.strip() or bool(PLACEHOLDER_RE.search(value))
+    normalized = value.strip()
+    return not normalized or bool(PLACEHOLDER_RE.fullmatch(normalized))
+
+
+def is_probable_bearer_token(value: str) -> bool:
+    """Distinguish token-shaped values from ordinary words after ``Bearer``."""
+
+    if any(not character.isascii() or not character.isalpha() for character in value):
+        return True
+    distinct = len(set(value.casefold()))
+    return len(value) >= 16 and distinct >= 12 and distinct * 10 >= len(value) * 7
 
 
 def add_fingerprint(
@@ -166,6 +195,25 @@ def is_public_provider_label(value: object) -> bool:
     return normalized in PUBLIC_PROVIDER_LABELS
 
 
+def is_loopback_url(value: object) -> bool:
+    """Whether a URL names the local loopback gateway without DNS lookup."""
+
+    if not isinstance(value, str):
+        return False
+    try:
+        hostname = urlsplit(value).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    normalized = hostname.casefold().rstrip(".")
+    if normalized == "localhost":
+        return True
+    if normalized == "::1":
+        return True
+    return normalized.startswith("127.")
+
+
 def walk_private_json(
     value: object,
     output: set[PrivateFingerprint],
@@ -179,7 +227,8 @@ def walk_private_json(
                 if SENSITIVE_KEY_RE.search(key_text):
                     add_fingerprint(output, "private-credential", child)
                 elif re.search(r"(?i)(?:base[_-]?url|endpoint|proxy|website[_-]?url)", key_text):
-                    add_fingerprint(output, "private-upstream", child)
+                    if not is_loopback_url(child):
+                        add_fingerprint(output, "private-upstream", child)
                 elif key_text == "provider":
                     if not is_public_provider_label(child):
                         add_fingerprint(
@@ -312,6 +361,20 @@ def sensitive_path(path: str) -> str | None:
     return None
 
 
+def line_allows(
+    line: str,
+    category: str,
+    finding_id: str = "",
+) -> bool:
+    """Return whether a narrowly scoped, reviewable allowance is present."""
+
+    marker = ALLOW_MARKER_RE.search(line)
+    if not marker or marker.group("category") != category:
+        return False
+    allowed_id = marker.group("finding_id")
+    return not finding_id or allowed_id == finding_id
+
+
 def scan_bytes(
     path: str,
     content: bytes,
@@ -319,33 +382,57 @@ def scan_bytes(
 ) -> list[Finding]:
     path_category = sensitive_path(path)
     findings = [Finding(path_category, path, 1)] if path_category else []
-    if b"\0" in content[:8192]:
-        return findings
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        return findings
-
-    for line_number, line in enumerate(text.splitlines(), 1):
-        if ALLOW_MARKER in line:
+    texts = [content.decode("utf-8", "replace")]
+    utf16_encodings: list[str] = []
+    if content.startswith(codecs.BOM_UTF16_LE):
+        utf16_encodings.append("utf-16")
+    elif content.startswith(codecs.BOM_UTF16_BE):
+        utf16_encodings.append("utf-16")
+    elif len(content) >= 4 and len(content) % 2 == 0:
+        even_nuls = content[0::2].count(0)
+        odd_nuls = content[1::2].count(0)
+        threshold = max(2, len(content) // 8)
+        if odd_nuls >= threshold:
+            utf16_encodings.append("utf-16-le")
+        if even_nuls >= threshold:
+            utf16_encodings.append("utf-16-be")
+    for encoding in utf16_encodings:
+        try:
+            decoded = content.decode(encoding)
+        except UnicodeDecodeError:
             continue
-        for category, pattern in GENERIC_PATTERNS:
-            for match in pattern.finditer(line):
-                candidate = match.group(match.lastindex or 0)
-                if not is_placeholder(candidate):
-                    findings.append(Finding(category, path, line_number))
-                    break
-        for fingerprint in fingerprints:
-            if fingerprint.value in line:
-                findings.append(
-                    Finding(
-                        fingerprint.category,
-                        path,
-                        line_number,
-                        fingerprint.finding_id,
+        if decoded not in texts:
+            texts.append(decoded)
+
+    unique_findings = set(findings)
+    for text in texts:
+        for line_number, line in enumerate(text.splitlines(), 1):
+            for category, pattern in GENERIC_PATTERNS:
+                for match in pattern.finditer(line):
+                    candidate = match.group(match.lastindex or 0)
+                    if (
+                        category == "literal-bearer-token"
+                        and not is_probable_bearer_token(candidate)
+                    ):
+                        continue
+                    if not is_placeholder(candidate) and not line_allows(
+                        line, category
+                    ):
+                        unique_findings.add(Finding(category, path, line_number))
+                        break
+            for fingerprint in fingerprints:
+                if fingerprint.value in line and not line_allows(
+                    line, fingerprint.category, fingerprint.finding_id
+                ):
+                    unique_findings.add(
+                        Finding(
+                            fingerprint.category,
+                            path,
+                            line_number,
+                            fingerprint.finding_id,
+                        )
                     )
-                )
-    return findings
+    return sorted(unique_findings, key=lambda item: (item.line, item.category))
 
 
 def decode_paths(raw: bytes) -> list[str]:
@@ -362,7 +449,7 @@ def staged_files() -> Iterable[tuple[str, bytes]]:
             "diff",
             "--cached",
             "--name-only",
-            "--diff-filter=ACMR",
+            "--diff-filter=ACMRT",
             "-z",
         )
     )
@@ -376,7 +463,34 @@ def staged_files() -> Iterable[tuple[str, bytes]]:
 def working_tree_files() -> Iterable[tuple[str, bytes]]:
     for path in decode_paths(run_git("ls-files", "-co", "--exclude-standard", "-z")):
         try:
-            yield path, Path(path).read_bytes()
+            candidate = Path(path)
+            before = candidate.lstat()
+            if stat.S_ISLNK(before.st_mode):
+                yield path, os.readlink(candidate).encode(
+                    "utf-8", "surrogateescape"
+                )
+                continue
+            if not stat.S_ISREG(before.st_mode):
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(candidate, flags)
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (before.st_dev, before.st_ino):
+                    continue
+                with os.fdopen(fd, "rb") as handle:
+                    fd = -1
+                    yield path, handle.read()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
         except (OSError, ValueError):
             continue
 
@@ -391,9 +505,14 @@ def commits_from_pre_push(lines: Iterable[str]) -> list[str]:
         if local_sha == ZERO_SHA:
             continue
         if remote_sha == ZERO_SHA:
-            args = ("rev-list", local_sha, "--not", "--remotes")
+            args = ("rev-list", local_sha)
         else:
-            args = ("rev-list", f"{remote_sha}..{local_sha}")
+            try:
+                run_git("cat-file", "-e", f"{remote_sha}^{{commit}}")
+            except subprocess.CalledProcessError:
+                args = ("rev-list", local_sha)
+            else:
+                args = ("rev-list", f"{remote_sha}..{local_sha}")
         commits.update(run_git(*args).decode().splitlines())
     return sorted(commits)
 
@@ -416,46 +535,6 @@ def history_files(commits: Iterable[str]) -> Iterable[tuple[str, bytes]]:
                 yield f"{path}@{commit[:10]}", run_git("cat-file", "blob", object_sha)
             except subprocess.CalledProcessError:
                 continue
-
-
-def filter_labels_already_in_remote(
-    fingerprints: set[PrivateFingerprint],
-) -> set[PrivateFingerprint]:
-    """Do not repeatedly flag non-secret labels that are already public.
-
-    Credentials remain findings even if a remote ref already contains them.
-    This exception is limited to provider labels, aliases, URLs, and notes so
-    the guard can protect newly added local channels without becoming unusable
-    on a repository that already names public providers.
-    """
-
-    public_categories = {
-        "private-provider-name",
-        "private-channel-alias",
-        "private-upstream",
-        "private-provider-metadata",
-    }
-    candidates = {
-        item for item in fingerprints if item.category in public_categories
-    }
-    if not candidates:
-        return fingerprints
-    try:
-        commits = run_git("rev-list", "--remotes=origin").decode().splitlines()
-        if not commits:
-            return fingerprints
-        remote_blobs = [
-            content for _path, content in history_files(commits) if b"\0" not in content[:8192]
-        ]
-    except subprocess.CalledProcessError:
-        return fingerprints
-
-    already_public = {
-        item
-        for item in candidates
-        if any(item.value.encode("utf-8") in content for content in remote_blobs)
-    }
-    return fingerprints - already_public
 
 
 def scan_files(
@@ -489,9 +568,7 @@ def main() -> int:
     args = parse_args()
     fingerprints: set[PrivateFingerprint] = set()
     if not args.no_private_sources:
-        fingerprints = filter_labels_already_in_remote(
-            load_private_fingerprints()
-        )
+        fingerprints = load_private_fingerprints()
 
     try:
         if args.staged:
@@ -527,7 +604,8 @@ def main() -> int:
         print(f"  {finding.render()}", file=sys.stderr)
     print(
         "[secret-guard] 未显示任何秘密值。请删除/改为占位符后重新检测；"
-        f"确认是假阳性时，仅在该行加入注释 `{ALLOW_MARKER}`。",
+        "确认是假阳性时，可在该行加入精确类别的注释 "
+        "`secret-guard: allow <category>`；私密指纹还必须追加报告中的短哈希。",
         file=sys.stderr,
     )
     return 1

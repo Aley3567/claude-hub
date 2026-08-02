@@ -5,7 +5,7 @@
 set -u
 
 TOKEN_FILE="${HOME}/anyrouter-tools/token"
-ENDPOINT="***REMOVED***/v1/health"
+ENDPOINT="https://probe.example.test/v1/health"
 TIMEOUT=10
 
 probe() {

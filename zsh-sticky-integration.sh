@@ -8,10 +8,18 @@
 # To opt out again in the current shell:
 #   unfunction claude
 
-export CLAUDE1_STICKY_INTEGRATION=1
+# Or remove the managed integration persistently:
+#   ./install.sh --disable-sticky
+#
+# Aliases are expanded while a sourced file is parsed.  Remove an existing
+# alias before the function declaration; otherwise zsh rejects the definition
+# while a stale environment flag can incorrectly advertise sticky support.
+unalias claude 2>/dev/null || true
 
 claude() {
-  local state_file="${CLAUDE1_STICKY_FILE:-$HOME/.cc-switch/claude1-backend}"
+  # The launcher writes CLAUDE1_BACKEND_STICKY. Keep the older shell-only name
+  # as a compatibility fallback.
+  local state_file="${CLAUDE1_BACKEND_STICKY:-${CLAUDE1_STICKY_FILE:-$HOME/.cc-switch/claude1-backend}}"
   local backend="direct"
 
   if [[ -r "$state_file" ]]; then
@@ -31,6 +39,10 @@ claude() {
         executable="$configured"
       else
         executable="$(whence -p "$configured" 2>/dev/null)"
+      fi
+      if [[ -z "$executable" && -z "${CLAUDE1_CLAUDE_BIN:-}" ]]; then
+        local fallback="${CLAUDE1_DEFAULT_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+        [[ -x "$fallback" ]] && executable="$fallback"
       fi
       if [[ -z "$executable" || ! -x "$executable" ]]; then
         print -u2 -- "[claude1] direct backend selected but Claude Code executable not found: $configured"
@@ -62,3 +74,6 @@ claude() {
       ;;
   esac
 }
+
+# Only advertise sticky support after the function has been installed.
+export CLAUDE1_STICKY_INTEGRATION=1

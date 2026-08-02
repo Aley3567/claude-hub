@@ -6,10 +6,11 @@ PROGRAM="claude1"
 MANAGED_MARKER="# claude1 managed source"
 STICKY_MARKER="# claude1 managed sticky source"
 ENABLE_STICKY=0
+DISABLE_STICKY=0
 
 usage() {
   cat <<'EOF'
-用法: ./install.sh [--enable-sticky]
+用法: ./install.sh [--enable-sticky|--disable-sticky]
 
 安装 claude1 到当前用户目录，并把安全的 zsh 集成接入 ~/.zshrc。
 
@@ -19,6 +20,9 @@ usage() {
 
 安装器不会读取或复制 CC Switch 配置、数据库内容或任何凭证，也不会启用
 zsh-sticky-integration.sh，除非显式传入 --enable-sticky。
+
+--disable-sticky 会移除安装器管理的粘性路由 source 行；不会改动用户自行
+添加的 shell 配置。
 EOF
 }
 
@@ -31,6 +35,9 @@ for arg in "$@"; do
     --enable-sticky)
       ENABLE_STICKY=1
       ;;
+    --disable-sticky)
+      DISABLE_STICKY=1
+      ;;
     *)
       printf '%s\n' "[claude1] 未知参数: $arg" >&2
       usage >&2
@@ -38,6 +45,11 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+if [ "$ENABLE_STICKY" -eq 1 ] && [ "$DISABLE_STICKY" -eq 1 ]; then
+  printf '%s\n' "[claude1] --enable-sticky 与 --disable-sticky 不能同时使用。" >&2
+  exit 2
+fi
 
 if [ -z "${HOME:-}" ]; then
   printf '%s\n' "[claude1] 安装失败：HOME 未设置。" >&2
@@ -50,7 +62,7 @@ CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db"
 ZSHRC="$HOME/.zshrc"
 ZSHRC_TARGET="$ZSHRC"
 MANAGE_STICKY=$ENABLE_STICKY
-if [ -f "$ZSHRC" ] && grep -Fq "$STICKY_MARKER" "$ZSHRC" 2>/dev/null; then
+if [ "$DISABLE_STICKY" -eq 0 ] && [ -f "$ZSHRC" ] && grep -Fq "$STICKY_MARKER" "$ZSHRC" 2>/dev/null; then
   MANAGE_STICKY=1
 fi
 
@@ -203,6 +215,12 @@ zshrc_needs_update() {
 }
 
 sticky_zshrc_needs_update() {
+  if [ "$DISABLE_STICKY" -eq 1 ]; then
+    [ -f "$ZSHRC_TARGET" ] || return 1
+    marker_count=$(grep -Fc "$STICKY_MARKER" "$ZSHRC_TARGET" 2>/dev/null || true)
+    [ "$marker_count" = "0" ] && return 1
+    return 0
+  fi
   [ "$MANAGE_STICKY" -eq 1 ] || return 1
   [ -f "$ZSHRC_TARGET" ] || return 0
   exact_count=$(grep -Fxc "$STICKY_SOURCE_LINE" "$ZSHRC_TARGET" 2>/dev/null || true)
@@ -326,7 +344,7 @@ if [ "$NEED_ZSHRC" -eq 1 ]; then
     if [ "$existing_mode" != "unknown" ]; then
       zshrc_mode=$existing_mode
     fi
-    if [ "$MANAGE_STICKY" -eq 1 ]; then
+    if [ "$MANAGE_STICKY" -eq 1 ] || [ "$DISABLE_STICKY" -eq 1 ]; then
       awk -v marker="$MANAGED_MARKER" -v sticky="$STICKY_MARKER" \
         'index($0, marker) == 0 && index($0, sticky) == 0 { print }' \
         "$ZSHRC_TARGET" > "$temporary"

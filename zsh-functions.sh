@@ -37,13 +37,11 @@ claude1() {
     return 127
   fi
 
-  local -a args=()
   local arg
   for arg in "$@"; do
     if [[ "$arg" == "-dp" ]]; then
-      args+=(--dangerously-skip-permissions)
-    else
-      args+=("$arg")
+      print -u2 -- "[claude1] -dp is not supported; pass --dangerously-skip-permissions explicitly if you intentionally accept that risk."
+      return 2
     fi
   done
 
@@ -54,7 +52,7 @@ claude1() {
   unset CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
   unset CLAUDE_CODE_WORKFLOWS
   CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN="${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-1}" \
-    "$python_path" "$launcher" "${args[@]}"
+    "$python_path" "$launcher" "$@"
 }
 
 # Explicit escape hatch that always invokes the real Claude Code executable.
@@ -66,6 +64,10 @@ claude1-direct() {
     executable="$configured"
   else
     executable="$(whence -p "$configured" 2>/dev/null)"
+  fi
+  if [[ -z "$executable" && -z "${CLAUDE1_CLAUDE_BIN:-}" ]]; then
+    local fallback="${CLAUDE1_DEFAULT_CLAUDE_BIN:-$HOME/.local/bin/claude}"
+    [[ -x "$fallback" ]] && executable="$fallback"
   fi
   if [[ -z "$executable" || ! -x "$executable" ]]; then
     print -u2 -- "[claude1] Claude Code executable not found: $configured"

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["aiohttp>=3.9"]
+# dependencies = ["aiohttp>=3.9", "certifi>=2024.2.2"]
 # ///
 """claude-hub — local multi-channel Anthropic gateway.
 
@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sqlite3
+import ssl
 import stat
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import aiohttp
+import certifi
 from aiohttp import web
 from multidict import CIMultiDict
 
@@ -59,14 +61,18 @@ HOME = Path.home()
 DEFAULT_CONFIG_PATH = HOME / ".cc-switch" / "claude-hub.json"
 DEFAULT_DB_PATH = HOME / ".cc-switch" / "cc-switch.db"
 DEFAULT_LOG_PATH = HOME / ".cc-switch" / "logs" / "claude-hub.log"
+DEFAULT_USAGE_PATH = HOME / ".cc-switch" / "logs" / "claude-hub-usage.jsonl"
 
 ENV_CONFIG = "CLAUDE_HUB_CONFIG"
 ENV_DB = "CLAUDE_HUB_DB"
 ENV_LOG = "CLAUDE_HUB_LOG"
+ENV_USAGE = "CLAUDE_HUB_USAGE"
 ENV_PORT = "CLAUDE_HUB_PORT"
 ENV_LOCAL_TOKEN = "CLAUDE_HUB_LOCAL_TOKEN"
 
 LOG_MAX_BYTES = 10 * 1024 * 1024
+USAGE_LOG_MAX_BYTES = 10 * 1024 * 1024
+MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 UPSTREAM_SESSION_KEY = web.AppKey("upstream_session", aiohttp.ClientSession)
 DB_SNAPSHOT_RETRIES = 5
@@ -101,6 +107,7 @@ RESP_STRIP = HOP_BY_HOP | {"content-length"}
 
 _log_fp = None
 _log_stderr = False
+_usage_fp = None
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -120,13 +127,38 @@ def log_path() -> Path:
     return _env_path(ENV_LOG, DEFAULT_LOG_PATH)
 
 
+def usage_path() -> Path:
+    return _env_path(ENV_USAGE, DEFAULT_USAGE_PATH)
+
+
 def log(msg: str) -> None:
+    # Request-controlled model names and upstream error strings must stay on
+    # one physical line, otherwise they can forge log entries.
+    msg = str(msg).replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
     if _log_fp:
         _log_fp.write(line + "\n")
         _log_fp.flush()
+        _rotate_open_log_if_needed()
     if _log_stderr or not _log_fp:
         print(line, file=sys.stderr)
+
+
+def _rotate_open_log_if_needed() -> None:
+    """Rotate an already-open log after a write crosses the size limit."""
+    global _log_fp
+    if _log_fp is None:
+        return
+    try:
+        if os.fstat(_log_fp.fileno()).st_size <= LOG_MAX_BYTES:
+            return
+        _log_fp.close()
+        _log_fp = None
+        open_log()
+    except (OSError, RuntimeError, ValueError):
+        # Logging should never take down request forwarding.  A later write or
+        # restart will retry normal rotation with open_log's path checks.
+        pass
 
 
 def open_log() -> None:
@@ -181,6 +213,102 @@ def open_log() -> None:
     except BaseException:
         os.close(fd)
         raise
+
+
+def _usage_int(value: object) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _open_usage_log():
+    """Open the usage JSONL privately, rotating one bounded backup if needed."""
+    path = usage_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        current = None
+    expected_current = current
+    if current is not None:
+        if not stat.S_ISREG(current.st_mode):
+            raise RuntimeError("usage path is not a regular file")
+        if current.st_size > USAGE_LOG_MAX_BYTES:
+            rotated = path.with_name(path.name + ".1")
+            path.replace(rotated)
+            expected_current = None
+            rotated_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                rotated_flags |= os.O_NOFOLLOW
+            rotated_fd = os.open(rotated, rotated_flags)
+            try:
+                if not stat.S_ISREG(os.fstat(rotated_fd).st_mode):
+                    raise RuntimeError("rotated usage path is not a regular file")
+                if os.name == "posix":
+                    os.fchmod(rotated_fd, 0o600)
+            finally:
+                os.close(rotated_fd)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError("usage path is not a regular file")
+        if expected_current is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            expected_current.st_dev,
+            expected_current.st_ino,
+        ):
+            raise RuntimeError("usage path changed while it was being opened")
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def record_usage(
+    alias: str, model_out: str, api_format: str, usage: dict | None
+) -> None:
+    """把一条请求的 token 用量追加到 JSONL。统计绝不能搞挂转发主路径，全部异常静默。"""
+    try:
+        usage = usage if isinstance(usage, dict) else {}
+        row = {
+            "ts": int(time.time()),
+            "channel": alias,
+            "model": model_out,
+            "format": api_format,
+            "in": _usage_int(usage.get("input_tokens")),
+            "out": _usage_int(usage.get("output_tokens")),
+            "cr": _usage_int(usage.get("cache_read_input_tokens")),
+            "cw": _usage_int(usage.get("cache_creation_input_tokens")),
+        }
+        global _usage_fp
+        if _usage_fp is None:
+            _usage_fp = _open_usage_log()
+        _usage_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        _usage_fp.flush()
+        if os.fstat(_usage_fp.fileno()).st_size > USAGE_LOG_MAX_BYTES:
+            _usage_fp.close()
+            _usage_fp = None
+            _usage_fp = _open_usage_log()
+    except Exception:
+        pass
+
+
+def _usage_from_json_bytes(raw: bytes | bytearray) -> dict | None:
+    """best-effort 从非流式 JSON 响应体取 usage，失败静默。"""
+    try:
+        body = json.loads(bytes(raw))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if isinstance(body, dict) and isinstance(body.get("usage"), dict):
+        return body["usage"]
+    return None
 
 
 # ---------------------------------------------------------------- config / DB
@@ -266,6 +394,14 @@ def _config_port(raw: object) -> int:
     return port
 
 
+def _normalize_base_url(value: object) -> str:
+    base = value.strip().rstrip("/") if isinstance(value, str) else ""
+    # Forwarded paths already begin with /v1. Avoid /v1/v1/messages.
+    if base.endswith("/v1"):
+        base = base[:-3].rstrip("/")
+    return base
+
+
 def validate_config(raw: object) -> dict:
     """Validate and return a normalized, detached configuration dictionary."""
     if not isinstance(raw, dict):
@@ -284,9 +420,17 @@ def validate_config(raw: object) -> dict:
         if not isinstance(channel_raw, dict):
             raise ConfigError(f"channels.{alias} must be an object")
 
-        provider = _require_nonempty_string(
-            channel_raw.get("provider"), f"channels.{alias}.provider"
+        provider_raw = channel_raw.get("provider")
+        provider = (
+            provider_raw.strip()
+            if isinstance(provider_raw, str) and provider_raw.strip()
+            else ""
         )
+        provider_base_url = _normalize_base_url(channel_raw.get("base_url"))
+        if not provider and not provider_base_url:
+            raise ConfigError(
+                f"channels.{alias}.provider or base_url must be a non-empty string"
+            )
         models_raw = channel_raw.get("models", [])
         if not isinstance(models_raw, list) or any(
             not isinstance(model, str) or not model.strip() for model in models_raw
@@ -299,6 +443,7 @@ def validate_config(raw: object) -> dict:
 
         channel = {
             "provider": provider,
+            "provider_base_url": provider_base_url,
             "models": [model.strip() for model in models_raw],
             "allow_insecure_http": allow_insecure,
         }
@@ -339,13 +484,37 @@ def validate_config(raw: object) -> dict:
     if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
         raise ConfigError("proxy must be a non-empty string or null")
 
+    effort_level = raw.get("effort_level")
+    if effort_level is not None and effort_level not in {
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    }:
+        raise ConfigError("effort_level must be low, medium, high, or xhigh")
+
     return {
         "port": _config_port(raw.get("port")),
         "local_token": local_token,
         "default_channel": default_channel,
         "channels": channels,
         "proxy": proxy.strip() if isinstance(proxy, str) else None,
+        "effort_level": effort_level,
     }
+
+
+def _apply_effort_pin(payload: dict, cfg: dict, *, is_count: bool) -> None:
+    """Force every generative request through this Hub to one effort level."""
+    effort_level = cfg.get("effort_level")
+    if effort_level is None or is_count:
+        return
+    output_config = payload.get("output_config")
+    if output_config is None:
+        output_config = {}
+        payload["output_config"] = output_config
+    elif not isinstance(output_config, dict):
+        raise ValueError("output_config must be a JSON object")
+    output_config["effort"] = effort_level
 
 
 def get_config() -> dict:
@@ -371,14 +540,6 @@ def get_config() -> dict:
             {"path": path, "mtime_ns": st.st_mtime_ns, "size": st.st_size, "raw": raw}
         )
     return validate_config(_cfg_cache["raw"])
-
-
-def _normalize_base_url(value: object) -> str:
-    base = value.strip().rstrip("/") if isinstance(value, str) else ""
-    # Forwarded paths already begin with /v1. Avoid /v1/v1/messages.
-    if base.endswith("/v1"):
-        base = base[:-3].rstrip("/")
-    return base
 
 
 def _read_provider_rows(path: Path) -> dict:
@@ -436,9 +597,20 @@ def _read_provider_rows(path: Path) -> dict:
             )
             if not isinstance(token, str):
                 token = ""
+            folded_env = {
+                str(key).upper(): value for key, value in env.items()
+            }
+            proxy_key = "HTTPS_PROXY" if base.startswith("https://") else "HTTP_PROXY"
+            raw_proxy = folded_env.get(proxy_key) or folded_env.get("ALL_PROXY")
+            provider_proxy = (
+                raw_proxy.strip()
+                if isinstance(raw_proxy, str) and raw_proxy.strip()
+                else None
+            )
             record = {
                 "base_url": base,
                 "token": token,
+                "proxy": provider_proxy,
                 "api_format": provider_api_format(
                     meta=meta,
                     settings=settings,
@@ -641,7 +813,7 @@ def route(
         raise RouteError(500, f"default_channel '{alias}' not in channels config")
     if providers is None:
         providers = get_providers()
-    provider = providers.get(channel["provider"])
+    provider = _match_channel_provider(channel, providers)
     model_lower = model.lower()
     if provider:
         for tier in ("opus", "sonnet", "haiku"):
@@ -654,13 +826,44 @@ def route(
 def _is_loopback(hostname: str | None) -> bool:
     if not hostname:
         return False
-    hostname = hostname.rstrip(".").lower()
+    hostname = _canonical_hostname(hostname)
     if hostname == "localhost" or hostname.endswith(".localhost"):
         return True
     try:
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         return False
+
+
+def _is_private_or_special_host(hostname: str | None) -> bool:
+    """Return whether an IP literal or localhost targets local address space."""
+    if not hostname:
+        return False
+    hostname = _canonical_hostname(hostname)
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        # ``is_global`` excludes RFC1918, link-local metadata addresses,
+        # loopback, multicast and other non-public address space.
+        return not ipaddress.ip_address(hostname).is_global
+    except ValueError:
+        # libc accepts historical numeric IPv4 spellings that ipaddress
+        # intentionally rejects (127.1, a single 32-bit integer, hexadecimal,
+        # octal components). Treat numeric-looking failures as unsafe rather
+        # than letting getaddrinfo reinterpret them as a private destination.
+        component = r"(?:0x[0-9a-f]+|[0-9]+)"
+        return re.fullmatch(rf"{component}(?:\.{component})*", hostname) is not None
+
+
+def _canonical_hostname(hostname: str) -> str:
+    """Apply the IDNA mapping used by network resolvers before policy checks."""
+    try:
+        canonical = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("invalid IDNA hostname") from exc
+    if not canonical or len(canonical) > 253:
+        raise ValueError("invalid hostname")
+    return canonical
 
 
 def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) -> None:
@@ -680,10 +883,21 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
         or parsed.fragment
     ):
         raise RouteError(502, f"channel '{alias}' has an invalid upstream URL")
+    try:
+        canonical_hostname = _canonical_hostname(parsed.hostname)
+    except ValueError as exc:
+        raise RouteError(
+            502, f"channel '{alias}' has an invalid upstream URL"
+        ) from exc
     if parsed.scheme == "https":
+        if _is_private_or_special_host(canonical_hostname):
+            raise RouteError(
+                502,
+                f"channel '{alias}' HTTPS upstream must not target a private address",
+            )
         return
     if parsed.scheme == "http" and (
-        _is_loopback(parsed.hostname) or allow_insecure_http
+        _is_loopback(canonical_hostname) or allow_insecure_http
     ):
         return
     if parsed.scheme == "http":
@@ -693,6 +907,32 @@ def validate_upstream_url(base_url: str, alias: str, allow_insecure_http: bool) 
             "for this channel only if it is intentional",
         )
     raise RouteError(502, f"channel '{alias}' upstream must use http or https")
+
+
+def _match_channel_provider(channel: dict, providers: dict) -> dict | None:
+    """Resolve a channel without mutating provider or gateway configuration.
+
+    Current channels use a CC Switch provider selector. Legacy local-gateway
+    channels used ``base_url`` instead; for those, match exactly one existing
+    CC Switch provider by normalized URL and continue sourcing its credential
+    from the read-only database.
+    """
+    selector = channel.get("provider")
+    if isinstance(selector, str) and selector:
+        return providers.get(selector)
+    base_url = _normalize_base_url(channel.get("provider_base_url"))
+    if not base_url:
+        return None
+    matches: list[dict] = []
+    seen: set[int] = set()
+    for candidate in providers.values():
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if _normalize_base_url(candidate.get("base_url")) == base_url:
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
 
 
 def resolve_provider(
@@ -705,11 +945,13 @@ def resolve_provider(
         raise RouteError(400, f"unknown channel alias '{alias}'")
     if providers is None:
         providers = get_providers()
-    provider = providers.get(channel["provider"])
+    provider = _match_channel_provider(channel, providers)
     if not provider:
+        selector = channel.get("provider") or "base_url"
         raise RouteError(
             502,
-            f"channel '{alias}' provider was not found in the CC Switch database "
+            f"channel '{alias}' provider selector '{selector}' was not found "
+            f"or was ambiguous in the CC Switch database "
             f"(check {config_path().name})",
         )
     if not provider.get("token"):
@@ -742,9 +984,14 @@ def check_local_auth(request: web.Request, cfg: dict) -> bool:
     )
 
 
-def channel_proxy(alias: str, cfg: dict) -> str | None:
-    """A channel proxy overrides the optional global proxy."""
-    return cfg["channels"].get(alias, {}).get("proxy") or cfg.get("proxy") or None
+def channel_proxy(alias: str, cfg: dict, provider: dict | None = None) -> str | None:
+    """A channel proxy overrides provider and optional global proxies."""
+    return (
+        cfg["channels"].get(alias, {}).get("proxy")
+        or (provider or {}).get("proxy")
+        or cfg.get("proxy")
+        or None
+    )
 
 
 def _header_values(headers, name: str) -> list[str]:
@@ -957,6 +1204,78 @@ class _SSETerminalTracker:
         self._event_type = value if separator else b""
 
 
+class _SSEUsageTracker:
+    """轻量解析透传 SSE 里的 usage（message_start / message_delta），用于落盘统计。
+
+    跨 chunk 缓冲不完整行，best-effort：解析失败静默，不影响转发正确性。"""
+
+    def __init__(self) -> None:
+        self.usage: dict = {}
+        self._pending = bytearray()
+        self._discarding_line = False
+
+    def feed(self, chunk: bytes) -> None:
+        start = 0
+        for match in SSE_NEWLINE_RE.finditer(chunk):
+            segment = chunk[start : match.start()]
+            if not self._discarding_line:
+                if len(self._pending) + len(segment) <= SSE_LINE_LIMIT:
+                    self._pending.extend(segment)
+                    self._consume_line(bytes(self._pending))
+                self._pending.clear()
+            self._discarding_line = False
+            start = match.end()
+        tail = chunk[start:]
+        if self._discarding_line:
+            return
+        if len(self._pending) + len(tail) > SSE_LINE_LIMIT:
+            self._pending.clear()
+            self._discarding_line = True
+            return
+        self._pending.extend(tail)
+
+    def finish(self) -> None:
+        if self._pending and not self._discarding_line:
+            self._consume_line(bytes(self._pending))
+        self._pending.clear()
+        self._discarding_line = False
+
+    def _consume_line(self, line: bytes) -> None:
+        if not line.startswith(b"data:"):
+            return
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            return
+        try:
+            event = json.loads(payload)
+        except (ValueError, UnicodeDecodeError):
+            return
+        self._absorb(event)
+
+    def _absorb(self, event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind == "message_start":
+            message = event.get("message")
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                self._merge(message["usage"])
+        elif kind == "message_delta":
+            if isinstance(event.get("usage"), dict):
+                self._merge(event["usage"])
+
+    def _merge(self, usage: dict) -> None:
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            value = usage.get(key)
+            if isinstance(value, int) and value > self.usage.get(key, 0):
+                self.usage[key] = value
+
+
 class _SSEContentDecoder:
     """Decode one SSE content-coding for validation while forwarding raw bytes."""
 
@@ -1077,13 +1396,53 @@ def _transformed_headers(token: str, streaming: bool) -> CIMultiDict:
     return headers
 
 
-async def _read_upstream_body(upstream, limit: int = 64 * 1024 * 1024) -> bytes:
+async def _read_upstream_body(
+    upstream, limit: int = MAX_UPSTREAM_BODY_BYTES
+) -> bytes:
     body = bytearray()
     async for chunk in upstream.content.iter_any():
         body.extend(chunk)
         if len(body) > limit:
             raise ProtocolTransformError("upstream response exceeds size limit")
     return bytes(body)
+
+
+async def _read_decoded_upstream_body(
+    upstream, limit: int = MAX_UPSTREAM_BODY_BYTES
+) -> bytes:
+    """Decode one bounded HTTP content-coding for transformed JSON responses."""
+    try:
+        decoder = _SSEContentDecoder.from_headers(upstream.headers)
+    except ValueError as exc:
+        raise ProtocolTransformError(
+            "upstream JSON uses an unsupported content encoding"
+        ) from exc
+    body = bytearray()
+    try:
+        async for chunk in upstream.content.iter_any():
+            for decoded in decoder.feed(chunk):
+                body.extend(decoded)
+                if len(body) > limit:
+                    raise ProtocolTransformError(
+                        "upstream response exceeds size limit"
+                    )
+                await asyncio.sleep(0)
+        decoder.finish()
+    except zlib.error as exc:
+        raise ProtocolTransformError(
+            "upstream JSON has an invalid content encoding"
+        ) from exc
+    return bytes(body)
+
+
+def _append_bounded_json_buffer(
+    buffer: bytearray | None, chunk: bytes, limit: int = MAX_UPSTREAM_BODY_BYTES
+) -> bytearray | None:
+    """Keep at most ``limit`` bytes for optional direct-response usage parsing."""
+    if buffer is None or len(buffer) + len(chunk) > limit:
+        return None
+    buffer.extend(chunk)
+    return buffer
 
 
 async def _handle_transformed_messages(
@@ -1138,7 +1497,7 @@ async def _handle_transformed_messages(
             data=data,
             headers=_transformed_headers(provider["token"], streaming),
             timeout=timeout,
-            proxy=channel_proxy(alias, cfg),
+            proxy=channel_proxy(alias, cfg, provider),
             allow_redirects=False,
         ) as upstream:
             content_type = (
@@ -1153,7 +1512,7 @@ async def _handle_transformed_messages(
                 and content_type == "text/event-stream"
             )
             if not is_sse:
-                raw = await _read_upstream_body(upstream)
+                raw = await _read_decoded_upstream_body(upstream)
                 try:
                     decoded = json.loads(raw.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1170,6 +1529,12 @@ async def _handle_transformed_messages(
                         "upstream returned a non-object JSON response"
                     )
                 body = transform_response(decoded, api_format)
+                record_usage(
+                    alias,
+                    model_out,
+                    api_format,
+                    body.get("usage") if isinstance(body, dict) else None,
+                )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
                     f"{api_format} {upstream.status} json "
@@ -1212,19 +1577,36 @@ async def _handle_transformed_messages(
                             for translated in bridge.feed(event, event_data):
                                 await response.write(translated)
                                 byte_count += len(translated)
-                    await asyncio.sleep(0)
+                        await asyncio.sleep(0)
                 decoder.finish()
                 parser.finish()
+                if not bridge.upstream_terminal:
+                    raise ProtocolTransformError(
+                        "upstream SSE ended without a terminal event"
+                    )
                 for translated in bridge.finish():
                     await response.write(translated)
                     byte_count += len(translated)
                 await response.write_eof()
+                record_usage(
+                    alias,
+                    model_out,
+                    api_format,
+                    {
+                        "input_tokens": bridge.input_tokens,
+                        "output_tokens": bridge.output_tokens,
+                        "cache_read_input_tokens": bridge.cache_read,
+                        "cache_creation_input_tokens": bridge.cache_write,
+                    },
+                )
             except (
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
                 OSError,
                 UnicodeDecodeError,
                 ProtocolTransformError,
+                TypeError,
+                ValueError,
                 zlib.error,
             ) as exc:
                 log(
@@ -1312,6 +1694,10 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     model_in = payload.get("model")
     if not isinstance(model_in, str) or not model_in.strip():
         return anthropic_error(400, "model must be a non-empty string")
+    try:
+        _apply_effort_pin(payload, cfg, is_count=is_count)
+    except ValueError as exc:
+        return anthropic_error(400, str(exc))
 
     started = time.monotonic()
     try:
@@ -1352,7 +1738,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     url = provider["base_url"] + path_and_query
     headers = upstream_headers(request, provider["token"])
     ensure_1m_beta(headers, model_out)
-    proxy = channel_proxy(alias, cfg)
+    proxy = channel_proxy(alias, cfg, provider)
     session = request.app.get(UPSTREAM_SESSION_KEY)
     if session is None:
         # Kept for small fake-request fixtures that do not construct an aiohttp app.
@@ -1443,19 +1829,24 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             byte_count = 0
             sse_tracker = _SSETerminalTracker() if streamed else None
+            usage_tracker = _SSEUsageTracker() if streamed else None
+            json_buf = bytearray() if not streamed and upstream.status == 200 else None
             try:
                 async for chunk in upstream.content.iter_any():
                     if sse_tracker is not None:
                         for decoded in sse_decoder.feed(chunk):
                             sse_tracker.feed(decoded)
+                            usage_tracker.feed(decoded)
                             # Keep one highly compressible response from
                             # monopolizing the local gateway event loop.
                             await asyncio.sleep(0)
+                    json_buf = _append_bounded_json_buffer(json_buf, chunk)
                     await response.write(chunk)
                     byte_count += len(chunk)
                 if sse_tracker is not None:
                     sse_decoder.finish()
                     sse_tracker.finish()
+                    usage_tracker.finish()
             except (
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
@@ -1488,6 +1879,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 )
 
             await response.write_eof()
+            if usage_tracker is not None:
+                record_usage(alias, model_out, "anthropic", usage_tracker.usage)
+            elif json_buf is not None:
+                record_usage(
+                    alias, model_out, "anthropic", _usage_from_json_bytes(json_buf)
+                )
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
                 f"{upstream.status} {'stream' if streamed else 'json'} "
@@ -1538,6 +1935,23 @@ async def handle_healthz(_request: web.Request | None) -> web.Response:
     return web.json_response(dict(HEALTH_PAYLOAD))
 
 
+async def handle_readyz(request: web.Request) -> web.Response:
+    """Return a challenge response proving possession of the local token."""
+    challenge = request.headers.get("x-claude-hub-challenge", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", challenge):
+        return anthropic_error(
+            400, "invalid readiness challenge", "invalid_request_error"
+        )
+    cfg = get_config()
+    proof_message = (
+        f"claude-hub-ready:v1:{cfg['port']}:{challenge}".encode("ascii")
+    )
+    proof = hmac.digest(
+        cfg["local_token"].encode("utf-8"), proof_message, "sha256"
+    ).hex()
+    return web.json_response({**HEALTH_PAYLOAD, "proof": proof})
+
+
 async def handle_fallback(request: web.Request) -> web.Response:
     return anthropic_error(
         404,
@@ -1568,6 +1982,12 @@ async def controlled_error_middleware(
             "claude-hub configuration is unavailable; run `claude-hub doctor`",
             "api_error",
         )
+    except web.HTTPRequestEntityTooLarge:
+        return anthropic_error(
+            413,
+            "request body exceeds claude-hub's 64 MiB limit",
+            "invalid_request_error",
+        )
     except (ProviderDatabaseError, sqlite3.Error) as exc:
         log(
             f"{request.method} {request.path}: provider database unavailable: "
@@ -1580,10 +2000,26 @@ async def controlled_error_middleware(
         )
 
 
+def _upstream_ssl_context() -> ssl.SSLContext:
+    """Use the platform trust plus certifi's Mozilla CA bundle.
+
+    Python.org macOS builds can have no populated default OpenSSL CA file;
+    adding certifi keeps public HTTPS providers verifiable without disabling TLS.
+    """
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context
+
+
+def _upstream_connector() -> aiohttp.TCPConnector:
+    return aiohttp.TCPConnector(ssl=_upstream_ssl_context())
+
+
 async def _client_session_context(app: web.Application):
     session = aiohttp.ClientSession(
         auto_decompress=False,
         skip_auto_headers={"Accept-Encoding"},
+        connector=_upstream_connector(),
     )
     app[UPSTREAM_SESSION_KEY] = session
     try:
@@ -1602,6 +2038,7 @@ def create_app() -> web.Application:
     app.router.add_post("/v1/messages/count_tokens", handle_messages)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/healthz", handle_healthz)
+    app.router.add_get("/readyz", handle_readyz)
     app.router.add_route("*", "/{tail:.*}", handle_fallback)
     return app
 
@@ -1645,11 +2082,12 @@ def cli_list() -> None:
     print(f"claude-hub channels (port {cfg['port']}, default *):\n")
     width = max(len(alias) for alias in cfg["channels"])
     for alias, channel in cfg["channels"].items():
-        provider = providers.get(channel["provider"])
+        provider = _match_channel_provider(channel, providers)
+        provider_label = channel.get("provider") or "CC Switch URL match"
         marker = "*" if alias == cfg["default_channel"] else " "
         status = "ready" if provider else "provider missing from DB"
         print(
-            f" {marker}{alias:<{width}}  {channel['provider']:<16} "
+            f" {marker}{alias:<{width}}  {provider_label:<16} "
             f"{status:<24} {', '.join(channel.get('models', []))}"
         )
     default_models = cfg["channels"][cfg["default_channel"]].get("models", [])
@@ -1743,7 +2181,7 @@ def cli_doctor() -> int:
             models = channel.get("models", [])
             if not models:
                 problems.append("no selectable models")
-            provider = providers.get(channel["provider"])
+            provider = _match_channel_provider(channel, providers)
             if provider is None:
                 problems.append("provider missing")
             else:
@@ -1807,7 +2245,7 @@ async def cli_check(target: str | None) -> None:
                     "messages": [{"role": "user", "content": "hi"}],
                 },
                 headers=headers,
-                proxy=channel_proxy(alias, cfg),
+                proxy=channel_proxy(alias, cfg, provider),
                 timeout=aiohttp.ClientTimeout(total=30),
                 allow_redirects=False,
             ) as response:
@@ -1822,7 +2260,7 @@ async def cli_check(target: str | None) -> None:
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             return alias, f"✗ {type(exc).__name__}: {exc}"
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_upstream_connector()) as session:
         results = await asyncio.gather(*(one(session, alias) for alias in aliases))
     width = max(len(alias) for alias in aliases)
     for alias, message in results:

@@ -151,11 +151,18 @@ def _chat_content_and_tools(
             if isinstance(source, dict):
                 media = source.get("media_type", "image/png")
                 data = source.get("data", "")
-                if isinstance(data, str):
+                if isinstance(data, str) and data:
                     parts.append(
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:{media};base64,{data}"},
+                        }
+                    )
+                elif source.get("type") == "url" and isinstance(source.get("url"), str):
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": source["url"]},
                         }
                     )
         elif kind == "tool_use":
@@ -189,7 +196,57 @@ def _chat_content_and_tools(
     return output, tool_calls, tool_results, "\n".join(reasoning)
 
 
+def _validate_tool_result_causality(messages: object) -> None:
+    """Reject results without one unique, earlier tool-use declaration."""
+    if not isinstance(messages, list):
+        return
+    declared: set[str] = set()
+    consumed: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            raise ProtocolTransformError(
+                "message roles must be user or assistant"
+            )
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "tool_use":
+                if role != "assistant":
+                    raise ProtocolTransformError(
+                        "tool_use blocks require the assistant role"
+                    )
+                call_id = block.get("id")
+                if not isinstance(call_id, str) or not call_id or call_id in declared:
+                    raise ProtocolTransformError(
+                        "tool_use ids must be non-empty and unique"
+                    )
+                declared.add(call_id)
+            elif kind == "tool_result":
+                if role != "user":
+                    raise ProtocolTransformError(
+                        "tool_result blocks require the user role"
+                    )
+                call_id = block.get("tool_use_id")
+                if (
+                    not isinstance(call_id, str)
+                    or call_id not in declared
+                    or call_id in consumed
+                ):
+                    raise ProtocolTransformError(
+                        "tool_result must reference one earlier unconsumed tool_use"
+                    )
+                consumed.add(call_id)
+
+
 def anthropic_to_chat(payload: dict) -> dict:
+    _validate_tool_result_causality(payload.get("messages"))
     result: dict = {"model": payload.get("model"), "messages": []}
     system = _system_text(payload.get("system"))
     if system:
@@ -202,17 +259,30 @@ def anthropic_to_chat(payload: dict) -> dict:
         content, tool_calls, tool_results, reasoning = _chat_content_and_tools(
             str(role), message.get("content")
         )
-        if content is not None or tool_calls:
+        # ``reasoning_content`` is part of the historical assistant turn for
+        # reasoning-capable Chat providers.  A turn interrupted while thinking
+        # has no regular content or tool call, but must not disappear from the
+        # replayed conversation.
+        if content is not None or tool_calls or (role == "assistant" and reasoning):
             converted: dict = {"role": role, "content": content}
             if tool_calls:
                 converted["tool_calls"] = tool_calls
             # Several reasoning OpenAI-compatible providers require historical
-            # reasoning_content on assistant tool-call messages. It is harmless
-            # to omit when Claude did not supply a plain thinking block.
-            if reasoning and role == "assistant" and tool_calls:
+            # reasoning_content on assistant messages. It is harmless to omit
+            # when Claude did not supply a plain thinking block.
+            if reasoning and role == "assistant":
                 converted["reasoning_content"] = reasoning
-            result["messages"].append(converted)
-        result["messages"].extend(tool_results)
+            # Chat Completions requires a tool result to immediately follow the
+            # assistant tool call.  Anthropic can combine it with later user
+            # text in one block, so split that block while preserving causality.
+            if role == "user":
+                result["messages"].extend(tool_results)
+                result["messages"].append(converted)
+            else:
+                result["messages"].append(converted)
+                result["messages"].extend(tool_results)
+        else:
+            result["messages"].extend(tool_results)
 
     model = str(payload.get("model", ""))
     if "max_tokens" in payload:
@@ -249,7 +319,35 @@ def anthropic_to_chat(payload: dict) -> dict:
         result["tools"] = tools
     if "tool_choice" in payload:
         result["tool_choice"] = _chat_tool_choice(payload["tool_choice"])
+
+    effort = _anthropic_effort(payload)
+    if effort is not None:
+        result["reasoning_effort"] = effort
     return result
+
+
+def _anthropic_effort(payload: dict) -> str | None:
+    """Read Claude Code's current effort field with legacy-thinking fallback."""
+    output_config = payload.get("output_config")
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        if effort in {"low", "medium", "high", "xhigh"}:
+            return effort
+
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") == "disabled":
+        return None
+    effort = thinking.get("effort")
+    if effort in {"low", "medium", "high", "xhigh"}:
+        return effort
+    budget = thinking.get("budget_tokens")
+    return (
+        "low"
+        if isinstance(budget, int) and budget < 4_000
+        else "medium"
+        if isinstance(budget, int) and budget < 16_000
+        else "high"
+    )
 
 
 def _responses_input(messages: object) -> list[dict]:
@@ -267,6 +365,12 @@ def _responses_input(messages: object) -> list[dict]:
         if not isinstance(content, list):
             continue
         message_parts: list[dict] = []
+
+        def flush_message_parts() -> None:
+            if message_parts:
+                output.append({"role": role, "content": list(message_parts)})
+                message_parts.clear()
+
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -276,15 +380,21 @@ def _responses_input(messages: object) -> list[dict]:
                 message_parts.append({"type": part_type, "text": block["text"]})
             elif kind == "image" and role == "user":
                 source = block.get("source")
-                if isinstance(source, dict) and isinstance(source.get("data"), str):
-                    media = source.get("media_type", "image/png")
-                    message_parts.append(
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:{media};base64,{source['data']}",
-                        }
-                    )
+                if isinstance(source, dict):
+                    if isinstance(source.get("data"), str):
+                        media = source.get("media_type", "image/png")
+                        message_parts.append(
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:{media};base64,{source['data']}",
+                            }
+                        )
+                    elif source.get("type") == "url" and isinstance(source.get("url"), str):
+                        message_parts.append(
+                            {"type": "input_image", "image_url": source["url"]}
+                        )
             elif kind == "tool_use":
+                flush_message_parts()
                 output.append(
                     {
                         "type": "function_call",
@@ -294,6 +404,7 @@ def _responses_input(messages: object) -> list[dict]:
                     }
                 )
             elif kind == "tool_result":
+                flush_message_parts()
                 output.append(
                     {
                         "type": "function_call_output",
@@ -302,6 +413,7 @@ def _responses_input(messages: object) -> list[dict]:
                     }
                 )
             elif kind == "redacted_thinking" and isinstance(block.get("data"), str):
+                flush_message_parts()
                 output.append(
                     {
                         "type": "reasoning",
@@ -309,12 +421,12 @@ def _responses_input(messages: object) -> list[dict]:
                         "summary": [],
                     }
                 )
-        if message_parts:
-            output.append({"role": role, "content": message_parts})
+        flush_message_parts()
     return output
 
 
 def anthropic_to_responses(payload: dict, *, codex_oauth: bool = False) -> dict:
+    _validate_tool_result_causality(payload.get("messages"))
     result: dict = {
         "model": payload.get("model"),
         "input": _responses_input(payload.get("messages")),
@@ -347,18 +459,8 @@ def anthropic_to_responses(payload: dict, *, codex_oauth: bool = False) -> dict:
     if "tool_choice" in payload:
         result["tool_choice"] = _responses_tool_choice(payload["tool_choice"])
 
-    thinking = payload.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") != "disabled":
-        effort = thinking.get("effort")
-        if effort not in {"low", "medium", "high", "xhigh"}:
-            budget = thinking.get("budget_tokens")
-            effort = (
-                "low"
-                if isinstance(budget, int) and budget < 4_000
-                else "medium"
-                if isinstance(budget, int) and budget < 16_000
-                else "high"
-            )
+    effort = _anthropic_effort(payload)
+    if effort is not None:
         result["reasoning"] = {"effort": effort, "summary": "auto"}
     if codex_oauth:
         result["include"] = ["reasoning.encrypted_content"]
@@ -380,11 +482,48 @@ def transform_request(
     return "/v1/messages", payload
 
 
-def _usage(input_tokens: object = 0, output_tokens: object = 0) -> dict:
+def _usage(
+    input_tokens: object = 0,
+    output_tokens: object = 0,
+    cache_read: object = 0,
+    cache_write: object = 0,
+) -> dict:
     return {
-        "input_tokens": input_tokens if isinstance(input_tokens, int) else 0,
-        "output_tokens": output_tokens if isinstance(output_tokens, int) else 0,
+        "input_tokens": _token_count(input_tokens),
+        "output_tokens": _token_count(output_tokens),
+        "cache_read_input_tokens": _token_count(cache_read),
+        "cache_creation_input_tokens": _token_count(cache_write),
     }
+
+
+def _token_count(value: object, default: int = 0) -> int:
+    """Accept protocol-compatible integer strings without trusting other values."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return default
+
+
+def _cache_read(raw_usage: dict) -> object:
+    """从 OpenAI 两种 usage 形状里取缓存读 token 数（多数上游不返回则为 0）。"""
+    details = raw_usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and _token_count(details.get("cached_tokens")):
+        return _token_count(details["cached_tokens"])
+    details = raw_usage.get("input_tokens_details")
+    if isinstance(details, dict) and _token_count(details.get("cached_tokens")):
+        return _token_count(details["cached_tokens"])
+    for key in ("cache_read_input_tokens", "cache_read_tokens"):
+        if _token_count(raw_usage.get(key)):
+            return _token_count(raw_usage[key])
+    return 0
+
+
+def _cache_write(raw_usage: dict) -> object:
+    for key in ("cache_creation_input_tokens", "cache_creation_tokens"):
+        if _token_count(raw_usage.get(key)):
+            return _token_count(raw_usage[key])
+    return 0
 
 
 def _stop_reason(reason: object, *, has_tool: bool = False) -> str:
@@ -450,7 +589,10 @@ def chat_to_anthropic(body: dict) -> dict:
         "stop_reason": _stop_reason(choice.get("finish_reason"), has_tool=has_tool),
         "stop_sequence": None,
         "usage": _usage(
-            raw_usage.get("prompt_tokens"), raw_usage.get("completion_tokens")
+            raw_usage.get("prompt_tokens"),
+            raw_usage.get("completion_tokens"),
+            _cache_read(raw_usage),
+            _cache_write(raw_usage),
         ),
     }
 
@@ -473,7 +615,7 @@ def responses_to_anthropic(body: dict) -> dict:
                 if isinstance(text, str) and text:
                     content.append({"type": "text", "text": text})
         elif kind == "function_call":
-            arguments = item.get("arguments", "{}")
+            arguments = item.get("arguments", item.get("input", "{}"))
             try:
                 parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
             except json.JSONDecodeError:
@@ -514,7 +656,10 @@ def responses_to_anthropic(body: dict) -> dict:
         ),
         "stop_sequence": None,
         "usage": _usage(
-            raw_usage.get("input_tokens"), raw_usage.get("output_tokens")
+            raw_usage.get("input_tokens"),
+            raw_usage.get("output_tokens"),
+            _cache_read(raw_usage),
+            _cache_write(raw_usage),
         ),
     }
 
@@ -563,13 +708,13 @@ class SSEParser:
 
     def feed(self, chunk: bytes) -> list[tuple[str, str]]:
         self.buffer.extend(chunk)
-        if len(self.buffer) > self.max_buffer:
-            raise ProtocolTransformError("upstream SSE event exceeds size limit")
         events: list[tuple[str, str]] = []
         while True:
             match = re.search(br"\r\n\r\n|\n\n|\r\r", self.buffer)
             if match is None:
                 break
+            if match.start() > self.max_buffer:
+                raise ProtocolTransformError("upstream SSE event exceeds size limit")
             raw = bytes(self.buffer[: match.start()])
             del self.buffer[: match.end()]
             event = "message"
@@ -581,6 +726,8 @@ class SSEParser:
                     data.append(line[5:].lstrip().decode("utf-8", "strict"))
             if data:
                 events.append((event, "\n".join(data)))
+        if len(self.buffer) > self.max_buffer:
+            raise ProtocolTransformError("upstream SSE event exceeds size limit")
         return events
 
     def finish(self) -> None:
@@ -595,15 +742,21 @@ class AnthropicStreamBridge:
     model: str = ""
     started: bool = False
     stopped: bool = False
+    upstream_terminal: bool = False
     next_index: int = 0
     text_index: int | None = None
     thinking_index: int | None = None
     tool_indices: dict[str, int] = field(default_factory=dict)
+    response_text_deltas: set[tuple[str, str, str]] = field(default_factory=set)
+    response_text_done: set[tuple[str, str, str]] = field(default_factory=set)
+    response_tool_argument_deltas: set[int] = field(default_factory=set)
     open_indices: set[int] = field(default_factory=set)
     has_tool: bool = False
     stop: str = "end_turn"
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
 
     def _start(self) -> list[bytes]:
         if self.started:
@@ -622,7 +775,9 @@ class AnthropicStreamBridge:
                         "model": self.model,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": _usage(self.input_tokens, 0),
+                        "usage": _usage(
+                            self.input_tokens, 0, self.cache_read, self.cache_write
+                        ),
                     },
                 },
             )
@@ -662,6 +817,7 @@ class AnthropicStreamBridge:
     def _text(self, text: str) -> list[bytes]:
         chunks: list[bytes] = []
         if self.text_index is None:
+            chunks.extend(self._close_open_tools())
             self.text_index, opened = self._open("text", {"text": ""})
             chunks.extend(opened)
         chunks.append(
@@ -679,6 +835,7 @@ class AnthropicStreamBridge:
     def _thinking(self, text: str) -> list[bytes]:
         chunks: list[bytes] = []
         if self.thinking_index is None:
+            chunks.extend(self._close_open_tools())
             self.thinking_index, opened = self._open(
                 "thinking", {"thinking": "", "signature": ""}
             )
@@ -702,11 +859,27 @@ class AnthropicStreamBridge:
             {"id": call_id, "name": name, "input": {}},
             key=key,
         )
-        return [*self._close(self.text_index), *self._close(self.thinking_index), *chunks]
+        index = self.tool_indices[key]
+        if call_id:
+            self.tool_indices.setdefault(call_id, index)
+        closed = [
+            *self._close(self.text_index),
+            *self._close(self.thinking_index),
+        ]
+        self.text_index = None
+        self.thinking_index = None
+        return [*closed, *chunks]
+
+    def _close_open_tools(self) -> list[bytes]:
+        """Close preceding tool blocks before starting a later text block."""
+        chunks: list[bytes] = []
+        for index in sorted(set(self.tool_indices.values()) & self.open_indices):
+            chunks.extend(self._close(index))
+        return chunks
 
     def _tool_delta(self, key: str, value: str) -> list[bytes]:
         index = self.tool_indices.get(key)
-        if index is None:
+        if index is None or index not in self.open_indices:
             return []
         return [
             sse_event(
@@ -720,8 +893,13 @@ class AnthropicStreamBridge:
         ]
 
     def feed(self, event: str, data: str) -> list[bytes]:
+        if self.stopped:
+            return []
         if data == "[DONE]":
+            self.upstream_terminal = True
             return self.finish()
+        if self.upstream_terminal and self.api_format != "openai_chat":
+            return []
         try:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
@@ -741,8 +919,22 @@ class AnthropicStreamBridge:
             self.model = payload["model"]
         usage = payload.get("usage")
         if isinstance(usage, dict):
-            self.input_tokens = int(usage.get("prompt_tokens") or self.input_tokens)
-            self.output_tokens = int(usage.get("completion_tokens") or self.output_tokens)
+            self.input_tokens = _token_count(
+                usage.get("prompt_tokens"), self.input_tokens
+            )
+            self.output_tokens = _token_count(
+                usage.get("completion_tokens"), self.output_tokens
+            )
+            self.cache_read = _token_count(_cache_read(usage), self.cache_read)
+            self.cache_write = _token_count(_cache_write(usage), self.cache_write)
+        # Chat providers commonly send one choices=[] usage event after the
+        # finish reason. Preserve that metadata, while rejecting late content.
+        if self.upstream_terminal:
+            if payload.get("choices") not in (None, []):
+                raise ProtocolTransformError(
+                    "upstream Chat emitted choices after finish_reason"
+                )
+            return []
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
             return []
@@ -772,9 +964,15 @@ class AnthropicStreamBridge:
             arguments = function.get("arguments")
             if isinstance(arguments, str) and arguments:
                 chunks.extend(self._tool_delta(key, arguments))
-        if choice.get("finish_reason") is not None:
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            if not isinstance(finish_reason, str) or not finish_reason:
+                raise ProtocolTransformError(
+                    "upstream Chat finish_reason must be a non-empty string or null"
+                )
+            self.upstream_terminal = True
             self.stop = _stop_reason(
-                choice.get("finish_reason"), has_tool=self.has_tool
+                finish_reason, has_tool=self.has_tool
             )
         return chunks
 
@@ -787,11 +985,45 @@ class AnthropicStreamBridge:
             self.model = response["model"]
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         if usage:
-            self.input_tokens = int(usage.get("input_tokens") or self.input_tokens)
-            self.output_tokens = int(usage.get("output_tokens") or self.output_tokens)
+            self.input_tokens = _token_count(
+                usage.get("input_tokens"), self.input_tokens
+            )
+            self.output_tokens = _token_count(
+                usage.get("output_tokens"), self.output_tokens
+            )
+            self.cache_read = _token_count(_cache_read(usage), self.cache_read)
+            self.cache_write = _token_count(_cache_write(usage), self.cache_write)
         if kind in {"response.output_text.delta", "response.refusal.delta"}:
+            text_kind = kind.removesuffix(".delta")
+            key = (
+                text_kind,
+                str(payload.get("output_index", "")),
+                str(payload.get("content_index", "")),
+            )
+            if key in self.response_text_done:
+                return []
+            self.response_text_deltas.add(key)
             delta = payload.get("delta")
             return self._text(delta) if isinstance(delta, str) and delta else []
+        if kind in {"response.output_text.done", "response.refusal.done"}:
+            text_kind = kind.removesuffix(".done")
+            key = (
+                text_kind,
+                str(payload.get("output_index", "")),
+                str(payload.get("content_index", "")),
+            )
+            if key in self.response_text_done:
+                return []
+            self.response_text_done.add(key)
+            # Normal Responses streams send the full text again in ``.done``
+            # after deltas.  Some compatible upstreams send only ``.done``;
+            # emit that text exactly once rather than losing or duplicating it.
+            if key in self.response_text_deltas:
+                self.response_text_deltas.remove(key)
+                return []
+            text_key = "text" if text_kind == "response.output_text" else "refusal"
+            text = payload.get(text_key, payload.get("delta"))
+            return self._text(text) if isinstance(text, str) and text else []
         if kind == "response.reasoning_summary_text.delta":
             delta = payload.get("delta")
             return self._thinking(delta) if isinstance(delta, str) and delta else []
@@ -799,16 +1031,57 @@ class AnthropicStreamBridge:
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             if item.get("type") == "function_call":
                 key = str(item.get("id") or item.get("call_id") or payload.get("output_index"))
-                return self._tool_start(
+                chunks = self._tool_start(
                     key,
                     str(item.get("call_id") or item.get("id") or ""),
                     str(item.get("name", "")),
                 )
+                arguments = item.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    self.response_tool_argument_deltas.add(self.tool_indices[key])
+                    chunks.extend(self._tool_delta(key, arguments))
+                return chunks
         if kind == "response.function_call_arguments.delta":
-            key = str(payload.get("item_id") or payload.get("output_index"))
-            delta = payload.get("delta")
+            key = str(
+                payload.get("item_id")
+                or payload.get("call_id")
+                or payload.get("output_index")
+            )
+            index = self.tool_indices.get(key)
+            if index is not None:
+                self.response_tool_argument_deltas.add(index)
+            delta = payload.get("delta", payload.get("arguments"))
             return self._tool_delta(key, delta) if isinstance(delta, str) else []
+        if kind == "response.function_call_arguments.done":
+            key = str(
+                payload.get("item_id")
+                or payload.get("call_id")
+                or payload.get("output_index")
+            )
+            chunks: list[bytes] = []
+            index = self.tool_indices.get(key)
+            if index is not None and index not in self.response_tool_argument_deltas:
+                arguments = payload.get("arguments", payload.get("delta"))
+                if isinstance(arguments, str) and arguments:
+                    chunks.extend(self._tool_delta(key, arguments))
+            if index is not None:
+                self.response_tool_argument_deltas.discard(index)
+            return [*chunks, *self._close(index)]
+        if kind == "response.output_item.done":
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            if item.get("type") == "function_call":
+                key = str(item.get("id") or item.get("call_id") or payload.get("output_index"))
+                chunks: list[bytes] = []
+                index = self.tool_indices.get(key)
+                if index is not None and index not in self.response_tool_argument_deltas:
+                    arguments = item.get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        chunks.extend(self._tool_delta(key, arguments))
+                if index is not None:
+                    self.response_tool_argument_deltas.discard(index)
+                return [*chunks, *self._close(index)]
         if kind in {"response.completed", "response.incomplete"}:
+            self.upstream_terminal = True
             incomplete = (
                 response.get("incomplete_details")
                 if isinstance(response.get("incomplete_details"), dict)
@@ -819,8 +1092,10 @@ class AnthropicStreamBridge:
                 has_tool=self.has_tool,
             )
         if kind in {"response.failed", "error"}:
+            self.upstream_terminal = True
             error = payload.get("error") or response.get("error") or {}
             message = error.get("message") if isinstance(error, dict) else str(error)
+            self.stopped = True
             return [
                 sse_event(
                     "error",
@@ -869,4 +1144,6 @@ def translate_sse_chunks(
         for event, data in parser.feed(chunk):
             yield from bridge.feed(event, data)
     parser.finish()
+    if not bridge.upstream_terminal:
+        raise ProtocolTransformError("upstream SSE ended without a terminal event")
     yield from bridge.finish()

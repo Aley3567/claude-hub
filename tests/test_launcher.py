@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hmac
 import io
 import json
 import os
@@ -15,7 +16,7 @@ import threading
 import time
 import unittest
 import uuid
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingTCPServer
@@ -83,14 +84,30 @@ def free_local_port() -> int:
 
 
 @contextmanager
-def health_server(status_code: int, payload: bytes):
+def health_server(
+    status_code: int, payload: bytes, *, ready_token: str | None = None
+):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+            body = payload
+            if self.path == "/readyz" and ready_token is not None:
+                challenge = self.headers.get("X-Claude-Hub-Challenge", "")
+                decoded = json.loads(payload)
+                proof_message = (
+                    f"claude-hub-ready:v1:{self.server.server_address[1]}:{challenge}"
+                    .encode("ascii")
+                )
+                decoded["proof"] = hmac.digest(
+                    ready_token.encode("utf-8"),
+                    proof_message,
+                    "sha256",
+                ).hex()
+                body = json.dumps(decoded).encode("utf-8")
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(body)
 
         def log_message(self, _format: str, *_args) -> None:
             return
@@ -634,6 +651,27 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "1–120"):
                         launcher._hub_start_timeout()
 
+                requested, forwarded = launcher._extract_hub_model(
+                    ["-p", "hello", "--", "--model", "not-for-hub"]
+                )
+                self.assertIsNone(requested)
+                self.assertEqual(
+                    forwarded, ["-p", "hello", "--", "--model", "not-for-hub"]
+                )
+
+    def test_conflicting_backend_selectors_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                for argv in (
+                    ["--hub", "--direct"],
+                    ["anyrouter", "--current"],
+                    ["--direct", "hub"],
+                ):
+                    with self.subTest(argv=argv), self.assertRaisesRegex(
+                        RuntimeError, "不能同时指定后端"
+                    ):
+                        launcher.parse_args(argv)
+
     def test_list_and_doctor_are_local_and_scriptable(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
@@ -650,7 +688,18 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 connection.executemany(
                     "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
                     [
-                        ("a", "Alpha", '{"env": {}}', 1),
+                        (
+                            "a",
+                            "Alpha",
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "CLAUDE_CODE_SUBAGENT_MODEL": "pinned-model"
+                                    }
+                                }
+                            ),
+                            1,
+                        ),
                         ("b", "团队渠道", '{"env": {}}', 2),
                     ],
                 )
@@ -673,10 +722,81 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertLess(rendered.index("Alpha"), rendered.index("团队渠道"))
                 self.assertIn("本机只读，不连接上游", rendered)
                 self.assertIn("发现 2 个 Claude 渠道", rendered)
+                self.assertIn("1 个 provider 固定了子代理模型", rendered)
+                self.assertIn("claude1 doctor --fix", rendered)
                 self.assertEqual(
                     stat.S_IMODE(Path(env["CLAUDE1_CONFIG_PATH"]).stat().st_mode),
                     0o600,
                 )
+            with sqlite3.connect(db_path) as connection:
+                raw = connection.execute(
+                    "SELECT settings_config FROM providers WHERE id = 'a'"
+                ).fetchone()[0]
+            self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", raw)
+
+    def test_doctor_fix_backs_up_and_cleans_every_provider_type(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            dirty = json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_MODEL": "fixture-model",
+                        "CLAUDE_CODE_SUBAGENT_MODEL": "pinned-model",
+                    }
+                }
+            )
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?)",
+                    [
+                        ("claude", "Claude Fixture", dirty, "claude", 1),
+                        ("desktop", "Desktop Fixture", dirty, "claude-desktop", 2),
+                        ("clean", "Clean Fixture", '{"env": {}}', "claude", 3),
+                    ],
+                )
+            db_path.chmod(0o600)
+            fake_claude = home / "bin" / "claude"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(fake_claude, "#!/bin/sh\nexit 0\n")
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+
+            output = io.StringIO()
+            with loaded_launcher(env) as launcher, redirect_stdout(output):
+                self.assertEqual(launcher.main(["doctor", "--fix"]), 0)
+
+            backups = list(db_path.parent.glob("cc-switch.db.bak-doctor-fix-*"))
+            self.assertEqual(len(backups), 1)
+            with sqlite3.connect(db_path) as connection:
+                live_settings = [
+                    json.loads(row[0])
+                    for row in connection.execute(
+                        "SELECT settings_config FROM providers ORDER BY id"
+                    )
+                ]
+            self.assertTrue(
+                all(
+                    "CLAUDE_CODE_SUBAGENT_MODEL" not in settings.get("env", {})
+                    for settings in live_settings
+                )
+            )
+            with sqlite3.connect(backups[0]) as connection:
+                backup_dirty_count = connection.execute(
+                    "SELECT COUNT(*) FROM providers "
+                    "WHERE settings_config LIKE '%CLAUDE_CODE_SUBAGENT_MODEL%'"
+                ).fetchone()[0]
+            self.assertEqual(backup_dirty_count, 2)
+            rendered = output.getvalue()
+            self.assertIn("Claude Fixture", rendered)
+            self.assertIn("Desktop Fixture", rendered)
+            self.assertIn(str(backups[0]), rendered)
 
     def test_current_provider_uses_unique_db_marker_and_main_launches_that_row(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -742,6 +862,311 @@ class LauncherTuiLogicTests(unittest.TestCase):
 
 
 class LauncherSafetyTests(unittest.TestCase):
+    def test_usage_loader_reads_rotated_backup_and_skips_malformed_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            with loaded_launcher(isolated_env(home)) as launcher:
+                usage = home / "logs" / "usage.jsonl"
+                usage.parent.mkdir(parents=True)
+                rotated = usage.with_name(usage.name + ".1")
+                rotated.write_text(
+                    '\n'.join(
+                        (
+                            json.dumps({"ts": 100, "in": 1}),
+                            json.dumps({"ts": "corrupt", "in": 999}),
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                usage.write_text(
+                    json.dumps({"ts": 200, "in": 2}) + "\n",
+                    encoding="utf-8",
+                )
+
+                rows = launcher._load_usage_rows(usage, 50)
+
+        self.assertEqual([row["in"] for row in rows], [1, 2])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX special-file safety")
+    def test_usage_loader_ignores_fifo_and_symlink_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            with loaded_launcher(isolated_env(home)) as launcher:
+                usage = home / "usage.jsonl"
+                os.mkfifo(usage)
+                self.assertEqual(launcher._load_usage_rows(usage, 0), [])
+
+                usage.unlink()
+                target = home / "other.jsonl"
+                target.write_text(json.dumps({"ts": 100, "in": 9}), encoding="utf-8")
+                usage.symlink_to(target)
+                self.assertEqual(launcher._load_usage_rows(usage, 0), [])
+
+    def test_claude_interrupt_is_forwarded_to_its_session_without_killing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                proc = mock.Mock(pid=4242)
+                proc.wait.side_effect = [KeyboardInterrupt(), 17]
+                proc.poll.return_value = None
+                with (
+                    mock.patch.object(launcher.subprocess, "Popen", return_value=proc) as popen,
+                    mock.patch.object(launcher.os, "killpg") as killpg,
+                ):
+                    self.assertEqual(launcher._run_claude(["claude"], env={}), 17)
+
+        popen.assert_called_once_with(
+            ["claude"], env={}, start_new_session=(os.name == "posix")
+        )
+        if os.name == "posix":
+            killpg.assert_called_once_with(4242, launcher.signal.SIGINT)
+        else:
+            proc.send_signal.assert_called_once_with(launcher.signal.SIGINT)
+
+    def test_direct_preserves_explicitly_inherited_claude_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(
+                Path(raw_home),
+                CLAUDE1_CLAUDE_BIN="/fixture/claude",
+                ANTHROPIC_AUTH_TOKEN="inherited-token",
+                ANTHROPIC_BASE_URL="https://inherited.example",
+            )
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(launcher, "_run_claude", return_value=0) as run:
+                    self.assertEqual(launcher.exec_plain_claude("direct", ["-p", "hi"]), 0)
+
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["ANTHROPIC_AUTH_TOKEN"], "inherited-token")
+        self.assertEqual(child_env["ANTHROPIC_BASE_URL"], "https://inherited.example")
+
+    def test_parse_args_preserves_double_dash_and_rejects_lost_provider_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.parse_args(["direct", "--", "--current", "--hub"]),
+                    ("direct", None, ["--", "--current", "--hub"]),
+                )
+                with self.assertRaisesRegex(RuntimeError, "provider 与 --hub"):
+                    launcher.parse_args(["DeepSeek", "--hub"])
+
+    def test_missing_notion_config_is_not_forwarded_to_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            stderr = io.StringIO()
+            with loaded_launcher(env) as launcher, redirect_stderr(stderr):
+                backend, hint, forwarded = launcher.parse_args(["--notion", "--", "-p", "hi"])
+
+        self.assertIsNone(backend)
+        self.assertIsNone(hint)
+        self.assertEqual(forwarded, ["--", "-p", "hi"])
+        self.assertIn("notion 配置不存在", stderr.getvalue())
+
+    def test_reserved_provider_name_requires_an_explicit_backend_or_id(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, app_type TEXT, sort_index INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', 1)",
+                    ("provider-hub", "hub", '{"env": {}}'),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(RuntimeError, "名称“hub”与 claude1 后端命令冲突"):
+                    launcher.main(["hub"])
+                self.assertEqual(launcher.parse_args(["--hub"])[0], "hub")
+
+    def test_gateway_missing_binary_and_doctor_report_a_clear_action(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, app_type TEXT, sort_index INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', 1)",
+                    (
+                        "gateway-provider",
+                        "Gateway",
+                        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18317"}}),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(launcher, "gateway_healthy", return_value=False):
+                    with self.assertRaisesRegex(RuntimeError, "CLAUDE1_GATEWAY_BIN"):
+                        launcher.ensure_local_gateway("http://127.0.0.1:18317")
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.cli_doctor(), 1)
+
+        self.assertIn("有渠道需要本地网关", output.getvalue())
+        self.assertIn("CLAUDE1_GATEWAY_BIN", output.getvalue())
+
+    def test_gateway_log_is_created_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            gateway = Path(env["CLAUDE1_GATEWAY_BIN"])
+            gateway.parent.mkdir(parents=True)
+            write_executable(gateway, "#!/bin/sh\nexit 0\n")
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "gateway_healthy", side_effect=[False, True]),
+                    mock.patch.object(launcher.subprocess, "Popen"),
+                ):
+                    launcher.ensure_local_gateway("http://127.0.0.1:18317")
+                if os.name == "posix":
+                    self.assertEqual(
+                        stat.S_IMODE(Path(env["CLAUDE1_GATEWAY_LOG"]).stat().st_mode),
+                        0o600,
+                    )
+
+    def test_hub_start_is_serialized_between_concurrent_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            port = free_local_port()
+            env = isolated_env(home, CLAUDE1_HUB_START_TIMEOUT="5")
+            fake_hub = Path(env["CLAUDE1_HUB_SCRIPT"])
+            fake_hub.parent.mkdir(parents=True)
+            write_executable(
+                fake_hub,
+                """
+                #!/usr/bin/env python3
+                import hmac
+                import json
+                import os
+                from http.server import BaseHTTPRequestHandler
+                from socketserver import TCPServer
+
+                body = json.dumps({"ok": True, "service": "claude-hub", "protocol": 1}).encode()
+                class Handler(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    def log_message(self, *_args):
+                        return
+                TCPServer(("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler).serve_forever()
+                """,
+            )
+            with loaded_launcher(env) as launcher:
+                real_popen = subprocess.Popen
+                started = threading.Barrier(2)
+                errors: list[BaseException] = []
+
+                def start_hub() -> None:
+                    try:
+                        started.wait(timeout=2)
+                        launcher.ensure_hub(port)
+                    except BaseException as exc:  # assertions run in the parent thread
+                        errors.append(exc)
+
+                with mock.patch.object(launcher.subprocess, "Popen", side_effect=real_popen) as popen:
+                    threads = [threading.Thread(target=start_hub) for _ in range(2)]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=8)
+
+                try:
+                    self.assertFalse(any(thread.is_alive() for thread in threads))
+                    self.assertEqual(errors, [])
+                    self.assertEqual(popen.call_count, 1)
+                finally:
+                    for process in launcher._hub_processes:
+                        if process.poll() is None:
+                            process.terminate()
+                            process.wait(timeout=5)
+
+    def test_noninteractive_provider_selection_has_a_clear_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                with mock.patch("builtins.input", side_effect=EOFError):
+                    with self.assertRaisesRegex(RuntimeError, "标准输入不可用"):
+                        launcher.choose([{"id": "one", "name": "One"}], None)
+
+    def test_list_explains_how_to_view_when_every_provider_is_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, app_type TEXT, sort_index INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES ('one', 'One', '{\"env\": {}}', 'claude', 1)"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            config_path = Path(env["CLAUDE1_CONFIG_PATH"])
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps({"version": 3, "providers": {"one": {"name": "One", "hidden": True}}}),
+                encoding="utf-8",
+            )
+            with loaded_launcher(env) as launcher:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.cli_list_providers(), 1)
+
+        self.assertIn("claude1 list --all", output.getvalue())
+
+    def test_tui_reverts_alias_and_hidden_changes_when_persistence_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                alias_cfg = {"providers": {"one": {"name": "One", "hidden": False}}}
+
+                def edit_alias(_win, provider_id, meta):
+                    meta[provider_id]["alias"] = "new-alias"
+                    return True, "别名已设为 new-alias"
+
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "save_config", return_value=False),
+                    mock.patch.object(launcher, "_edit_alias", side_effect=edit_alias),
+                ):
+                    launcher._launcher_main(ScriptedWindow([ord("a"), ord("q")]), alias_cfg, {"one"})
+                self.assertNotIn("alias", alias_cfg["providers"]["one"])
+
+                hidden_cfg = {"providers": {"one": {"name": "One", "hidden": False}}}
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "_draw_launcher"),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "save_config", return_value=False),
+                    mock.patch.object(launcher, "_confirm", return_value=True),
+                ):
+                    launcher._launcher_main(ScriptedWindow([ord("x"), ord("q")]), hidden_cfg, {"one"})
+                self.assertFalse(hidden_cfg["providers"]["one"]["hidden"])
+
     def test_recent_provider_state_is_written_atomically_and_privately(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -814,6 +1239,81 @@ class LauncherSafetyTests(unittest.TestCase):
                 self.assertEqual(
                     launcher.GATEWAY_URL, "http://127.0.0.1:54321"
                 )
+
+    def test_build_settings_seals_model_slots_against_user_settings_leak(self) -> None:
+        # Claude Code merges ~/.claude/settings.json env under the private
+        # --settings file, so slot keys the provider does not define would
+        # otherwise leak in from the CC Switch current provider and show
+        # foreign models in /model.
+        provider_env = {
+            "ANTHROPIC_BASE_URL": "https://kimi.example/coding/",
+            "ANTHROPIC_AUTH_TOKEN": "tok",
+            "ANTHROPIC_MODEL": "kimi-for-coding",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "must-not-pin-subagents",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "k3",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "k3",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL": "k3[1M]",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "k3",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "kimi-for-coding",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "kimi-for-coding",
+            # Haiku model without a sibling _NAME: the leak vector.
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "kimi-for-coding",
+        }
+        provider = {
+            "id": "p1",
+            "name": "Fixture Kimi",
+            "settings_config": json.dumps({"env": provider_env}),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                env = launcher.build_settings(provider)["env"]
+
+        # Owned slots keep the provider's own values verbatim.
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "k3")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "k3")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "")
+        # A missing _NAME is sealed to the provider's model id (the menu uses
+        # ??, so an empty string would render a blank label).
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "kimi-for-coding")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "kimi-for-coding")
+        self.assertEqual(
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"], "Custom Haiku model"
+        )
+        # Slots the provider does not serve are blanked entirely so Claude
+        # Code falls back to its built-in entries instead of leaking the
+        # foreign ANTHROPIC_CUSTOM_MODEL_OPTION from user settings.
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "")
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"], "")
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"], "")
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"], "")
+
+    def test_build_settings_seals_provider_without_any_slots(self) -> None:
+        provider = {
+            "id": "p2",
+            "name": "Fixture Bare",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://api.example.com",
+                        "ANTHROPIC_AUTH_TOKEN": "tok",
+                        "ANTHROPIC_MODEL": "some-model",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                env = launcher.build_settings(provider)["env"]
+
+                self.assertEqual(env["ANTHROPIC_MODEL"], "some-model")
+                for tier in launcher.MODEL_SLOT_TIERS:
+                    self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"], "")
+                    self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL_NAME"], "")
+                self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "")
 
     def test_regular_launch_records_last_session_without_touching_sticky(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1012,6 +1512,93 @@ class LauncherSafetyTests(unittest.TestCase):
                 with health_server(200, b"not-json") as port:
                     self.assertFalse(launcher.hub_healthy(port))
 
+                payload = json.dumps(valid).encode("utf-8")
+                with health_server(200, payload) as port:
+                    self.assertFalse(
+                        launcher.hub_healthy(port, "fixture-local-token")
+                    )
+                with health_server(
+                    200, payload, ready_token="fixture-local-token"
+                ) as port:
+                    self.assertTrue(
+                        launcher.hub_healthy(port, "fixture-local-token")
+                    )
+
+    def test_ensure_hub_timeout_stops_and_reaps_spawned_child(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            script = Path(env["CLAUDE1_HUB_SCRIPT"])
+            script.parent.mkdir(parents=True)
+            write_executable(script, "#!/bin/sh\nexit 0\n")
+            with loaded_launcher(env) as launcher:
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                with mock.patch.object(
+                    launcher, "hub_healthy", return_value=False
+                ), mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=process
+                ), mock.patch.object(
+                    launcher, "_hub_start_timeout", return_value=1
+                ), mock.patch.object(
+                    launcher.time, "monotonic", side_effect=[0, 2]
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "启动失败"):
+                        launcher.ensure_hub(18787, token="fixture-local-token")
+
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once()
+                self.assertNotIn(process, launcher._hub_processes)
+
+    def test_protocol_bridge_selects_provider_by_id(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            script = Path(env["CLAUDE1_HUB_SCRIPT"])
+            script.parent.mkdir(parents=True)
+            write_executable(script, "#!/bin/sh\nexit 0\n")
+            with loaded_launcher(env) as launcher:
+                written = []
+                real_write = launcher._atomic_private_write
+
+                def capture(path, content):
+                    if path.name == "hub.json":
+                        written.append(json.loads(content))
+                    return real_write(path, content)
+
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                with mock.patch.object(
+                    launcher, "_atomic_private_write", side_effect=capture
+                ), mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=process
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=True
+                ), mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    result = launcher.launch_with_protocol_bridge(
+                        {"id": "provider-id", "name": "Duplicate Name"},
+                        {"env": {}},
+                        "openai_chat",
+                        [],
+                    )
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    written[0]["channels"]["direct"]["provider"],
+                    "id:provider-id",
+                )
+
+    def test_gateway_health_requires_a_successful_http_response(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                for status_code, expected in ((200, True), (204, True), (400, False), (503, False)):
+                    with self.subTest(status_code=status_code):
+                        with health_server(status_code, b"gateway") as port:
+                            with mock.patch.object(launcher, "GATEWAY_URL", f"http://127.0.0.1:{port}"):
+                                self.assertIs(launcher.gateway_healthy(), expected)
+
     def test_ensure_hub_starts_with_a_scrubbed_whitelist_environment(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
@@ -1028,7 +1615,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 CLAUDE_CODE_CHILD_SESSION="must-not-leak",
                 CLAUDE_CODE_WORKFLOWS="must-not-leak",
                 UNRELATED_SECRET="must-not-leak",
-                CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+                FIXTURE_HUB_TOKEN="fixture-local-token",
                 CLAUDE1_HUB_START_TIMEOUT="5",
             )
             fake_hub = Path(env["CLAUDE1_HUB_SCRIPT"])
@@ -1039,6 +1626,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 fake_hub,
                 """
                 #!/usr/bin/env python3
+                import hmac
                 import json
                 import os
                 from http.server import BaseHTTPRequestHandler
@@ -1048,15 +1636,28 @@ class LauncherSafetyTests(unittest.TestCase):
                 Path(os.environ["CLAUDE_HUB_CONFIG"]).write_text(
                     json.dumps(dict(os.environ)), encoding="utf-8"
                 )
-                body = json.dumps({
+                health = {
                     "ok": True,
                     "service": "claude-hub",
                     "protocol": 1,
                     "version": "0.1.0",
-                }).encode("utf-8")
+                }
 
                 class Handler(BaseHTTPRequestHandler):
                     def do_GET(self):
+                        challenge = self.headers.get("X-Claude-Hub-Challenge", "")
+                        proof_message = (
+                            f"claude-hub-ready:v1:{os.environ['CLAUDE_HUB_PORT']}:{challenge}"
+                            .encode()
+                        )
+                        body = json.dumps({
+                            **health,
+                            "proof": hmac.digest(
+                                os.environ["FIXTURE_HUB_TOKEN"].encode(),
+                                proof_message,
+                                "sha256",
+                            ).hex(),
+                        }).encode("utf-8")
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(body)))
@@ -1074,7 +1675,11 @@ class LauncherSafetyTests(unittest.TestCase):
 
             with loaded_launcher(env) as launcher:
                 try:
-                    launcher.ensure_hub(port)
+                    launcher.ensure_hub(
+                        port,
+                        token="fixture-local-token",
+                        token_env="FIXTURE_HUB_TOKEN",
+                    )
                     child_env = json.loads(capture.read_text(encoding="utf-8"))
                 finally:
                     for process in launcher._hub_processes:
@@ -1098,7 +1703,8 @@ class LauncherSafetyTests(unittest.TestCase):
                 "UNRELATED_SECRET",
             ):
                 self.assertNotIn(key, child_env)
-            self.assertEqual(child_env["CLAUDE_HUB_LOCAL_TOKEN"], "fixture-local-token")
+            self.assertEqual(child_env["FIXTURE_HUB_TOKEN"], "fixture-local-token")
+            self.assertNotIn("CLAUDE_HUB_LOCAL_TOKEN", child_env)
             self.assertEqual(child_env["CLAUDE_HUB_CONFIG"], str(capture))
             self.assertEqual(
                 child_env["CLAUDE_HUB_DB"], env["CLAUDE1_HUB_DB"]
@@ -1122,11 +1728,13 @@ class LauncherSafetyTests(unittest.TestCase):
                     "version": "0.1.0",
                 }
             ).encode("utf-8")
-            with health_server(200, valid_health) as port:
+            with health_server(
+                200, valid_health, ready_token="fixture-local-token"
+            ) as port:
                 env = isolated_env(
                     home,
                     CLAUDE1_HUB_PORT=str(port),
-                    CLAUDE_HUB_LOCAL_TOKEN="fixture-local-token",
+                    FIXTURE_HUB_TOKEN="fixture-local-token",
                 )
                 config = Path(env["CLAUDE1_HUB_CONFIG"])
                 config.parent.mkdir(parents=True)
@@ -1134,6 +1742,8 @@ class LauncherSafetyTests(unittest.TestCase):
                     json.dumps(
                         {
                             "port": 18787,
+                            "local_token_env": "FIXTURE_HUB_TOKEN",
+                            "effort_level": "xhigh",
                             "default_channel": "glm",
                             "channels": {
                                 "glm": {
@@ -1173,7 +1783,15 @@ class LauncherSafetyTests(unittest.TestCase):
                 )
 
                 with loaded_launcher(env) as launcher:
-                    self.assertEqual(launcher.exec_hub(["-p", "hello"]), 0)
+                    with mock.patch.object(
+                        launcher, "ensure_hub", wraps=launcher.ensure_hub
+                    ) as ensure_hub:
+                        self.assertEqual(launcher.exec_hub(["-p", "hello"]), 0)
+                    ensure_hub.assert_called_once_with(
+                        port,
+                        token="fixture-local-token",
+                        token_env="FIXTURE_HUB_TOKEN",
+                    )
 
                     settings = json.loads(capture.read_text(encoding="utf-8"))
                     self.assertEqual(
@@ -1188,12 +1806,41 @@ class LauncherSafetyTests(unittest.TestCase):
                         settings["env"]["ANTHROPIC_MODEL"],
                         "glm,glm-fixture",
                     )
+                    self.assertEqual(settings["effortLevel"], "xhigh")
+                    self.assertEqual(
+                        settings["env"]["CLAUDE_CODE_EFFORT_LEVEL"],
+                        "xhigh",
+                    )
+                    for tier in launcher.MODEL_SLOT_TIERS:
+                        self.assertEqual(
+                            settings["env"][f"ANTHROPIC_DEFAULT_{tier}_MODEL"],
+                            "glm,glm-fixture",
+                        )
+                        self.assertEqual(
+                            settings["env"][
+                                f"ANTHROPIC_DEFAULT_{tier}_MODEL_SUPPORTED_CAPABILITIES"
+                            ],
+                            "thinking,adaptive_thinking,effort,xhigh_effort",
+                        )
+                    self.assertNotIn(
+                        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+                        settings["env"],
+                    )
+                    self.assertEqual(
+                        settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
+                        "",
+                    )
+                    self.assertEqual(
+                        settings["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"], ""
+                    )
 
                     # Legacy live configs with local_token continue to work when
                     # the safer environment secret is not supplied.
                     hub_cfg = json.loads(config.read_text(encoding="utf-8"))
-                    hub_cfg["local_token"] = "legacy-config-token"
+                    hub_cfg.pop("local_token_env")
+                    hub_cfg["local_token"] = "fixture-local-token"
                     config.write_text(json.dumps(hub_cfg), encoding="utf-8")
+                    os.environ["FIXTURE_HUB_TOKEN"] = ""
                     os.environ["CLAUDE_HUB_LOCAL_TOKEN"] = ""
                     self.assertEqual(launcher.exec_hub([]), 0)
                     legacy_settings = json.loads(
@@ -1201,9 +1848,115 @@ class LauncherSafetyTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         legacy_settings["env"]["ANTHROPIC_AUTH_TOKEN"],
-                        "legacy-config-token",
+                        "fixture-local-token",
                     )
                 self.assertEqual(sticky.read_text(encoding="utf-8"), "direct\n")
+
+    def test_hub_resume_restores_the_session_channel_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(
+                home,
+                CLAUDE1_HUB_PORT="18787",
+                FIXTURE_HUB_TOKEN="fixture-local-token",
+            )
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps(
+                    {
+                        "port": 18787,
+                        "local_token_env": "FIXTURE_HUB_TOKEN",
+                        "default_channel": "glm",
+                        "channels": {
+                            "glm": {"provider": "GLM", "models": ["glm-fixture"]},
+                            "grok": {"provider": "Grok", "models": ["grok-4.5"]},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            session_id = "5ffb0882-0050-4e71-9917-c76025876da8"
+            project_key = str(Path.cwd().resolve()).replace("/", "-")
+            transcript_dir = home / ".claude" / "projects" / project_key
+            transcript_dir.mkdir(parents=True)
+            (transcript_dir / f"{session_id}.jsonl").write_text(
+                "\n".join(
+                    (
+                        json.dumps({"type": "assistant", "message": {"model": "glm-fixture"}}),
+                        json.dumps({"type": "assistant", "message": {"model": "grok-4.5"}}),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_claude = home / "bin" / "claude"
+            capture = home / "capture.json"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(
+                fake_claude,
+                """
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                settings_path = Path(sys.argv[sys.argv.index("--settings") + 1])
+                Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
+                    json.dumps(
+                        {
+                            "argv": sys.argv,
+                            "settings": json.loads(settings_path.read_text(encoding="utf-8")),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                """,
+            )
+            env.update(
+                CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                FAKE_CLAUDE_CAPTURE=str(capture),
+            )
+
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(launcher, "ensure_hub"):
+                    self.assertEqual(
+                        launcher.exec_hub(["--resume", session_id]),
+                        0,
+                    )
+
+            launched = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(
+                launched["settings"]["env"]["ANTHROPIC_MODEL"],
+                "grok,grok-4.5",
+            )
+            self.assertEqual(launched["argv"][-2:], ["--resume", session_id])
+
+    def test_hub_native_model_slots_route_fixture_and_other_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                channels = {
+                    "fixture": {"models": ["k3-256k"]},
+                    "n1": {"models": ["gpt-5.6-sol"]},
+                }
+                cfg = {
+                    "model_slots": {
+                        "fab" + "le": "fixture,k3-256k",
+                        "opus": "n1,gpt-5.6-sol",
+                        "sonnet": "n1,gpt-5.6-sol",
+                        "haiku": "n1,gpt-5.6-sol",
+                    }
+                }
+
+                slots = launcher._hub_model_slots(
+                    cfg, channels, "n1,gpt-5.6-sol"
+                )
+
+        self.assertEqual(slots["FABLE"], "fixture,k3-256k")
+        for tier in ("OPUS", "SONNET", "HAIKU"):
+            self.assertEqual(slots[tier], "n1,gpt-5.6-sol")
 
     def test_hub_fails_before_start_when_no_local_token_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1276,7 +2029,7 @@ HUB_FIXTURE = {
         },
         "any": {
             "provider": "Any",
-            "models": ["claude-fable-5[1m]", "claude-opus-4-6"],
+            "models": ["claude-fixture-5[1m]", "claude-opus-4-6"],
         },
         "grok": {"provider": "Grok", "models": ["grok-4.5"]},
     },
@@ -1315,9 +2068,9 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(by_selector["gpt,gpt-5.6-sol"].status_label, "代理")
                 self.assertEqual(by_selector["any,claude-opus-4-6"].family, "Claude")
                 self.assertEqual(by_selector["grok,grok-4.5"].family, "Grok")
-                self.assertTrue(by_selector["any,claude-fable-5[1m]"].is_1m)
+                self.assertTrue(by_selector["any,claude-fixture-5[1m]"].is_1m)
                 self.assertEqual(
-                    by_selector["any,claude-fable-5[1m]"].status_label, "1M"
+                    by_selector["any,claude-fixture-5[1m]"].status_label, "1M"
                 )
 
     def test_hub_model_family_classification(self) -> None:
@@ -1325,6 +2078,7 @@ class HubWorkspaceTests(unittest.TestCase):
             env = isolated_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 self.assertEqual(launcher._hub_model_family("kimi-k3"), "Kimi")
+                self.assertEqual(launcher._hub_model_family("k3-256k"), "Kimi")
                 self.assertEqual(
                     launcher._hub_model_family("deepseek-v4-pro"), "DeepSeek"
                 )
