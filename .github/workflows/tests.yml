@@ -47,7 +47,7 @@ jobs:
           claude1_protocol.py
           scripts/secret_guard.py
 
-      - name: Scan repository for leaked secrets
+      - name: Scan repository for generic secrets and sensitive paths
         run: >-
           python scripts/secret_guard.py
           --working-tree

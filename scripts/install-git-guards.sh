@@ -16,5 +16,6 @@ fi
 
 python3 scripts/secret_guard.py --working-tree
 printf '%s\n' \
-  "[secret-guard] 已启用 pre-commit 与 pre-push 双重拦截。" \
+  "[secret-guard] 已启用 pre-commit 与 pre-push 客户端检查。" \
+  "[secret-guard] 注意：git commit --no-verify 可以跳过客户端 hook；只有受保护分支/服务端 pre-receive 才能强制阻止。" \
   "[secret-guard] 手动全历史检查：python3 scripts/secret_guard.py --all-history"

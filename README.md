@@ -23,8 +23,9 @@ Claude Code 会话里沿用原生 `/model` 切换渠道和模型。
 - CC Switch，至少配置一个 Claude provider，并已生成
   `~/.cc-switch/cc-switch.db`。
 
-`claude-hub` 是可选功能。需要会话内 `/model` 切换时再安装
-[uv](https://docs.astral.sh/uv/)；没有 uv 不影响普通的 provider 选择。
+`claude-hub` 和 OpenAI Chat / Responses 协议桥需要
+[uv](https://docs.astral.sh/uv/)。没有 uv 仍可使用 Anthropic 原生 provider，
+但选择需要协议转换的 provider 会明确报错，无法启动该会话。
 
 ### 2. 安装
 
@@ -64,6 +65,8 @@ claude1 hub                     # 本次通过可选 claude-hub 启动
 claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
 claude1 list                    # 稳定顺序列出可见渠道
 claude1 doctor                  # 本机只读检查，不连接 provider
+claude1 doctor --fix            # 备份 DB 后清理 provider 的子代理模型固定值
+claude1 usage                   # 查看 token 用量与缓存命中率曲线
 claude1 --help                  # 查看完整命令与快捷键
 CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
 ```
@@ -100,6 +103,12 @@ claude1 use hub
 
 未启用时，`claude1 use` 只保存选择并明确提示普通 `claude` 尚未接管，不再
 输出已经生效的误导性承诺。无需这项行为时不要传 `--enable-sticky`。
+已启用的安装器管理集成可随时撤销，且不会改动自行添加的 shell 配置：
+
+```bash
+./install.sh --disable-sticky
+source ~/.zshrc
+```
 
 `claude1 current` 与 statusline 的 CC Switch 回退都以数据库中唯一的
 `providers.is_current=1` 为准；`~/.cc-switch/settings.json` 只视为缓存，不再
@@ -152,13 +161,78 @@ Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监�
    claude1 hub
    ```
 
-`doctor` 只检查本机配置、数据库、渠道映射和文件权限，不会连接 provider，也
+`doctor` 默认只检查本机配置、数据库、渠道映射和文件权限，不会连接 provider，也
 不会显示上游地址或 token。Hub 会要求配置、CC Switch 数据库以及当前存在的
 `-wal`、`-shm` 文件权限不超过 `0600`；检查失败时按输出修正后再启动。
 
 进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Hub
 会在请求发生时从 CC Switch DB 只读获取对应 provider 的凭证，不修改 DB、
 provider 或 current 状态。
+
+## 可选：查看 token 用量与缓存命中率
+
+请求经过 Hub 时，网关会把每条响应的 token 用量（输入 / 输出 / 缓存读 /
+缓存写）追加到 `~/.cc-switch/logs/claude-hub-usage.jsonl`（权限 `0600`，只
+存 token 计数与时间，不含任何凭证）。平时由 Hub 实时写入；也可以把 Claude
+Code 本地会话记录里已有的用量一次性导入同一文件（见下）。
+
+```bash
+claude1 usage            # 最近 24 小时（默认）
+claude1 usage --day      # 最近 24 小时，按小时分桶
+claude1 usage --week     # 最近 7 天，按天分桶
+claude1 usage --month    # 最近 30 天，按天分桶
+```
+
+输出分两部分：
+
+- **汇总表**：请求数、输入 / 输出 / 缓存读 / 缓存写 token，以及整体缓存
+  命中率（`缓存读 / (输入 + 缓存读)`）；
+- **Braille 双曲线**：缓存命中率与 token 量（按窗口内峰值归一化）随时间的
+  变化；彩色终端使用两种颜色区分，禁用颜色时共用 Braille 点阵并保留文字图例。
+
+两点说明：
+
+- 只有返回了 cache 字段的上游（官方 / 原生 Anthropic 转发）缓存命中率才是
+  真实值；多数 OpenAI 兼容中转不返回 cache 字段，对应渠道的缓存读会计为
+  `0`，命中率因此偏低属正常；
+- 用量文件由 Hub 写入，首次使用或窗口内无记录时，`claude1 usage` 会提示先
+  用 `claude1 hub` 跑几个请求。
+
+### 导入已有会话的用量
+
+除了 Hub 实时埋点，也可以把 Claude Code 本地会话记录（
+`~/.claude/projects/*/*.jsonl`）里已经发生的用量一次性导入同一个统计文件，
+这样能覆盖不经过 Hub 的直连渠道。导入按消息 id 去重，时间戳取消息本身的
+时间。一个可用的导入脚本片段：
+
+```bash
+python3 - <<'EOF'
+import json, glob, os, time, datetime
+start = time.mktime(datetime.date.today().timetuple())  # 今天 00:00
+seen = {}
+for path in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+    for line in open(path, encoding="utf-8", errors="ignore"):
+        try: r = json.loads(line)
+        except Exception: continue
+        m = r.get("message")
+        if not (isinstance(m, dict) and isinstance(m.get("usage"), dict)): continue
+        ts = datetime.datetime.fromisoformat(
+            (r.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+        if ts < start: continue
+        u = m["usage"]
+        seen[m.get("id")] = (ts, u, m.get("model", ""))
+out = os.path.expanduser("~/.cc-switch/logs/claude-hub-usage.jsonl")
+with open(out, "a", encoding="utf-8") as f:   # 追加；想重来先清空该文件
+    for ts, u, model in sorted(seen.values()):
+        f.write(json.dumps({"ts": int(ts), "channel": "import",
+            "model": model, "format": "session",
+            "in": u.get("input_tokens", 0), "out": u.get("output_tokens", 0),
+            "cr": u.get("cache_read_input_tokens", 0),
+            "cw": u.get("cache_creation_input_tokens", 0)}) + "\n")
+os.chmod(out, 0o600)
+print("导入", len(seen), "条")
+EOF
+```
 
 ## 安装位置与备份
 

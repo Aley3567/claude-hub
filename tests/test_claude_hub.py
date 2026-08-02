@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import gzip
+import hmac
 import importlib.util
 import ipaddress
 import io
@@ -174,6 +175,7 @@ class ClaudeHubTests(unittest.TestCase):
         self.config_file = root / "hub.json"
         self.db_file = root / "fixture ?#%.db"
         self.log_file = root / "logs" / "hub.log"
+        self.usage_file = root / "logs" / "hub-usage.jsonl"
         self._write_db(
             [
                 (
@@ -208,6 +210,7 @@ class ClaudeHubTests(unittest.TestCase):
                 "CLAUDE_HUB_CONFIG": str(self.config_file),
                 "CLAUDE_HUB_DB": str(self.db_file),
                 "CLAUDE_HUB_LOG": str(self.log_file),
+                "CLAUDE_HUB_USAGE": str(self.usage_file),
                 "CLAUDE_HUB_LOCAL_TOKEN": "fixture-local-token",
             },
             clear=False,
@@ -220,6 +223,9 @@ class ClaudeHubTests(unittest.TestCase):
         if hub._log_fp is not None:
             hub._log_fp.close()
             hub._log_fp = None
+        if hub._usage_fp is not None:
+            hub._usage_fp.close()
+            hub._usage_fp = None
         hub.reset_caches()
         self.env_patch.stop()
         self.temp_dir.cleanup()
@@ -237,6 +243,45 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(self.log_file.read_text(encoding="utf-8"), "")
         if os.name == "posix":
             self.assertEqual(self.log_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(rotated.stat().st_mode & 0o777, 0o600)
+
+    def test_log_escapes_newlines_and_rotates_while_server_is_running(self):
+        with mock.patch.object(hub, "LOG_MAX_BYTES", 1):
+            hub.open_log()
+            hub.log("model\nforged-entry")
+
+        rotated = self.log_file.with_name(self.log_file.name + ".1")
+        self.assertIn("model\\nforged-entry", rotated.read_text(encoding="utf-8"))
+        self.assertEqual(self.log_file.read_text(encoding="utf-8"), "")
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW unavailable")
+    def test_usage_log_does_not_follow_symlinks(self):
+        self.usage_file.parent.mkdir(parents=True, exist_ok=True)
+        target = self.root / "must-not-be-written"
+        target.write_text("unchanged", encoding="utf-8")
+        self.usage_file.symlink_to(target)
+
+        hub.record_usage("fast", "model", "anthropic", {})
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+        self.assertIsNone(hub._usage_fp)
+
+    def test_usage_log_rotates_after_crossing_its_size_limit(self):
+        with mock.patch.object(hub, "USAGE_LOG_MAX_BYTES", 1):
+            hub.record_usage(
+                "fast",
+                "fixture-model",
+                "anthropic",
+                {"input_tokens": 3, "output_tokens": 5},
+            )
+
+        rotated = self.usage_file.with_name(self.usage_file.name + ".1")
+        row = json.loads(rotated.read_text(encoding="utf-8"))
+        self.assertEqual(row["model"], "fixture-model")
+        self.assertEqual((row["in"], row["out"]), (3, 5))
+        self.assertEqual(self.usage_file.read_text(encoding="utf-8"), "")
+        if os.name == "posix":
+            self.assertEqual(self.usage_file.stat().st_mode & 0o777, 0o600)
             self.assertEqual(rotated.stat().st_mode & 0o777, 0o600)
 
     @unittest.skipUnless(os.name == "posix", "POSIX file safety")
@@ -374,6 +419,67 @@ class ClaudeHubTests(unittest.TestCase):
         with self.assertRaisesRegex(hub.ConfigError, "port must be an integer"):
             hub.get_config()
 
+    def test_config_effort_pin_forces_all_generative_requests(self):
+        self._write_config(effort_level="xhigh")
+        hub.reset_caches()
+        cfg = hub.get_config()
+
+        inherited = {}
+        hub._apply_effort_pin(inherited, cfg, is_count=False)
+        self.assertEqual(inherited["output_config"]["effort"], "xhigh")
+
+        explicit_lower = {"output_config": {"effort": "low"}}
+        hub._apply_effort_pin(explicit_lower, cfg, is_count=False)
+        self.assertEqual(explicit_lower["output_config"]["effort"], "xhigh")
+
+        count_payload = {}
+        hub._apply_effort_pin(count_payload, cfg, is_count=True)
+        self.assertNotIn("output_config", count_payload)
+
+    def test_config_validation_rejects_invalid_effort_level(self):
+        self._write_config(effort_level="maximum")
+        hub.reset_caches()
+
+        with self.assertRaisesRegex(hub.ConfigError, "effort_level must be"):
+            hub.get_config()
+
+    def test_legacy_base_url_channel_resolves_existing_provider_read_only(self):
+        self._write_config(
+            default_channel="legacy",
+            channels={
+                "legacy": {
+                    "base_url": "http://127.0.0.1:19090",
+                    "token_file": "/ignored/legacy-token",
+                    "ensure_cmd": ["ignored-legacy-command"],
+                    "models": ["local-model"],
+                }
+            },
+        )
+        hub.reset_caches()
+
+        cfg = hub.get_config()
+        provider = hub.resolve_provider("legacy", cfg)
+
+        self.assertEqual(cfg["channels"]["legacy"]["provider"], "")
+        self.assertEqual(
+            cfg["channels"]["legacy"]["provider_base_url"],
+            "http://127.0.0.1:19090",
+        )
+        self.assertEqual(provider["base_url"], "http://127.0.0.1:19090")
+        self.assertEqual(provider["token"], "fixture-upstream-token")
+
+    def test_channel_requires_provider_or_base_url_selector(self):
+        self._write_config(
+            default_channel="broken",
+            channels={"broken": {"models": ["some-model"]}},
+        )
+        hub.reset_caches()
+
+        with self.assertRaisesRegex(
+            hub.ConfigError, "provider or base_url must be a non-empty string"
+        ):
+            hub.get_config()
+
     def test_explicit_and_default_routes(self):
         cfg = hub.get_config()
 
@@ -453,9 +559,206 @@ class ClaudeHubTests(unittest.TestCase):
 
         self.assertEqual(provider["base_url"], "http://127.0.0.1:19090")
 
+    def test_provider_https_proxy_is_inherited_and_channel_proxy_wins(self):
+        connection = sqlite3.connect(self.db_file)
+        try:
+            env = {
+                "ANTHROPIC_BASE_URL": "https://upstream.invalid/v1",
+                "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+                "HTTPS_PROXY": "http://127.0.0.1:7897",
+            }
+            connection.execute(
+                "UPDATE providers SET settings_config=? WHERE name=?",
+                (json.dumps({"env": env}), "Fixture HTTPS"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        hub.reset_caches()
+
+        cfg = hub.get_config()
+        provider = hub.resolve_provider("fast", cfg)
+        self.assertEqual(
+            hub.channel_proxy("fast", cfg, provider), "http://127.0.0.1:7897"
+        )
+
+        cfg["channels"]["fast"]["proxy"] = "http://127.0.0.1:8899"
+        self.assertEqual(
+            hub.channel_proxy("fast", cfg, provider), "http://127.0.0.1:8899"
+        )
+
+    def test_upstream_ssl_context_adds_certifi_ca_bundle(self):
+        context = mock.Mock()
+        with mock.patch.object(
+            hub.ssl, "create_default_context", return_value=context
+        ) as create_default_context, mock.patch.object(
+            hub.certifi, "where", return_value="/fixture/cacert.pem"
+        ):
+            result = hub._upstream_ssl_context()
+
+        self.assertIs(result, context)
+        create_default_context.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(
+            cafile="/fixture/cacert.pem"
+        )
+
     def test_malformed_upstream_url_becomes_controlled_route_error(self):
         with self.assertRaisesRegex(hub.RouteError, "invalid upstream URL"):
             hub.validate_upstream_url("http://[::1", "broken", False)
+
+    def test_https_private_and_metadata_addresses_are_rejected(self):
+        for host in (
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "127.1",
+            "2130706433",
+            "0x7f000001",
+            "①②⑦.⓪.⓪.①",
+            "１６９.２５４.１６９.２５４",
+            "ⓛⓞⓒⓐⓛⓗⓞⓢⓣ",
+            "127。0。0。1",
+        ):
+            with self.subTest(host=host), self.assertRaisesRegex(
+                hub.RouteError, "must not target a private address"
+            ):
+                url = f"https://[{host}]" if ":" in host else f"https://{host}"
+                hub.validate_upstream_url(url, "blocked", False)
+
+    def test_transformed_compressed_json_is_decoded_before_translation(self):
+        transformed = {
+            "id": "resp_fixture",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "compressed"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        }
+        upstream = _FakeUpstream(
+            200,
+            {
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+            },
+            [gzip.compress(json.dumps(transformed).encode("utf-8"), mtime=0)],
+        )
+        request = self._request({}, session=_FakeSession(upstream))
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+        response = asyncio.run(
+            hub._handle_transformed_messages(
+                request,
+                cfg=hub.get_config(),
+                provider=provider,
+                payload={
+                    "model": "custom-model",
+                    "messages": [{"role": "user", "content": "fixture"}],
+                },
+                alias="fast",
+                model_in="fast,custom-model",
+                model_out="custom-model",
+                is_count=False,
+                started=0,
+            )
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.text)["content"][0]["text"], "compressed")
+
+    def test_usage_tracker_discards_overlong_line_and_recovers_after_newline(self):
+        tracker = hub._SSEUsageTracker()
+        for _ in range(8):
+            tracker.feed(b"x" * (128 * 1024))
+
+        self.assertLessEqual(len(tracker._pending), hub.SSE_LINE_LIMIT)
+        self.assertTrue(tracker._discarding_line)
+
+        valid_event = json.dumps(
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 17}},
+            },
+            separators=(",", ":"),
+        ).encode()
+        tracker.feed(b"\n" + b"data:" + valid_event + b"\n")
+
+        self.assertEqual(tracker.usage["input_tokens"], 17)
+        self.assertFalse(tracker._discarding_line)
+
+    def test_usage_json_buffer_has_the_same_64_mib_cap_as_transform_bodies(self):
+        buffer = bytearray(b"a" * (hub.MAX_UPSTREAM_BODY_BYTES - 1))
+        self.assertIsNone(hub._append_bounded_json_buffer(buffer, b"bc"))
+        self.assertEqual(
+            hub._append_bounded_json_buffer(bytearray(b"a"), b"b", limit=2),
+            bytearray(b"ab"),
+        )
+
+    def test_transformed_stream_type_errors_abort_the_started_response(self):
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [b"data: fixture\n\n"],
+        )
+        request = self._request({"model": "fast,model", "messages": []}, session=_FakeSession(upstream))
+        downstream = _FakeDownstream(200)
+
+        class TypeFailingBridge:
+            input_tokens = output_tokens = cache_read = cache_write = 0
+
+            def __init__(self, _api_format):
+                pass
+
+            def feed(self, _event, _data):
+                raise TypeError("invalid upstream usage")
+
+            def finish(self):
+                return []
+
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+        with mock.patch.object(
+            hub, "transform_request", return_value=("/chat/completions", {"stream": True})
+        ), mock.patch.object(hub, "AnthropicStreamBridge", TypeFailingBridge), mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(
+                    hub._handle_transformed_messages(
+                        request,
+                        cfg=hub.get_config(),
+                        provider=provider,
+                        payload={"model": "model", "messages": []},
+                        alias="fast",
+                        model_in="fast,model",
+                        model_out="model",
+                        is_count=False,
+                        started=0,
+                    )
+                )
+        self.assertTrue(request.transport.aborted)
+
+    def test_request_too_large_returns_anthropic_json_error(self):
+        async def handler(_request):
+            raise hub.web.HTTPRequestEntityTooLarge(max_size=1, actual_size=2)
+
+        response = asyncio.run(
+            hub.controlled_error_middleware(
+                SimpleNamespace(method="POST", path="/v1/messages"), handler
+            )
+        )
+        self.assertEqual(response.status, 413)
+        self.assertEqual(json.loads(response.text)["error"]["type"], "invalid_request_error")
 
     def test_health_payload_is_fixed_and_does_not_disclose_routing(self):
         response = asyncio.run(hub.handle_healthz(None))
@@ -473,6 +776,33 @@ class ClaudeHubTests(unittest.TestCase):
         serialized = json.dumps(payload)
         for forbidden in ("channels", "provider", "host", "Fixture HTTPS"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_readyz_returns_token_bound_challenge_proof(self):
+        challenge = "fixture_challenge_1234567890"
+        request = SimpleNamespace(
+            headers={"x-claude-hub-challenge": challenge}
+        )
+        response = asyncio.run(hub.handle_readyz(request))
+        payload = json.loads(response.text)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["service"], "claude-hub")
+        self.assertEqual(
+            payload["proof"],
+            hmac.digest(
+                b"fixture-local-token",
+                f"claude-hub-ready:v1:{hub.get_config()['port']}:{challenge}".encode(
+                    "ascii"
+                ),
+                "sha256",
+            ).hex(),
+        )
+        bad = asyncio.run(
+            hub.handle_readyz(
+                SimpleNamespace(headers={"x-claude-hub-challenge": "short"})
+            )
+        )
+        self.assertEqual(bad.status, 400)
 
     def test_private_snapshot_is_opened_read_only_without_touching_source(self):
         source_bytes = self.db_file.read_bytes()

@@ -175,6 +175,21 @@ test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall(
   pass "explicit sticky install reconnects claude1 use state"
 }
 
+test_disable_sticky_removes_only_managed_sticky_source() {
+  local home="$(make_home disable-sticky)"
+  print -r -- '# user config' > "$home/.zshrc"
+  run_install "$home" --enable-sticky >/dev/null 2>&1
+  run_install "$home" --disable-sticky >/dev/null 2>&1
+
+  [[ "$(sticky_line_count "$home/.zshrc")" == "0" ]] ||
+    fail "--disable-sticky did not remove the managed sticky source"
+  [[ "$(managed_line_count "$home/.zshrc")" == "1" ]] ||
+    fail "--disable-sticky removed the safe integration"
+  [[ "$(<"$home/.zshrc")" == *'# user config'* ]] ||
+    fail "--disable-sticky removed user shell configuration"
+  pass "--disable-sticky revokes the managed sticky integration"
+}
+
 test_existing_files_are_backed_up() {
   local home="$(make_home backup)"
   command mkdir -p -- "$home/install root/scripts" "$home/install root/claude1"
@@ -268,6 +283,7 @@ test_missing_dependencies_are_clear() {
 test_first_install_is_safe
 test_repeated_install_is_idempotent
 test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall
+test_disable_sticky_removes_only_managed_sticky_source
 test_existing_files_are_backed_up
 test_missing_dependencies_are_clear
 
