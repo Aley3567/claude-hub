@@ -279,6 +279,7 @@ class ClaudeHubTests(unittest.TestCase):
         row = json.loads(rotated.read_text(encoding="utf-8"))
         self.assertEqual(row["model"], "fixture-model")
         self.assertEqual((row["in"], row["out"]), (3, 5))
+        self.assertNotIn("hub", row)
         self.assertEqual(self.usage_file.read_text(encoding="utf-8"), "")
         if os.name == "posix":
             self.assertEqual(self.usage_file.stat().st_mode & 0o777, 0o600)
@@ -497,6 +498,41 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(cfg["launch_slot"], "fable")
         self.assertEqual(cfg["model_slots"]["sonnet"], "fast,claude-sonnet-4")
         self.assertEqual(cfg["effort_by_slot"]["fable"], "xhigh")
+
+    def test_config_validation_rejects_unsafe_hub_instance_ids(self):
+        for instance_id in (
+            None,
+            True,
+            123,
+            "",
+            "-leading-hyphen",
+            "two words",
+            "contains:colon",
+            "non-ascii-中文",
+            "a" * 129,
+        ):
+            with self.subTest(instance_id=instance_id):
+                self._write_config(
+                    version=2,
+                    instance_id=instance_id,
+                    launch_slot="fable",
+                    model_slots={
+                        "fable": "fast,claude-opus-4",
+                        "opus": "fast,claude-opus-4",
+                        "sonnet": "fast,claude-sonnet-4",
+                        "haiku": "fast,claude-sonnet-4",
+                    },
+                    effort_by_slot={
+                        "fable": "xhigh",
+                        "opus": "high",
+                        "sonnet": "medium",
+                        "haiku": "low",
+                    },
+                )
+                hub.reset_caches()
+
+                with self.assertRaisesRegex(hub.ConfigError, "instance_id"):
+                    hub.get_config()
 
     def test_legacy_base_url_channel_resolves_existing_provider_read_only(self):
         self._write_config(
@@ -741,6 +777,70 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.text)["content"][0]["text"], "compressed")
 
+    def test_usage_record_includes_configured_hub_instance(self):
+        instance_id = "fixture-hub_01"
+        self._write_config(
+            version=2,
+            instance_id=instance_id,
+            launch_slot="fable",
+            model_slots={
+                "fable": "fast,claude-opus-4",
+                "opus": "fast,claude-opus-4",
+                "sonnet": "fast,claude-sonnet-4",
+                "haiku": "fast,claude-sonnet-4",
+            },
+            effort_by_slot={
+                "fable": "xhigh",
+                "opus": "high",
+                "sonnet": "medium",
+                "haiku": "low",
+            },
+        )
+        hub.reset_caches()
+        transformed = {
+            "id": "resp_fixture",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fixture"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(transformed).encode("utf-8")],
+        )
+        request = self._request({}, session=_FakeSession(upstream))
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+
+        asyncio.run(
+            hub._handle_transformed_messages(
+                request,
+                cfg=hub.get_config(),
+                provider=provider,
+                payload={
+                    "model": "custom-model",
+                    "messages": [{"role": "user", "content": "fixture"}],
+                },
+                alias="fast",
+                model_in="fast,custom-model",
+                model_out="custom-model",
+                is_count=False,
+                started=0,
+            )
+        )
+
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["hub"], instance_id)
+
     def test_usage_tracker_discards_overlong_line_and_recovers_after_newline(self):
         tracker = hub._SSEUsageTracker()
         for _ in range(8):
@@ -865,12 +965,58 @@ class ClaudeHubTests(unittest.TestCase):
                 "sha256",
             ).hex(),
         )
+        self.assertNotIn("identity_protocol", payload)
         bad = asyncio.run(
             hub.handle_readyz(
                 SimpleNamespace(headers={"x-claude-hub-challenge": "short"})
             )
         )
         self.assertEqual(bad.status, 400)
+
+    def test_readyz_uses_v2_identity_proof_for_named_hub_instance(self):
+        instance_id = "fixture-hub_01"
+        self._write_config(
+            version=2,
+            instance_id=instance_id,
+            launch_slot="fable",
+            model_slots={
+                "fable": "fast,claude-opus-4",
+                "opus": "fast,claude-opus-4",
+                "sonnet": "fast,claude-sonnet-4",
+                "haiku": "fast,claude-sonnet-4",
+            },
+            effort_by_slot={
+                "fable": "xhigh",
+                "opus": "high",
+                "sonnet": "medium",
+                "haiku": "low",
+            },
+        )
+        hub.reset_caches()
+        challenge = "fixture_challenge_1234567890"
+
+        response = asyncio.run(
+            hub.handle_readyz(
+                SimpleNamespace(headers={"x-claude-hub-challenge": challenge})
+            )
+        )
+        payload = json.loads(response.text)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["identity_protocol"], 2)
+        self.assertEqual(
+            payload["proof"],
+            hmac.digest(
+                b"fixture-local-token",
+                (
+                    f"claude-hub-ready:v2:{instance_id}:"
+                    f"{hub.get_config()['port']}:{challenge}"
+                ).encode("ascii"),
+                "sha256",
+            ).hex(),
+        )
+        self.assertNotIn("instance_id", payload)
+        self.assertNotIn("name", payload)
 
     def test_private_snapshot_is_opened_read_only_without_touching_source(self):
         source_bytes = self.db_file.read_bytes()

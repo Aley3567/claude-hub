@@ -76,6 +76,7 @@ MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 HUB_SLOT_ORDER = ("fable", "opus", "sonnet", "haiku")
 HUB_EFFORT_LEVELS = {"low", "medium", "high", "xhigh"}
+HUB_INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 UPSTREAM_SESSION_KEY = web.AppKey("upstream_session", aiohttp.ClientSession)
 DB_SNAPSHOT_RETRIES = 5
 SSE_LINE_LIMIT = 64 * 1024
@@ -274,7 +275,12 @@ def _open_usage_log():
 
 
 def record_usage(
-    alias: str, model_out: str, api_format: str, usage: dict | None
+    alias: str,
+    model_out: str,
+    api_format: str,
+    usage: dict | None,
+    *,
+    instance_id: str | None = None,
 ) -> None:
     """把一条请求的 token 用量追加到 JSONL。统计绝不能搞挂转发主路径，全部异常静默。"""
     try:
@@ -289,6 +295,8 @@ def record_usage(
             "cr": _usage_int(usage.get("cache_read_input_tokens")),
             "cw": _usage_int(usage.get("cache_creation_input_tokens")),
         }
+        if instance_id is not None:
+            row["hub"] = instance_id
         global _usage_fp
         if _usage_fp is None:
             _usage_fp = _open_usage_log()
@@ -413,6 +421,18 @@ def validate_config(raw: object) -> dict:
     if type(version) is not int or version not in (1, 2):
         raise ConfigError("version must be 1 or 2")
 
+    instance_id = None
+    if "instance_id" in raw:
+        instance_id_raw = raw["instance_id"]
+        if not isinstance(instance_id_raw, str) or not HUB_INSTANCE_ID_RE.fullmatch(
+            instance_id_raw
+        ):
+            raise ConfigError(
+                "instance_id must be 1-128 ASCII letters, digits, dots, underscores, "
+                "or hyphens, beginning with a letter or digit"
+            )
+        instance_id = instance_id_raw
+
     channels_raw = raw.get("channels")
     if not isinstance(channels_raw, dict) or not channels_raw:
         raise ConfigError("channels must be a non-empty object")
@@ -532,6 +552,7 @@ def validate_config(raw: object) -> dict:
 
     return {
         "version": version,
+        "instance_id": instance_id,
         "port": _config_port(raw.get("port")),
         "local_token": local_token,
         "default_channel": default_channel,
@@ -1560,6 +1581,7 @@ async def _handle_transformed_messages(
                     model_out,
                     api_format,
                     body.get("usage") if isinstance(body, dict) else None,
+                    instance_id=cfg.get("instance_id"),
                 )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -1624,6 +1646,7 @@ async def _handle_transformed_messages(
                         "cache_read_input_tokens": bridge.cache_read,
                         "cache_creation_input_tokens": bridge.cache_write,
                     },
+                    instance_id=cfg.get("instance_id"),
                 )
             except (
                 aiohttp.ClientError,
@@ -1901,10 +1924,20 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
             await response.write_eof()
             if usage_tracker is not None:
-                record_usage(alias, model_out, "anthropic", usage_tracker.usage)
+                record_usage(
+                    alias,
+                    model_out,
+                    "anthropic",
+                    usage_tracker.usage,
+                    instance_id=cfg.get("instance_id"),
+                )
             elif json_buf is not None:
                 record_usage(
-                    alias, model_out, "anthropic", _usage_from_json_bytes(json_buf)
+                    alias,
+                    model_out,
+                    "anthropic",
+                    _usage_from_json_bytes(json_buf),
+                    instance_id=cfg.get("instance_id"),
                 )
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -1964,13 +1997,24 @@ async def handle_readyz(request: web.Request) -> web.Response:
             400, "invalid readiness challenge", "invalid_request_error"
         )
     cfg = get_config()
-    proof_message = (
-        f"claude-hub-ready:v1:{cfg['port']}:{challenge}".encode("ascii")
-    )
+    instance_id = cfg.get("instance_id")
+    if instance_id is None:
+        proof_message = (
+            f"claude-hub-ready:v1:{cfg['port']}:{challenge}".encode("ascii")
+        )
+    else:
+        proof_message = (
+            f"claude-hub-ready:v2:{instance_id}:{cfg['port']}:{challenge}".encode(
+                "ascii"
+            )
+        )
     proof = hmac.digest(
         cfg["local_token"].encode("utf-8"), proof_message, "sha256"
     ).hex()
-    return web.json_response({**HEALTH_PAYLOAD, "proof": proof})
+    payload = {**HEALTH_PAYLOAD, "proof": proof}
+    if instance_id is not None:
+        payload["identity_protocol"] = 2
+    return web.json_response(payload)
 
 
 async def handle_fallback(request: web.Request) -> web.Response:

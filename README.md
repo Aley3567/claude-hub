@@ -38,8 +38,8 @@ source ~/.zshrc
 
 安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub、共享协议桥和 statusline 模型解析器四份 Python
-文件。已有目标文件和
+安装器实际复制启动器、Hub、命名 Hub 目录模块、共享协议桥和 statusline 模型
+解析器五份 Python 文件。已有目标文件和
 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
@@ -61,9 +61,9 @@ claude1 mimo                    # 按 provider 名或唯一别名直达
 claude1 direct                  # 本次直接启动原生 Claude Code
 claude1 current                 # 本次使用 DB is_current 标记的 CC Switch 当前渠道
 claude1 any                     # 本次使用已有的 AnyRouter settings
-claude1 hub                     # 按 launch_slot 直启可选 claude-hub
-claude1 hub --slot sonnet       # 从指定 Fable/Opus/Sonnet/Haiku 槽位启动
-claude1 hub --model lab,model   # 指定 Hub 渠道与模型后启动
+claude1 hub                     # 从默认命名 Hub 的 launch_slot 直启
+claude1 hub --slot sonnet       # 从默认命名 Hub 的指定槽位启动
+claude1 hub --model lab,model   # 从默认命名 Hub 的指定渠道与模型启动
 claude1 list                    # 稳定顺序列出可见渠道
 claude1 doctor                  # 本机只读检查，不连接 provider
 claude1 doctor --fix            # 备份 DB 后清理 provider 的子代理模型固定值
@@ -134,16 +134,20 @@ mode、permission-mode、last-prompt、file-history 和 system 统计元条目�
 
 ## 可选：启用 claude-hub
 
-Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监听本机
-`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。启动页会直接展开四个
-Hub 槽位及各自的渠道、模型、effort 和默认标记：使用 `↑↓` 选择槽位、Enter
-启动，使用 `←`、`→` 或 `e` 调整 effort，按 `a` 直接新增渠道。模型池绑定和
-渠道删除等完整操作通过 `Tab` 或 `m` 进入 Slots / Channels 管理页。
+Hub 适合需要在不同工作区或一个长会话里频繁切换渠道和模型的人。每个命名 Hub
+都有独立的 v2 配置、端口、进程、日志和用量记录；它们都只监听本机
+`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。
 
-新增渠道使用“渠道 → 模型 → 设置 → 确认”四阶段面板。选择 CC Switch 渠道后，
-该渠道声明的模型默认全部勾选，可用空格取消或重新勾选；候选列表没有目标模型时，
-选择“手动添加模型 ID”。确认后只新增 Hub 渠道，不会替换四个原生槽位；槽位绑定
-统一在 `Tab/m` 的 Slots 页完成。
+启动首页只列命名 Hub，不展开模型或四个槽位。使用 `↑↓` 选择 Hub，按 Enter
+直接从该 Hub 的 `launch_slot` 启动；按 `m`、`→` 或 `Tab` 进入该 Hub 的
+Slots / Channels 管理页。首页按 `a` 或 `n` 会复制当前 Hub 的渠道、四槽和
+effort，创建一份端口与进程隔离的新 Hub；按 `r` 只修改显示名，不改变稳定 id、
+配置路径或运行身份。
+
+进入 Channels 页后，新增渠道使用“渠道 → 模型 → 设置 → 确认”四阶段面板。选择
+CC Switch 渠道后，该渠道声明的模型默认全部勾选，可用空格取消或重新勾选；候选
+列表没有目标模型时，选择“手动添加模型 ID”。确认后只新增当前 Hub 的渠道，不会
+替换四个原生槽位；槽位绑定统一在 Slots 页完成。
 
 1. 安装 uv。
 2. 从仓库复制示例配置，并将 provider 名改成 CC Switch 中的真实名称：
@@ -159,11 +163,34 @@ Hub 槽位及各自的渠道、模型、effort 和默认标记：使用 `↑↓`
    槽位的默认 effort。`default_channel` 仍只负责裸模型请求的网关回退路由，
    不等同于启动默认值。
 
+   首次打开 `claude1` 时，启动器会把现有 `~/.cc-switch/claude-hub.json`
+   自动登记为名为 `Claude-Hub` 的工作区，并创建目录
+   `~/.cc-switch/claude-hubs.json`。旧配置文件只被目录引用，不会被移动或改名。
+   新增 Hub 的独立配置写入 `~/.cc-switch/hubs/<hub-id>.json`。
+
+   目录文件的结构如下；其中所有路径都相对于目录文件所在位置：
+
+   ```json
+   {
+     "version": 1,
+     "default_hub": "claude-hub",
+     "order": ["claude-hub"],
+     "hubs": {
+       "claude-hub": {
+         "name": "Claude-Hub",
+         "config": "claude-hub.json",
+         "log": "logs/claude-hub.log",
+         "usage": "logs/claude-hub-usage.jsonl"
+       }
+     }
+   }
+   ```
+
    channel 的 `provider` 建议写成 `id:<provider-id>`；Hub 的 Channels 添加向导
    会始终保存稳定 id，不保存凭证。向导优先复用 CC Switch 的协议元数据；无法
    判断时会要求选择 Anthropic、OpenAI Chat 或 OpenAI Responses，避免静默使用
-   错误协议。旧配置首次打开时会原子迁移到 v2，并在同目录留下一份
-   `claude-hub.json.bak-migrate-*` 私有备份。
+   错误协议。每个旧版 Hub 配置首次打开时都会原子迁移到 v2，并在其原目录留下
+   一份 `<配置文件名>.bak-migrate-*` 私有备份。
 
 3. 生成并保存一个仅供本机 Claude Code 连接 Hub 使用的 token，再启动。Hub
    持续运行期间应复用同一个 token：
@@ -182,12 +209,12 @@ Hub 槽位及各自的渠道、模型、effort 和默认标记：使用 `↑↓`
 不会显示上游地址或 token。Hub 会要求配置、CC Switch 数据库以及当前存在的
 `-wal`、`-shm` 文件权限不超过 `0600`；检查失败时按输出修正后再启动。
 
-进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。首页与
-Slots 页都可修改当前槽位的默认 effort；Slots 页额外用 `b` 将模型池里的模型绑定
-到某个槽位，Channels 页可添加或删除未被回退路由和槽位引用的渠道。槽位默认
-effort 通过本次会话的临时 settings 注入，不会用环境变量锁死，进入会话后仍可用
-原生 `/effort` 调整。Hub 会在请求发生时从 CC Switch DB 只读获取对应 provider
-的凭证，不修改 DB、provider 或 current 状态。
+进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Slots
+页可修改当前 Hub 各槽位的默认 effort，并用 `b` 将模型池里的模型绑定到某个槽位；
+Channels 页可添加或删除未被回退路由和槽位引用的渠道。槽位默认 effort 通过本次
+会话的临时 settings 注入，不会用环境变量锁死，进入会话后仍可用原生 `/effort`
+调整。Hub 会在请求发生时从 CC Switch DB 只读获取对应 provider 的凭证，不修改
+DB、provider 或 current 状态。
 
 ## 可选：查看 token 用量与缓存命中率
 
