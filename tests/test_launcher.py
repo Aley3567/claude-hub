@@ -2830,6 +2830,222 @@ class HubWorkspaceTests(unittest.TestCase):
                 {"provider": "id:home-provider-id", "models": ["home-model"]},
             )
 
+    def test_add_wizard_can_choose_a_nondefault_provider_model(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "multi-model-id",
+                "name": "Multi Model",
+                "settings_config": json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "model-default",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "model-preferred",
+                        }
+                    }
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,  # provider
+                            ord("j"), 10,  # second model
+                            10,  # generated alias
+                            10,  # pool only
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["multi-model"]["models"],
+                ["model-preferred"],
+            )
+
+    def test_add_wizard_accepts_a_custom_model_not_in_provider_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "custom-model-id",
+                "name": "Custom Model",
+                "settings_config": json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "listed-default",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "listed-opus",
+                        }
+                    }
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            custom_model = "my-custom-model"
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,  # provider
+                            ord("j"), ord("j"), 10,  # custom model row
+                            *(ord(char) for char in custom_model),
+                            10,  # custom model input
+                            10,  # generated alias
+                            10,  # pool only
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["custom-model"]["models"],
+                [custom_model],
+            )
+
+    def test_add_wizard_offers_custom_model_when_provider_declares_none(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "no-model-id",
+                "name": "No Model",
+                "settings_config": "{}",
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            custom_model = "manually-entered-model"
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,  # provider
+                            10,  # only the custom-model row
+                            *(ord(char) for char in custom_model),
+                            10,
+                            10,  # generated alias
+                            10,  # pool only
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["no-model"]["models"],
+                [custom_model],
+            )
+
+    def test_add_wizard_renders_one_coherent_four_stage_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            window = ScriptedWindow(
+                [ord("a"), 10, 10, 10, 27, ord("q")],
+                size=(24, 100),
+            )
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            provider = {
+                "id": "visual-provider-id",
+                "name": "Visual Provider",
+                "settings_config": json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "visual-default",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "visual-opus",
+                        }
+                    }
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "list_providers", return_value=[provider]),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"alpha-id"})
+                    )
+
+            rendered_strings = [
+                value
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            ]
+            rendered = " ".join(rendered_strings)
+            self.assertIn("新增 Hub 渠道", rendered)
+            self.assertIn("● 渠道", rendered)
+            self.assertIn("选择 CC Switch 渠道", rendered)
+            self.assertIn("选择模型", rendered)
+            self.assertIn("手动输入模型 ID", rendered)
+            self.assertIn("设置渠道", rendered)
+            self.assertIn("选择添加去向", rendered)
+            self.assertIn("仅加入模型池", rendered)
+            self.assertIn("绑定 Fable", rendered)
+            self.assertFalse(any("Step" in value for value in rendered_strings))
+
+    def test_add_wizard_can_choose_a_slot_without_memorizing_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "arrow-bind-id",
+                "name": "Arrow Bind",
+                "settings_config": json.dumps(
+                    {"env": {"ANTHROPIC_MODEL": "arrow-model"}}
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,  # provider
+                            10,  # model
+                            10,  # generated alias
+                            ord("j"), 10,  # Fable destination
+                            ord("y"), 10,  # confirm replacement
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["model_slots"]["fable"],
+                "arrow-bind,arrow-model",
+            )
+
     def test_channels_add_wizard_prompts_when_api_format_cannot_be_inferred(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)

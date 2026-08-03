@@ -2425,18 +2425,128 @@ def _choose_hub_slot(win, prompt: str) -> str | None:
             return slot
 
 
-def _prompt_hub_text(win, label: str, initial: str) -> str | None:
-    """Small getch-based text field that works with the launcher's test seam."""
-    value = initial
-    while True:
-        h, w = win.getmaxyx()
-        _addstr(win, max(0, h - 1), 0, " " * max(0, w - 1))
+_HUB_WIZARD_STAGES = ("渠道", "模型", "设置", "去向")
+
+
+def _draw_hub_wizard_shell(
+    win,
+    stage: int,
+    title: str,
+    *,
+    detail: str = "",
+    footer: str = "Esc 取消 · ↑↓/jk 选择 · Enter 继续",
+) -> int:
+    """Draw the shared four-stage add-channel surface and return its list top."""
+    win.erase()
+    h, w = win.getmaxyx()
+    width = max(0, w - 4)
+    _addstr(
+        win,
+        0,
+        2,
+        _truncate_display("Claude1  ›  Claude-Hub  ›  新增 Hub 渠道", width),
+        C.get("dim", 0),
+    )
+    progress = "  ─  ".join(
+        f"{'✓' if index < stage else '●' if index == stage else '○'} {label}"
+        for index, label in enumerate(_HUB_WIZARD_STAGES)
+    )
+    compact = h < 10
+    progress_row = 1 if compact else 2
+    title_row = 2 if compact else 4
+    _addstr(
+        win,
+        progress_row,
+        2,
+        _truncate_display(progress, width),
+        C.get("lime", 0),
+    )
+    _addstr(
+        win,
+        title_row,
+        2,
+        _truncate_display(title, width),
+        C.get("base", 0) | curses.A_BOLD,
+    )
+    if detail and h >= 8:
         _addstr(
             win,
-            max(0, h - 1),
+            title_row + 1,
             2,
-            _truncate_display(f"{label}: {value}", max(0, w - 4)),
-            C.get("warning", 0),
+            _truncate_display(detail, width),
+            C.get("dim", 0),
+        )
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        _truncate_display(footer, width),
+        C.get("dim", 0),
+    )
+    if not compact:
+        return 7
+    return 4 if h >= 8 else 3
+
+
+def _draw_hub_wizard_options(
+    win,
+    options: list[tuple[str, str]],
+    idx: int,
+    list_top: int,
+) -> None:
+    """Render one selectable option list inside the add-channel surface."""
+    h, w = win.getmaxyx()
+    row_width = max(0, w - 4)
+    capacity = max(1, h - 1 - list_top)
+    start, end = _visible_window(len(options), idx, capacity)
+    for offset, option_index in enumerate(range(start, end)):
+        primary, secondary = options[option_index]
+        selected = option_index == idx
+        marker = "▸" if selected else " "
+        line = marker + " " + _compose_row(
+            primary,
+            secondary,
+            max(0, row_width - 2),
+        )
+        _addstr(
+            win,
+            list_top + offset,
+            2,
+            _pad_display(line, row_width) if selected else line,
+            C.get("sel", curses.A_REVERSE)
+            if selected
+            else C.get("base", 0) | curses.A_BOLD,
+        )
+
+
+def _prompt_hub_text(
+    win,
+    label: str,
+    initial: str,
+    *,
+    stage: int,
+    title: str,
+    detail: str = "",
+) -> str | None:
+    """Full-surface text field that works with the launcher's getch test seam."""
+    value = initial
+    while True:
+        list_top = _draw_hub_wizard_shell(
+            win,
+            stage,
+            title,
+            detail=detail,
+            footer="Esc 取消 · 输入文字 · Backspace 删除 · Enter 继续",
+        )
+        _addstr(win, list_top, 2, label, C.get("dim", 0))
+        display_value = value or "请输入…"
+        row_width = max(0, win.getmaxyx()[1] - 4)
+        _addstr(
+            win,
+            min(list_top + 2, max(0, win.getmaxyx()[0] - 2)),
+            2,
+            _pad_display(f"› {display_value}", row_width),
+            C.get("sel", curses.A_REVERSE),
         )
         win.refresh()
         ch = win.getch()
@@ -2455,21 +2565,20 @@ def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
         return None
     idx = 0
     while True:
-        win.erase()
-        _addstr(win, 0, 2, "Claude1 › Hub › 添加渠道", C.get("dim", 0))
-        _addstr(win, 1, 2, "Step 1/3 选择 CC Switch provider", C.get("lime", 0))
-        capacity = max(1, win.getmaxyx()[0] - 4)
-        start, end = _visible_window(len(providers), idx, capacity)
-        for row, provider_index in enumerate(range(start, end)):
-            provider = providers[provider_index]
-            marker = "▸" if provider_index == idx else " "
-            _addstr(
-                win,
-                3 + row,
-                2,
-                f"{marker} {provider.get('name') or provider.get('id')}",
-                C.get("sel", 0) if row == idx else C.get("base", 0),
+        list_top = _draw_hub_wizard_shell(
+            win,
+            0,
+            "选择 CC Switch 渠道",
+            detail="选择凭据与上游配置的来源，不会修改 CC Switch 当前渠道",
+        )
+        options = [
+            (
+                str(provider.get("name") or provider.get("id")),
+                str(provider.get("alias") or "CC Switch"),
             )
+            for provider in providers
+        ]
+        _draw_hub_wizard_options(win, options, idx, list_top)
         win.refresh()
         ch = win.getch()
         if ch in (-1, 27):
@@ -2480,6 +2589,50 @@ def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
             idx = (idx + 1) % len(providers)
         elif ch in (10, 13, curses.KEY_ENTER):
             return providers[idx]
+
+
+def _choose_hub_model(
+    win,
+    provider: dict,
+    models: list[str],
+) -> str | None:
+    """Choose one model exposed by the selected CC Switch provider."""
+    idx = 0
+    item_count = len(models) + 1
+    while True:
+        provider_name = provider.get("name") or provider.get("id")
+        list_top = _draw_hub_wizard_shell(
+            win,
+            1,
+            "选择模型",
+            detail=f"渠道 · {provider_name}",
+        )
+        options = [
+            (model, _hub_model_family(model))
+            for model in models
+        ]
+        options.append(("＋ 手动输入模型 ID", "候选中没有时使用"))
+        _draw_hub_wizard_options(win, options, idx, list_top)
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % item_count
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % item_count
+        elif ch in (10, 13, curses.KEY_ENTER):
+            if idx == len(models):
+                custom = _prompt_hub_text(
+                    win,
+                    "模型 ID",
+                    "",
+                    stage=1,
+                    title="输入模型 ID",
+                    detail=f"渠道 · {provider_name}",
+                )
+                return custom if custom else None
+            return models[idx]
 
 
 def _hub_alias_slug(name: object) -> str:
@@ -2517,33 +2670,99 @@ def _infer_hub_provider_api_format(provider: dict) -> str | None:
     return None
 
 
-def _choose_hub_api_format(win) -> str | None:
+def _choose_hub_api_format(win, detail: str = "") -> str | None:
     """Ask only when CC Switch metadata cannot determine the upstream protocol."""
-    h, _w = win.getmaxyx()
-    _addstr(
-        win,
-        max(0, h - 1),
-        2,
-        "协议未知：a Anthropic · c OpenAI Chat · r OpenAI Responses · Esc 取消",
-        C.get("warning", 0),
-    )
-    win.refresh()
-    choices = {
+    choices = [
+        ("anthropic", "Anthropic Messages", "原生 Claude / Anthropic 兼容接口"),
+        ("openai_chat", "OpenAI Chat Completions", "兼容 /chat/completions"),
+        ("openai_responses", "OpenAI Responses", "兼容 /responses"),
+    ]
+    shortcuts = {
         "a": "anthropic",
         "c": "openai_chat",
         "r": "openai_responses",
     }
+    idx = 0
     while True:
+        list_top = _draw_hub_wizard_shell(
+            win,
+            2,
+            "选择上游协议",
+            detail=detail or "CC Switch 中没有可确认的协议元数据",
+            footer="Esc 取消 · ↑↓/jk 选择 · Enter 继续 · a/c/r 快捷选择",
+        )
+        _draw_hub_wizard_options(
+            win,
+            [(label, description) for _value, label, description in choices],
+            idx,
+            list_top,
+        )
+        win.refresh()
         ch = win.getch()
         if ch in (-1, 27):
             return None
-        choice = choices.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(choices)
+            continue
+        if ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(choices)
+            continue
+        if ch in (10, 13, curses.KEY_ENTER):
+            return choices[idx][0]
+        choice = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
+        if choice is not None:
+            return choice
+
+
+def _choose_hub_destination(win, alias: str, model: str) -> str | None:
+    """Choose pool-only or one native slot; None means the user cancelled."""
+    config = load_hub_config()
+    options = [
+        ("pool", "仅加入模型池", "稍后可在 Slots 页绑定"),
+        *[
+            (
+                slot,
+                f"绑定 {slot.title()}",
+                f"替换 {config['model_slots'][slot]}",
+            )
+            for slot in HUB_SLOT_ORDER
+        ],
+    ]
+    shortcuts = {"p": "pool", "f": "fable", "o": "opus", "s": "sonnet", "h": "haiku"}
+    idx = 0
+    while True:
+        list_top = _draw_hub_wizard_shell(
+            win,
+            3,
+            "选择添加去向",
+            detail=f"{alias},{model}",
+            footer="Esc 取消 · ↑↓/jk 选择 · Enter 添加 · p/f/o/s/h 快捷选择",
+        )
+        _draw_hub_wizard_options(
+            win,
+            [(label, description) for _value, label, description in options],
+            idx,
+            list_top,
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(options)
+            continue
+        if ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(options)
+            continue
+        if ch in (10, 13, curses.KEY_ENTER):
+            return options[idx][0]
+        choice = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
         if choice is not None:
             return choice
 
 
 def _hub_add_channel_wizard(win) -> dict | None:
-    """Run the three-step provider/identity/slot channel wizard."""
+    """Run the four-stage provider/model/settings/destination wizard."""
     provider = _choose_hub_provider(win, list_providers())
     if provider is None:
         return None
@@ -2551,43 +2770,33 @@ def _hub_add_channel_wizard(win) -> dict | None:
         settings = json.loads(provider.get("settings_config") or "{}")
     except (TypeError, json.JSONDecodeError):
         settings = {}
-    alias = _prompt_hub_text(win, "Step 2/3 alias", _hub_alias_slug(provider.get("name")))
-    if alias is None:
-        return None
     inferred_api_format = _infer_hub_provider_api_format(provider)
-    format_label = inferred_api_format or "需选择协议"
-    model = _prompt_hub_text(
+    model = _choose_hub_model(
         win,
-        f"Step 2/3 model · {format_label}",
-        _provider_models(settings)[0],
+        provider,
+        _provider_models(settings, include_placeholder=False),
     )
     if model is None:
         return None
+    alias = _prompt_hub_text(
+        win,
+        "渠道别名",
+        _hub_alias_slug(provider.get("name")),
+        stage=2,
+        title="设置渠道",
+        detail=f"{provider.get('name') or provider.get('id')} · {model}",
+    )
+    if alias is None:
+        return None
     api_format = None
     if inferred_api_format is None:
-        api_format = _choose_hub_api_format(win)
+        api_format = _choose_hub_api_format(win, detail=f"{alias},{model}")
         if api_format is None:
             return None
-    h, _w = win.getmaxyx()
-    _addstr(
-        win,
-        max(0, h - 1),
-        2,
-        "Step 3/3  p 只进池 · f/o/s/h 绑定槽 · Esc 取消",
-        C.get("warning", 0),
-    )
-    win.refresh()
-    while True:
-        ch = win.getch()
-        if ch in (-1, 27):
-            return None
-        if ch in (ord("p"), ord("P")):
-            slot = None
-            break
-        shortcuts = {"f": "fable", "o": "opus", "s": "sonnet", "h": "haiku"}
-        slot = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
-        if slot is not None:
-            break
+    destination = _choose_hub_destination(win, alias, model)
+    if destination is None:
+        return None
+    slot = None if destination == "pool" else destination
     expected_slot_selector = None
     if slot is not None:
         latest = load_hub_config()
@@ -3262,7 +3471,11 @@ def _free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _provider_models(settings: dict) -> list[str]:
+def _provider_models(
+    settings: dict,
+    *,
+    include_placeholder: bool = True,
+) -> list[str]:
     env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
     names: list[str] = []
     for key in (
@@ -3275,7 +3488,9 @@ def _provider_models(settings: dict) -> list[str]:
         value = env.get(key)
         if isinstance(value, str) and value and value not in names:
             names.append(value)
-    return names or ["claude1-provider-model"]
+    if names or not include_placeholder:
+        return names
+    return ["claude1-provider-model"]
 
 
 def _bridge_child_env(
