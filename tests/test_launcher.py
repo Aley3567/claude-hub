@@ -85,7 +85,11 @@ def free_local_port() -> int:
 
 @contextmanager
 def health_server(
-    status_code: int, payload: bytes, *, ready_token: str | None = None
+    status_code: int,
+    payload: bytes,
+    *,
+    ready_token: str | None = None,
+    ready_instance_id: str | None = None,
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
@@ -93,9 +97,13 @@ def health_server(
             if self.path == "/readyz" and ready_token is not None:
                 challenge = self.headers.get("X-Claude-Hub-Challenge", "")
                 decoded = json.loads(payload)
-                proof_message = (
-                    f"claude-hub-ready:v1:{self.server.server_address[1]}:{challenge}"
-                    .encode("ascii")
+                proof_version = (
+                    f"v2:{ready_instance_id}:{self.server.server_address[1]}"
+                    if ready_instance_id is not None
+                    else f"v1:{self.server.server_address[1]}"
+                )
+                proof_message = f"claude-hub-ready:{proof_version}:{challenge}".encode(
+                    "ascii"
                 )
                 decoded["proof"] = hmac.digest(
                     ready_token.encode("utf-8"),
@@ -1528,6 +1536,29 @@ class LauncherSafetyTests(unittest.TestCase):
                     self.assertTrue(
                         launcher.hub_healthy(port, "fixture-local-token")
                     )
+                identity_payload = json.dumps(
+                    {**valid, "identity_protocol": 2}
+                ).encode("utf-8")
+                with health_server(
+                    200,
+                    identity_payload,
+                    ready_token="fixture-local-token",
+                    ready_instance_id="kimi-hub",
+                ) as port:
+                    self.assertTrue(
+                        launcher.hub_healthy(
+                            port,
+                            "fixture-local-token",
+                            "kimi-hub",
+                        )
+                    )
+                    self.assertFalse(
+                        launcher.hub_healthy(
+                            port,
+                            "fixture-local-token",
+                            "any-hub",
+                        )
+                    )
 
     def test_ensure_hub_timeout_stops_and_reaps_spawned_child(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2068,6 +2099,54 @@ class HubWorkspaceTests(unittest.TestCase):
             config.write_text(json.dumps(HUB_FIXTURE), encoding="utf-8")
         return env
 
+    def _multi_hub_env(self, home: Path) -> dict[str, str]:
+        env = self._hub_env(home, write_config=False)
+        root = home / ".cc-switch"
+        hubs_dir = root / "hubs"
+        hubs_dir.mkdir(parents=True, exist_ok=True)
+        first = json.loads(json.dumps(HUB_V2_FIXTURE))
+        first["port"] = 18787
+        first["instance_id"] = "claude-hub1"
+        first["local_token"] = "fixture-local-token"
+        second = json.loads(json.dumps(HUB_V2_FIXTURE))
+        second["port"] = 18788
+        second["launch_slot"] = "sonnet"
+        second["instance_id"] = "kimi-hub"
+        second["local_token"] = "fixture-local-token"
+        (root / "claude-hub.json").write_text(
+            json.dumps(first), encoding="utf-8"
+        )
+        (hubs_dir / "kimi-hub.json").write_text(
+            json.dumps(second), encoding="utf-8"
+        )
+        catalog = root / "claude-hubs.json"
+        catalog.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "default_hub": "claude-hub1",
+                    "order": ["claude-hub1", "kimi-hub"],
+                    "hubs": {
+                        "claude-hub1": {
+                            "name": "claude-hub1",
+                            "config": "claude-hub.json",
+                            "log": "logs/claude-hub.log",
+                            "usage": "logs/claude-hub-usage.jsonl",
+                        },
+                        "kimi-hub": {
+                            "name": "kimi-hub",
+                            "config": "hubs/kimi-hub.json",
+                            "log": "logs/hubs/kimi-hub.log",
+                            "usage": "logs/hubs/kimi-hub-usage.jsonl",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["CLAUDE1_HUB_CATALOG"] = str(catalog)
+        return env
+
     def test_build_hub_view_orders_default_first_and_derives_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
@@ -2199,6 +2278,58 @@ class HubWorkspaceTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX lock-file safety")
+    def test_named_hub_start_lock_refuses_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                hub = launcher.resolve_hub_ref("kimi-hub")
+                lock = hub.log_path.parent / f"claude-hub-{hub.hub_id}.lock"
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                target = Path(raw_home) / "do-not-chmod"
+                target.write_text("fixture", encoding="utf-8")
+                target.chmod(0o644)
+                lock.symlink_to(target)
+
+                with self.assertRaises(OSError):
+                    with launcher._hub_start_lock(hub):
+                        pass
+
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_catalog_migration_refuses_unrepresentable_legacy_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            catalog = home / "catalog-only" / "claude-hubs.json"
+            env["CLAUDE1_HUB_CATALOG"] = str(catalog)
+
+            with loaded_launcher(env) as launcher:
+                with self.assertRaisesRegex(ValueError, "catalog 目录内"):
+                    launcher.list_hub_refs(migrate=True)
+
+            self.assertFalse(catalog.exists())
+
+    def test_legacy_port_override_keeps_single_hub_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home, write_config=False)
+            env.pop("CLAUDE1_HUB_CONFIG")
+            env.pop("CLAUDE1_HUB_LOG")
+            env["CLAUDE1_HUB_PORT"] = "19999"
+            config = home / ".cc-switch" / "claude-hub.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+
+            with loaded_launcher(env) as launcher:
+                ref = launcher.resolve_hub_ref()
+                loaded = launcher.load_hub_config(hub=ref)
+                resolved_port = launcher._hub_port(loaded)
+
+            self.assertFalse(launcher.HUB_CATALOG_ENABLED)
+            self.assertEqual(ref.config_path, config)
+            self.assertEqual(resolved_port, 19999)
+
     def test_workspace_has_four_native_slots_then_only_unbound_models(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
@@ -2264,6 +2395,62 @@ class HubWorkspaceTests(unittest.TestCase):
                 ],
                 "thinking,adaptive_thinking,effort,xhigh_effort",
             )
+
+    def test_exec_hub_uses_the_selected_named_hubs_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                with (
+                    mock.patch.object(launcher, "ensure_hub") as ensure,
+                    mock.patch.object(
+                        launcher, "launch_with_settings", return_value=0
+                    ) as launch,
+                ):
+                    self.assertEqual(
+                        launcher.exec_hub(
+                            ["--slot", "sonnet"], hub_id="kimi-hub"
+                        ),
+                        0,
+                    )
+
+            selected_hub = ensure.call_args.kwargs["hub"]
+            self.assertEqual(ensure.call_args.args, (18788,))
+            self.assertEqual(selected_hub.hub_id, "kimi-hub")
+            self.assertEqual(
+                selected_hub.config_path.name,
+                "kimi-hub.json",
+            )
+            self.assertEqual(ensure.call_args.kwargs["instance_id"], "kimi-hub")
+            settings, _forwarded = launch.call_args.args
+            self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "glm,glm-5.2")
+            self.assertEqual(settings["effortLevel"], "medium")
+
+    def test_usage_aggregates_every_named_hubs_usage_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            now = time.time()
+            with loaded_launcher(env) as launcher:
+                for index, hub in enumerate(launcher.list_hub_refs()):
+                    hub.usage_path.parent.mkdir(parents=True, exist_ok=True)
+                    hub.usage_path.write_text(
+                        json.dumps(
+                            {
+                                "ts": now - index,
+                                "in": 10,
+                                "out": 2,
+                                "cr": 0,
+                                "cw": 0,
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.cli_usage(["--day"]), 0)
+
+            self.assertIn("请求数        2", output.getvalue())
+            self.assertIn("输入 token    20  (20)", output.getvalue())
 
     def test_exec_hub_model_inherits_unique_slot_effort_and_forwards_cli_effort(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2382,7 +2569,142 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(result.slot, "fable")
                 self.assertIsNone(result.option)
 
-    def test_home_arrow_navigation_selects_and_launches_each_hub_slot(self) -> None:
+    def test_home_lists_named_hubs_without_models_and_launches_selected_hub(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            window = ScriptedWindow([ord("j"), 10], size=(30, 120))
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(launcher, "hub_healthy", return_value=True),
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.hub_id, "kimi-hub")
+            self.assertEqual(result.slot, "sonnet")
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("claude-hub1", rendered)
+            self.assertIn("kimi-hub", rendered)
+            self.assertNotIn("gpt-5.6-sol", rendered)
+            self.assertNotIn("claude-fixture-5[1m]", rendered)
+
+    def test_home_add_creates_and_selects_an_isolated_named_hub(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._multi_hub_env(home)
+            window = ScriptedWindow(
+                [ord("a"), *map(ord, "any-hub"), 10, 10],
+                size=(30, 120),
+            )
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+                catalog = launcher.load_hub_catalog()
+                created = launcher.resolve_hub_ref("any-hub")
+                created_config = launcher.load_hub_config(hub=created)
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.hub_id, "any-hub")
+            self.assertEqual(catalog["order"][-1], "any-hub")
+            self.assertEqual(created.name, "any-hub")
+            self.assertEqual(created_config["instance_id"], "any-hub")
+            self.assertEqual(created_config["port"], 18789)
+            self.assertEqual(created.config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_catalog_write_removes_the_new_hub_config(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                source = launcher.resolve_hub_ref("kimi-hub")
+                real_write = launcher._atomic_private_write
+
+                def fail_catalog(path, text):
+                    if path == launcher.HUB_CATALOG:
+                        raise OSError("fixture catalog failure")
+                    return real_write(path, text)
+
+                with mock.patch.object(
+                    launcher,
+                    "_atomic_private_write",
+                    side_effect=fail_catalog,
+                ):
+                    with self.assertRaisesRegex(OSError, "catalog failure"):
+                        launcher.clone_named_hub(source, "orphan-hub")
+
+                catalog = launcher.load_hub_catalog()
+                orphan = launcher.HUB_CATALOG.parent / "hubs" / "orphan-hub.json"
+
+            self.assertNotIn("orphan-hub", catalog["hubs"])
+            self.assertFalse(orphan.exists())
+
+    def test_clone_rejects_a_symlinked_catalog_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._multi_hub_env(home)
+            root = home / ".cc-switch"
+            catalog_path = root / "claude-hubs.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog["order"] = ["claude-hub1"]
+            catalog["hubs"] = {
+                "claude-hub1": catalog["hubs"]["claude-hub1"]
+            }
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+            kimi_config = root / "hubs" / "kimi-hub.json"
+            kimi_config.unlink()
+            kimi_config.parent.rmdir()
+            outside = home / "outside"
+            outside.mkdir()
+            (root / "hubs").symlink_to(outside, target_is_directory=True)
+
+            with loaded_launcher(env) as launcher:
+                source = launcher.resolve_hub_ref("claude-hub1")
+                with self.assertRaisesRegex(ValueError, "符号链接"):
+                    launcher.clone_named_hub(source, "escape-hub")
+
+            self.assertFalse((outside / "escape-hub.json").exists())
+
+    def test_renaming_hub_preserves_its_stable_identity_and_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                before = launcher.resolve_hub_ref("kimi-hub")
+                renamed = launcher.rename_named_hub(
+                    "kimi-hub", "Kimi Research Hub"
+                )
+                resolved = launcher.resolve_hub_ref("kimi research hub")
+
+            self.assertEqual(renamed.hub_id, "kimi-hub")
+            self.assertEqual(resolved.hub_id, "kimi-hub")
+            self.assertEqual(resolved.config_path, before.config_path)
+            self.assertEqual(resolved.log_path, before.log_path)
+
+    def test_home_down_moves_from_the_only_hub_to_direct_provider(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
             config = Path(env["CLAUDE1_HUB_CONFIG"])
@@ -2390,8 +2712,7 @@ class HubWorkspaceTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 result = self._run_home(launcher, [ord("j"), 10])
 
-            self.assertIsInstance(result, launcher.HubLaunch)
-            self.assertEqual(result.slot, "opus")
+            self.assertEqual(result, "alpha-id")
 
     def test_home_effort_key_updates_the_selected_hub_slot(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2401,7 +2722,10 @@ class HubWorkspaceTests(unittest.TestCase):
             config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
             config.chmod(0o600)
             with loaded_launcher(env) as launcher:
-                self._run_home(launcher, [ord("j"), ord("e"), ord("q")])
+                self._run_home(
+                    launcher,
+                    [ord("\t"), ord("j"), ord("e"), 27, ord("q")],
+                )
 
             persisted = json.loads(config.read_text(encoding="utf-8"))
             self.assertEqual(persisted["effort_by_slot"]["opus"], "xhigh")
@@ -2602,6 +2926,10 @@ class HubWorkspaceTests(unittest.TestCase):
                 launcher.C = {}
                 launcher._logo_pairs[:] = [0]
                 status, _options = launcher.build_hub_view(HUB_V2_FIXTURE)
+                state = launcher.build_hub_launcher_state(HUB_V2_FIXTURE)
+                named = launcher.NamedHubLauncherState(
+                    launcher._legacy_hub_ref(), state
+                )
                 self.assertLessEqual(
                     sum(launcher._hub_columns(32)) + 4,
                     32 - 4,
@@ -2613,8 +2941,8 @@ class HubWorkspaceTests(unittest.TestCase):
                     0,
                     False,
                     {},
-                    hub_status=status,
                     hub_focus=True,
+                    hubs=[named],
                 )
 
             rendered = " ".join(
@@ -2651,11 +2979,12 @@ class HubWorkspaceTests(unittest.TestCase):
                 for value in call
                 if isinstance(value, str)
             )
-            self.assertIn("Claude-Hub · 首页可调", rendered)
-            for label in ("Fable", "Opus", "Sonnet", "Haiku"):
-                self.assertIn(label, rendered)
-            self.assertIn("a 新增渠道", rendered)
-            self.assertIn("Tab/m 完整管理", rendered)
+            self.assertIn("Hub 工作区 · 1 个", rendered)
+            self.assertIn("Claude-Hub", rendered)
+            self.assertNotIn("gpt-5.6-sol", rendered)
+            self.assertNotIn("claude-fixture-5[1m]", rendered)
+            self.assertIn("n 新建 Hub", rendered)
+            self.assertIn("m/→ 管理", rendered)
             self.assertIn("Alpha", rendered)
 
     def test_expanded_hub_home_uses_compact_logo_in_medium_height_window(self) -> None:
@@ -2669,6 +2998,9 @@ class HubWorkspaceTests(unittest.TestCase):
                 launcher.C = {}
                 launcher._logo_pairs[:] = [0]
                 state = launcher.build_hub_launcher_state(HUB_V2_FIXTURE)
+                named = launcher.NamedHubLauncherState(
+                    launcher._legacy_hub_ref(), state
+                )
                 launcher._draw_launcher(
                     window,
                     cfg,
@@ -2676,9 +3008,8 @@ class HubWorkspaceTests(unittest.TestCase):
                     0,
                     False,
                     {},
-                    hub_status=state.status,
                     hub_focus=True,
-                    hub_slots=state.slots,
+                    hubs=[named],
                 )
 
             rendered_strings = [
@@ -2716,8 +3047,8 @@ class HubWorkspaceTests(unittest.TestCase):
                     mock.patch.object(launcher, "hub_healthy", return_value=True),
                     mock.patch.object(
                         launcher,
-                        "_load_hub_launcher_state",
-                        wraps=launcher._load_hub_launcher_state,
+                        "_load_named_hub_launcher_states",
+                        wraps=launcher._load_named_hub_launcher_states,
                     ) as load_state,
                 ):
                     self.assertIsNone(

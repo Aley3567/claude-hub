@@ -38,6 +38,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from claude1_protocol import provider_api_format
+import claude_hub_catalog as hub_catalog
 
 
 VERSION = "0.1.0"
@@ -115,7 +116,34 @@ HUB_LOG = _env_path(
 HUB_USAGE = _env_path(
     "CLAUDE_HUB_USAGE", HOME / ".cc-switch" / "logs" / "claude-hub-usage.jsonl"
 )
+HUB_CATALOG = _env_path(
+    "CLAUDE1_HUB_CATALOG", HOME / ".cc-switch" / "claude-hubs.json"
+)
+# Existing single-Hub path/port overrides retain their legacy contract unless
+# the caller explicitly opts into a catalog.
+_LEGACY_HUB_OVERRIDE_KEYS = {
+    "CLAUDE1_HUB_CONFIG",
+    "CLAUDE1_HUB_PORT",
+    "CLAUDE1_HUB_LOG",
+    "CLAUDE_HUB_USAGE",
+}
+HUB_CATALOG_ENABLED = (
+    "CLAUDE1_HUB_CATALOG" in os.environ
+    or not any(key in os.environ for key in _LEGACY_HUB_OVERRIDE_KEYS)
+)
 _hub_processes: list[subprocess.Popen] = []
+
+
+@dataclass(frozen=True)
+class HubRef:
+    """Stable identity plus the isolated filesystem paths for one Hub."""
+
+    hub_id: str
+    name: str
+    config_path: Path
+    log_path: Path
+    usage_path: Path
+    legacy: bool = False
 
 # Optional local protocol-translation gateway (cliproxyapi). Providers whose
 # configured base URL points here need the gateway alive before Claude starts.
@@ -711,7 +739,11 @@ def ensure_local_gateway(base_url: str) -> None:
 
 
 def _hub_port(cfg: dict) -> int:
-    raw = os.environ.get("CLAUDE1_HUB_PORT", cfg.get("port"))
+    raw = (
+        cfg.get("port")
+        if HUB_CATALOG_ENABLED
+        else os.environ.get("CLAUDE1_HUB_PORT", cfg.get("port"))
+    )
     try:
         port = int(raw)
     except (TypeError, ValueError):
@@ -746,7 +778,11 @@ def _hub_local_token(cfg: dict) -> str:
     return token.strip()
 
 
-def hub_healthy(port: int, token: str | None = None) -> bool:
+def hub_healthy(
+    port: int,
+    token: str | None = None,
+    instance_id: str | None = None,
+) -> bool:
     """Accept public liveness, or verify a token-bound Hub identity proof."""
     try:
         path = "/readyz" if token else "/healthz"
@@ -771,10 +807,17 @@ def hub_healthy(port: int, token: str | None = None) -> bool:
             and not isinstance(protocol, bool)
             and protocol == 1
         )
+        if instance_id is not None:
+            contract_ok = contract_ok and payload.get("identity_protocol") == 2
         if not contract_ok or token is None:
             return contract_ok
         proof = payload.get("proof")
-        proof_message = f"claude-hub-ready:v1:{port}:{challenge}".encode("ascii")
+        proof_version = (
+            f"v2:{instance_id}:{port}" if instance_id is not None else f"v1:{port}"
+        )
+        proof_message = (
+            f"claude-hub-ready:{proof_version}:{challenge}".encode("ascii")
+        )
         expected = hmac.digest(token.encode("utf-8"), proof_message, "sha256").hex()
         return isinstance(proof, str) and hmac.compare_digest(proof, expected)
     except (
@@ -789,15 +832,21 @@ def hub_healthy(port: int, token: str | None = None) -> bool:
 
 
 def _hub_start_env(
-    port: int, *, token_env: str = DEFAULT_HUB_TOKEN_ENV
+    port: int,
+    *,
+    token_env: str = DEFAULT_HUB_TOKEN_ENV,
+    hub: HubRef | None = None,
 ) -> dict[str, str]:
     """Build a minimal child environment instead of inheriting secrets/proxies."""
     child: dict[str, str] = {
         "HOME": str(HOME),
         "PATH": os.environ.get("PATH", os.defpath),
-        "CLAUDE_HUB_CONFIG": str(HUB_CONFIG),
+        "CLAUDE_HUB_CONFIG": str(_hub_config_path(hub)),
         "CLAUDE_HUB_DB": str(HUB_DB),
-        "CLAUDE_HUB_LOG": str(HUB_LOG),
+        "CLAUDE_HUB_LOG": str(hub.log_path if hub is not None else HUB_LOG),
+        "CLAUDE_HUB_USAGE": str(
+            hub.usage_path if hub is not None else HUB_USAGE
+        ),
         "CLAUDE_HUB_PORT": str(port),
     }
     for key in ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"):
@@ -838,22 +887,15 @@ def _stop_spawned_process(process: subprocess.Popen, timeout: float = 3) -> None
 
 
 @contextmanager
-def _hub_start_lock():
+def _hub_start_lock(hub: HubRef | None = None):
     """Serialize Hub startup between independently launched claude1 processes."""
-    if os.name != "posix":
+    log_path = hub.log_path if hub is not None else HUB_LOG
+    lock_name = (
+        f"claude-hub-{hub.hub_id}.lock" if hub is not None else "claude-hub.lock"
+    )
+    lock_path = log_path.parent / lock_name
+    with _private_file_lock(lock_path, "hub 启动"):
         yield
-        return
-    import fcntl
-
-    lock_path = HUB_LOG.parent / "claude-hub.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
 
 
 def ensure_hub(
@@ -861,24 +903,28 @@ def ensure_hub(
     *,
     token: str | None = None,
     token_env: str = DEFAULT_HUB_TOKEN_ENV,
+    hub: HubRef | None = None,
+    instance_id: str | None = None,
 ) -> None:
     """Start the isolated claude-hub process unless its strict health check passes."""
-    if hub_healthy(port, token):
+    log_path = hub.log_path if hub is not None else HUB_LOG
+    if hub_healthy(port, token, instance_id):
         return
-    with _hub_start_lock():
+    with _hub_start_lock(hub):
         # Another claude1 may have completed startup while this process waited
         # for the inter-process lock.
-        if hub_healthy(port, token):
+        if hub_healthy(port, token, instance_id):
             return
         if not HUB_SCRIPT.is_file():
             raise RuntimeError(f"hub 脚本不存在: {HUB_SCRIPT}")
-        print("[claude1] claude-hub 未运行，正在启动 ...", file=sys.stderr)
-        with _open_private_append(HUB_LOG) as log:
+        display_name = hub.name if hub is not None else "claude-hub"
+        print(f"[claude1] {display_name} 未运行，正在启动 ...", file=sys.stderr)
+        with _open_private_append(log_path) as log:
             process = subprocess.Popen(
                 [str(HUB_SCRIPT), "serve"],
                 stdout=log,
                 stderr=log,
-                env=_hub_start_env(port, token_env=token_env),
+                env=_hub_start_env(port, token_env=token_env, hub=hub),
                 close_fds=True,
                 start_new_session=True,
             )
@@ -888,18 +934,18 @@ def ensure_hub(
         _hub_processes.append(process)
         deadline = time.monotonic() + _hub_start_timeout()
         while time.monotonic() < deadline:
-            if hub_healthy(port, token):
+            if hub_healthy(port, token, instance_id):
                 return
             return_code = process.poll()
             if return_code is not None:
                 _stop_spawned_process(process)
                 raise RuntimeError(
                     f"claude-hub 启动进程提前退出（状态 {return_code}），"
-                    f"查看日志: {HUB_LOG}"
+                    f"查看日志: {log_path}"
                 )
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         _stop_spawned_process(process)
-        raise RuntimeError(f"claude-hub 启动失败，查看日志: {HUB_LOG}")
+        raise RuntimeError(f"{display_name} 启动失败，查看日志: {log_path}")
 
 
 def _provider_terms(provider: dict) -> list[str]:
@@ -1059,44 +1105,30 @@ HUB_DEFAULT_EFFORTS = {
 }
 
 
-@contextmanager
-def _hub_config_lock():
-    """Serialize Hub config migrations and interactive edits."""
-    if os.name != "posix":
-        yield
-        return
-    import fcntl
-
-    lock_path = HUB_CONFIG.with_name(HUB_CONFIG.name + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(lock_path, flags, 0o600)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode):
-            raise OSError("hub 配置锁必须是普通文件")
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
+def _legacy_hub_ref() -> HubRef:
+    return HubRef(
+        hub_id=hub_catalog.LEGACY_HUB_ID,
+        name="Claude-Hub",
+        config_path=HUB_CONFIG,
+        log_path=HUB_LOG,
+        usage_path=HUB_USAGE,
+        legacy=True,
+    )
 
 
-def _hub_config_text(config: dict) -> str:
-    return json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+def _hub_config_path(hub: HubRef | None) -> Path:
+    return hub.config_path if hub is not None else HUB_CONFIG
 
 
-def _read_hub_config_text() -> str:
-    """Read the config without following a swapped symlink or special file."""
-    expected = HUB_CONFIG.lstat()
+def _read_regular_text(path: Path, label: str) -> str:
+    """Read one regular file without following a swapped symlink."""
+    expected = path.lstat()
     if not stat.S_ISREG(expected.st_mode):
-        raise ValueError("hub 配置必须是普通文件")
+        raise ValueError(f"{label}必须是普通文件")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(HUB_CONFIG, flags)
+    fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode) or (
@@ -1106,13 +1138,56 @@ def _read_hub_config_text() -> str:
             expected.st_dev,
             expected.st_ino,
         ):
-            raise OSError("hub 配置在读取期间发生变化")
+            raise OSError(f"{label}在读取期间发生变化")
         with os.fdopen(fd, encoding="utf-8") as handle:
             fd = -1
             return handle.read()
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+@contextmanager
+def _private_file_lock(lock_path: Path, label: str):
+    if os.name != "posix":
+        yield
+        return
+    import fcntl
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"{label}锁必须是普通文件")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _hub_config_lock(hub: HubRef | None = None):
+    """Serialize Hub config migrations and interactive edits."""
+    config_path = _hub_config_path(hub)
+    with _private_file_lock(
+        config_path.with_name(config_path.name + ".lock"),
+        "hub 配置",
+    ):
+        yield
+
+
+def _hub_config_text(config: dict) -> str:
+    return json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+
+
+def _read_hub_config_text(hub: HubRef | None = None) -> str:
+    """Read the config without following a swapped symlink or special file."""
+    return _read_regular_text(_hub_config_path(hub), "hub 配置")
 
 
 def _validate_hub_slot_selector(
@@ -1221,9 +1296,10 @@ def normalize_hub_config(raw: object) -> dict:
     return config
 
 
-def _hub_migration_backup_path() -> Path:
+def _hub_migration_backup_path(hub: HubRef | None = None) -> Path:
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    base = HUB_CONFIG.with_name(f"{HUB_CONFIG.name}.bak-migrate-{timestamp}")
+    config_path = _hub_config_path(hub)
+    base = config_path.with_name(f"{config_path.name}.bak-migrate-{timestamp}")
     candidate = base
     suffix = 1
     while candidate.exists():
@@ -1232,26 +1308,32 @@ def _hub_migration_backup_path() -> Path:
     return candidate
 
 
-def load_hub_config(*, migrate: bool = False) -> dict:
+def load_hub_config(
+    *,
+    migrate: bool = False,
+    hub: HubRef | None = None,
+) -> dict:
     """Load and validate Hub config, optionally migrating it atomically once."""
-    if not HUB_CONFIG.is_file():
-        raise ValueError(f"hub 配置不存在: {HUB_CONFIG}")
+    config_path = _hub_config_path(hub)
+    if not config_path.is_file():
+        raise ValueError(f"hub 配置不存在: {config_path}")
     if not migrate:
-        return normalize_hub_config(json.loads(_read_hub_config_text()))
-    with _hub_config_lock():
-        original_text = _read_hub_config_text()
+        return normalize_hub_config(json.loads(_read_hub_config_text(hub)))
+    with _hub_config_lock(hub):
+        original_text = _read_hub_config_text(hub)
         raw = json.loads(original_text)
         normalized = normalize_hub_config(raw)
         if normalized != raw:
-            _atomic_private_write(_hub_migration_backup_path(), original_text)
-            _atomic_private_write(HUB_CONFIG, _hub_config_text(normalized))
+            _atomic_private_write(_hub_migration_backup_path(hub), original_text)
+            _atomic_private_write(config_path, _hub_config_text(normalized))
         return normalized
 
 
-def mutate_hub_config(mutator) -> dict:
+def mutate_hub_config(mutator, *, hub: HubRef | None = None) -> dict:
     """Apply one config mutation against the latest on-disk v2 document."""
-    with _hub_config_lock():
-        original_text = _read_hub_config_text()
+    config_path = _hub_config_path(hub)
+    with _hub_config_lock(hub):
+        original_text = _read_hub_config_text(hub)
         raw = json.loads(original_text)
         config = normalize_hub_config(raw)
         migration_needed = config != raw
@@ -1259,15 +1341,290 @@ def mutate_hub_config(mutator) -> dict:
         normalized = normalize_hub_config(config)
         if normalized != raw:
             if migration_needed:
-                _atomic_private_write(_hub_migration_backup_path(), original_text)
-            _atomic_private_write(HUB_CONFIG, _hub_config_text(normalized))
+                _atomic_private_write(_hub_migration_backup_path(hub), original_text)
+            _atomic_private_write(config_path, _hub_config_text(normalized))
         return normalized
+
+
+def _hub_catalog_text(catalog: dict) -> str:
+    return json.dumps(catalog, ensure_ascii=False, indent=2) + "\n"
+
+
+@contextmanager
+def _hub_catalog_lock():
+    with _private_file_lock(
+        HUB_CATALOG.with_name(HUB_CATALOG.name + ".lock"),
+        "hub catalog",
+    ):
+        yield
+
+
+def _legacy_hub_catalog() -> dict:
+    if HUB_CATALOG_ENABLED:
+        catalog_root = HUB_CATALOG.parent.absolute()
+
+        def relative(path: Path, label: str) -> str:
+            try:
+                return path.absolute().relative_to(catalog_root).as_posix()
+            except ValueError:
+                raise ValueError(
+                    f"{label} 必须位于 hub catalog 目录内: {catalog_root}"
+                ) from None
+
+        entry = hub_catalog.legacy_hub_entry(
+            config=relative(HUB_CONFIG, "旧 Hub 配置"),
+            log=relative(HUB_LOG, "旧 Hub 日志"),
+            usage=relative(HUB_USAGE, "旧 Hub usage"),
+        )
+    else:
+        entry = hub_catalog.legacy_hub_entry()
+    return hub_catalog.normalize_hub_catalog(
+        {
+            "version": hub_catalog.CATALOG_VERSION,
+            "default_hub": hub_catalog.LEGACY_HUB_ID,
+            "order": [hub_catalog.LEGACY_HUB_ID],
+            "hubs": {
+                hub_catalog.LEGACY_HUB_ID: entry,
+            },
+        }
+    )
+
+
+def load_hub_catalog(*, migrate: bool = False) -> dict:
+    """Load the named-Hub catalog, optionally registering the legacy Hub."""
+    if not HUB_CATALOG_ENABLED:
+        return _legacy_hub_catalog()
+    if HUB_CATALOG.is_file():
+        return hub_catalog.load_hub_catalog(
+            json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+        )
+    if not migrate:
+        raise ValueError(f"hub catalog 不存在: {HUB_CATALOG}")
+    if not HUB_CONFIG.is_file():
+        raise ValueError(f"hub 配置不存在: {HUB_CONFIG}")
+    with _hub_catalog_lock():
+        if HUB_CATALOG.is_file():
+            return hub_catalog.load_hub_catalog(
+                json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+            )
+        catalog = _legacy_hub_catalog()
+        _atomic_private_write(HUB_CATALOG, _hub_catalog_text(catalog))
+        return catalog
+
+
+def mutate_hub_catalog(mutator) -> dict:
+    """Apply one catalog mutation under its private inter-process lock."""
+    if not HUB_CATALOG_ENABLED:
+        raise ValueError("显式单 Hub 配置模式不支持多 Hub 管理")
+    with _hub_catalog_lock():
+        if HUB_CATALOG.is_file():
+            raw = json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+            catalog = hub_catalog.normalize_hub_catalog(raw)
+        elif HUB_CONFIG.is_file():
+            catalog = _legacy_hub_catalog()
+        else:
+            raise ValueError("没有可迁移的 Hub 配置")
+        mutator(catalog)
+        normalized = hub_catalog.normalize_hub_catalog(catalog)
+        _atomic_private_write(HUB_CATALOG, _hub_catalog_text(normalized))
+        return normalized
+
+
+def _validate_catalog_path_chain(path: Path) -> None:
+    """Reject symlinked/non-directory parents beneath the catalog root."""
+    root = HUB_CATALOG.parent.absolute()
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        root_info = None
+    if root_info is not None:
+        if stat.S_ISLNK(root_info.st_mode):
+            raise ValueError(f"Hub catalog 根目录不能是符号链接: {root}")
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise ValueError(f"Hub catalog 根路径必须是目录: {root}")
+    target = path.absolute()
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        raise ValueError(f"Hub catalog 路径越界: {path}") from None
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"Hub catalog 路径父目录不能是符号链接: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"Hub catalog 路径父节点必须是目录: {current}")
+
+
+def _hub_ref_from_catalog(catalog: dict, hub_id: str) -> HubRef:
+    entry = catalog["hubs"][hub_id]
+    ref = HubRef(
+        hub_id=hub_id,
+        name=entry["name"],
+        config_path=hub_catalog.resolve_catalog_path(
+            HUB_CATALOG, entry["config"]
+        ),
+        log_path=hub_catalog.resolve_catalog_path(HUB_CATALOG, entry["log"]),
+        usage_path=hub_catalog.resolve_catalog_path(
+            HUB_CATALOG, entry["usage"]
+        ),
+        legacy=(hub_id == hub_catalog.LEGACY_HUB_ID),
+    )
+    for path in (ref.config_path, ref.log_path, ref.usage_path):
+        _validate_catalog_path_chain(path)
+    return ref
+
+
+def list_hub_refs(*, migrate: bool = False) -> list[HubRef]:
+    """Resolve all named Hubs and reject cross-instance port collisions."""
+    if not HUB_CATALOG_ENABLED:
+        return [_legacy_hub_ref()] if HUB_CONFIG.is_file() else []
+    try:
+        catalog = load_hub_catalog(migrate=migrate)
+    except ValueError:
+        if not HUB_CATALOG.is_file() and not HUB_CONFIG.is_file():
+            return []
+        raise
+    refs = [
+        _hub_ref_from_catalog(catalog, hub_id)
+        for hub_id in catalog["order"]
+    ]
+    configs = {
+        ref.hub_id: load_hub_config(migrate=migrate, hub=ref)
+        for ref in refs
+    }
+    hub_catalog.validate_unique_hub_ports(configs)
+    for ref in refs:
+        instance_id = configs[ref.hub_id].get("instance_id")
+        if not ref.legacy and instance_id != ref.hub_id:
+            raise ValueError(
+                f"Hub {ref.name} 的 instance_id 必须等于 {ref.hub_id}"
+            )
+    return refs
+
+
+def resolve_hub_ref(
+    value: str | None = None,
+    *,
+    migrate: bool = True,
+) -> HubRef:
+    refs = list_hub_refs(migrate=migrate)
+    if not refs:
+        raise ValueError("没有可用的 Hub")
+    if not HUB_CATALOG_ENABLED:
+        if value not in (None, refs[0].hub_id, refs[0].name):
+            raise ValueError(f"Hub 不存在: {value}")
+        return refs[0]
+    catalog = load_hub_catalog(migrate=migrate)
+    hub_id = hub_catalog.resolve_hub_id(catalog, value)
+    return _hub_ref_from_catalog(catalog, hub_id)
+
+
+def _next_hub_port(configs: dict[str, dict], preferred: int) -> int:
+    used = set(hub_catalog.validate_unique_hub_ports(configs).values())
+    candidate = preferred if 1 <= preferred <= 65535 else 18787
+    for _ in range(65535):
+        if candidate not in used:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", candidate))
+            except OSError:
+                pass
+            else:
+                return candidate
+            finally:
+                probe.close()
+        candidate = 1024 if candidate >= 65535 else candidate + 1
+    raise ValueError("没有可分配的 Hub 端口")
+
+
+def clone_named_hub(source: HubRef, name: str) -> HubRef:
+    """Create an isolated v2 Hub by cloning one selected workspace."""
+    if not HUB_CATALOG_ENABLED:
+        raise ValueError("显式单 Hub 配置模式不支持新增 Hub")
+    display_name = hub_catalog.validate_display_name(name)
+    with _hub_catalog_lock():
+        if HUB_CATALOG.is_file():
+            catalog = hub_catalog.load_hub_catalog(
+                json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+            )
+        else:
+            catalog = _legacy_hub_catalog()
+        hub_id = hub_catalog.unique_hub_id(display_name, catalog["hubs"])
+        source_config = load_hub_config(migrate=True, hub=source)
+        loaded_configs = {
+            existing_id: load_hub_config(
+                hub=_hub_ref_from_catalog(catalog, existing_id)
+            )
+            for existing_id in catalog["order"]
+        }
+        source_port = int(source_config.get("port", 18787))
+        config = json.loads(json.dumps(source_config))
+        config["port"] = _next_hub_port(loaded_configs, source_port + 1)
+        config["instance_id"] = hub_id
+        config = normalize_hub_config(config)
+        entry = {
+            "name": display_name,
+            "config": f"hubs/{hub_id}.json",
+            "log": f"logs/hubs/{hub_id}.log",
+            "usage": f"logs/hubs/{hub_id}-usage.jsonl",
+        }
+        new_ref = HubRef(
+            hub_id=hub_id,
+            name=display_name,
+            config_path=hub_catalog.resolve_catalog_path(
+                HUB_CATALOG, entry["config"]
+            ),
+            log_path=hub_catalog.resolve_catalog_path(HUB_CATALOG, entry["log"]),
+            usage_path=hub_catalog.resolve_catalog_path(
+                HUB_CATALOG, entry["usage"]
+            ),
+        )
+        for path in (
+            new_ref.config_path,
+            new_ref.log_path,
+            new_ref.usage_path,
+        ):
+            _validate_catalog_path_chain(path)
+        catalog["hubs"][hub_id] = entry
+        catalog["order"].append(hub_id)
+        normalized = hub_catalog.normalize_hub_catalog(catalog)
+        if new_ref.config_path.exists():
+            raise ValueError(f"Hub 配置路径已存在: {new_ref.config_path}")
+        _atomic_private_write(new_ref.config_path, _hub_config_text(config))
+        try:
+            _atomic_private_write(HUB_CATALOG, _hub_catalog_text(normalized))
+        except Exception:
+            try:
+                new_ref.config_path.unlink()
+            except OSError:
+                pass
+            raise
+        return new_ref
+
+
+def rename_named_hub(hub_id: str, name: str) -> HubRef:
+    display_name = hub_catalog.validate_display_name(name)
+
+    def rename(catalog: dict) -> None:
+        if hub_id not in catalog["hubs"]:
+            raise ValueError(f"Hub 不存在: {hub_id}")
+        catalog["hubs"][hub_id]["name"] = display_name
+
+    catalog = mutate_hub_catalog(rename)
+    return _hub_ref_from_catalog(catalog, hub_id)
 
 
 def cycle_hub_slot_effort(
     slot: str,
     expected_effort: str,
     direction: int,
+    *,
+    hub: HubRef | None = None,
 ) -> dict:
     """Cycle one slot with compare-and-swap protection across TUI surfaces."""
     if slot not in HUB_SLOT_ORDER or expected_effort not in HUB_EFFORT_LEVELS:
@@ -1284,7 +1641,9 @@ def cycle_hub_slot_effort(
             raise ValueError("槽位 effort 已被另一窗口修改，请重试")
         latest["effort_by_slot"][slot] = next_effort
 
-    return mutate_hub_config(set_effort)
+    if hub is None:
+        return mutate_hub_config(set_effort)
+    return mutate_hub_config(set_effort, hub=hub)
 
 
 def add_hub_channel(
@@ -1293,6 +1652,7 @@ def add_hub_channel(
     alias: str,
     models: list[str],
     api_format: str | None = None,
+    hub: HubRef | None = None,
 ) -> dict:
     """Add one credential-free, multi-model channel without changing slots."""
     alias = alias.strip().casefold()
@@ -1327,10 +1687,12 @@ def add_hub_channel(
         if api_format is not None:
             latest["channels"][alias]["api_format"] = api_format
 
-    return mutate_hub_config(add)
+    if hub is None:
+        return mutate_hub_config(add)
+    return mutate_hub_config(add, hub=hub)
 
 
-def remove_hub_channel(alias: str) -> dict:
+def remove_hub_channel(alias: str, *, hub: HubRef | None = None) -> dict:
     """Remove an unreferenced channel while preserving routing invariants."""
     alias = alias.strip().lower()
 
@@ -1350,7 +1712,9 @@ def remove_hub_channel(alias: str) -> dict:
             raise ValueError(f"渠道仍被槽位引用: {', '.join(referenced)}")
         del latest["channels"][alias]
 
-    return mutate_hub_config(remove)
+    if hub is None:
+        return mutate_hub_config(remove)
+    return mutate_hub_config(remove, hub=hub)
 
 
 def _hub_model_family(model: str) -> str:
@@ -1429,6 +1793,7 @@ class HubLaunch:
 
     option: HubModelOption | None = None
     slot: str | None = None
+    hub_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1448,6 +1813,14 @@ class HubLauncherState:
     status: HubStatus
     options: tuple[HubModelOption, ...]
     slots: tuple[HubSlotOption, ...]
+
+
+@dataclass(frozen=True)
+class NamedHubLauncherState:
+    """One top-level named Hub plus its independent v2 launcher snapshot."""
+
+    hub: HubRef
+    state: HubLauncherState
 
 
 def build_hub_workspace(
@@ -1572,12 +1945,32 @@ def build_hub_launcher_state(hub_cfg: dict) -> HubLauncherState:
 
 
 def _load_hub_launcher_state() -> HubLauncherState | None:
-    if not HUB_CONFIG.is_file():
+    try:
+        hub = resolve_hub_ref(migrate=True)
+    except (OSError, ValueError, json.JSONDecodeError):
         return None
     try:
-        return build_hub_launcher_state(load_hub_config(migrate=True))
+        return build_hub_launcher_state(load_hub_config(migrate=True, hub=hub))
     except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
         return None
+
+
+def _load_named_hub_launcher_states() -> list[NamedHubLauncherState]:
+    """Load all valid named Hubs while keeping ordinary providers available."""
+    try:
+        refs = list_hub_refs(migrate=True)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    states: list[NamedHubLauncherState] = []
+    for hub in refs:
+        try:
+            config = load_hub_config(migrate=True, hub=hub)
+            states.append(
+                NamedHubLauncherState(hub, build_hub_launcher_state(config))
+            )
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+            continue
+    return states
 
 
 def _load_hub_view() -> tuple[HubStatus, list[HubModelOption]] | None:
@@ -2076,24 +2469,35 @@ def _provider_meta_label(meta: dict, provider_id: str) -> str:
     return name
 
 
-def _home_hub_controls_expanded(
+def _home_hubs_expanded(
     rows: int,
     cols: int,
-    hub_slots: tuple[HubSlotOption, ...] | list[HubSlotOption],
+    hubs: tuple[NamedHubLauncherState, ...] | list[NamedHubLauncherState],
 ) -> bool:
-    """Keep four visible slots only when at least one provider row still fits."""
-    if len(hub_slots) != len(HUB_SLOT_ORDER):
+    """Use section headings when a Hub row and direct-provider row both fit."""
+    if not hubs:
         return False
     large_logo = _large_logo_supported(rows, cols) and rows >= 21
     head = _LOGO_TOP + len(LOGO) if large_logo else 1
-    list_top = head + 4 + 7  # section label + 4 slots + spacer + provider label
+    list_top = head + 4 + 3  # Hub heading + one Hub + provider heading
     return max(0, rows - 1 - list_top) >= 1
 
 
-def _hub_home_slot_text(slot: HubSlotOption, status: HubStatus, width: int) -> str:
-    left = f"{slot.slot.title():<7} {slot.selector}"
-    right = slot.effort + (" · 默认" if slot.slot == status.launch_slot else "")
+def _hub_home_text(named: NamedHubLauncherState, width: int) -> str:
+    status = named.state.status
+    left = f"◆ {named.hub.name}"
+    right = (
+        f"4 槽 · {status.channel_count} 渠道"
+        f" · 默认 {status.launch_slot.title()} · {status.launch_effort}"
+    )
     return _compose_row(left, right, width)
+
+
+_HUB_IDENTITY_COLORS = ("orange", "teal", "violet", "pink", "lime")
+
+
+def _hub_identity_color(index: int) -> str:
+    return _HUB_IDENTITY_COLORS[index]
 
 
 def _draw_launcher(
@@ -2109,17 +2513,14 @@ def _draw_launcher(
     notice: str | None = None,
     logo_phase: int = 0,
     logo_breathing: bool = False,
-    hub_status: "HubStatus | None" = None,
     hub_focus: bool = False,
-    hub_slots: tuple[HubSlotOption, ...] | list[HubSlotOption] = (),
-    hub_slot_idx: int = 0,
+    hubs: tuple[NamedHubLauncherState, ...] | list[NamedHubLauncherState] = (),
+    hub_idx: int = 0,
 ) -> None:
     meta = cfg["providers"]
     win.erase()
     h, w = win.getmaxyx()
-    expanded_hub = (
-        hub_status is not None and _home_hub_controls_expanded(h, w, hub_slots)
-    )
+    expanded_hub = _home_hubs_expanded(h, w, hubs)
     big = _large_logo_supported(h, w) and (not expanded_hub or h >= 21)
 
     if show_brand and big:
@@ -2155,59 +2556,66 @@ def _draw_launcher(
             C.get("dim", 0),
         )
     guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
-    if hub_status is not None and not notice:
+    if hubs and not notice:
         guide = (
-            "↑↓ 槽位/渠道 · Enter 启动 · ←/→ effort · a 新增渠道"
-            " · Tab/m 完整管理"
+            "↑↓ 选择 Hub · Enter 启动 · m/→ 管理 · n 新建 Hub"
+            " · r 重命名"
         )
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
     _addstr(win, head + 2, 2, guide, guide_attr)
     row_cursor = head + 4
-    if hub_status is not None:
+    if hubs:
         if expanded_hub:
             _addstr(
                 win,
                 row_cursor,
                 2,
-                "Claude-Hub · 首页可调",
-                C.get("dim", 0),
+                f"Hub 工作区 · {len(hubs)} 个",
+                C.get("teal", 0) | curses.A_BOLD,
             )
             row_cursor += 1
             row_width = max(0, w - 4)
-            for slot_index, slot in enumerate(hub_slots):
-                selected = hub_focus and slot_index == hub_slot_idx
+            footer_row = max(0, h - 1)
+            hub_capacity = max(0, footer_row - row_cursor - 2)
+            hub_start, hub_end = _visible_window(len(hubs), hub_idx, hub_capacity)
+            for row_offset, hub_index in enumerate(range(hub_start, hub_end)):
+                named = hubs[hub_index]
+                selected = hub_focus and hub_index == hub_idx
                 marker = "▸" if selected else " "
-                text = marker + " " + _hub_home_slot_text(
-                    slot,
-                    hub_status,
-                    max(0, row_width - 2),
+                text = marker + " " + _hub_home_text(
+                    named, max(0, row_width - 2)
                 )
                 attr = (
                     C.get("sel", curses.A_REVERSE)
                     if selected
-                    else C.get(_HUB_FAMILY_COLOR.get(slot.option.family, "violet"), 0)
+                    else C.get(
+                        _hub_identity_color(hub_index % len(_HUB_IDENTITY_COLORS)),
+                        0,
+                    )
                     | curses.A_BOLD
                 )
                 _addstr(
                     win,
-                    row_cursor + slot_index,
+                    row_cursor + row_offset,
                     2,
                     _pad_display(text, row_width) if selected else text,
                     attr,
                 )
-            row_cursor += len(hub_slots) + 1
+            row_cursor += hub_end - hub_start
             _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
             row_cursor += 1
         else:
-            entry = (
-                f"◆ Claude-Hub · {hub_status.summary}"
-                " · a 新增 · Tab 管理"
-            )
+            named = hubs[max(0, min(hub_idx, len(hubs) - 1))]
+            entry = _hub_home_text(named, max(0, w - 4))
             entry_width = max(0, w - 4)
             attr = (
                 C.get("sel", curses.A_REVERSE)
                 if hub_focus
-                else C.get("orange", 0) | curses.A_BOLD
+                else C.get(
+                    _hub_identity_color(hub_idx % len(_HUB_IDENTITY_COLORS)),
+                    0,
+                )
+                | curses.A_BOLD
             )
             rendered = (
                 _pad_display(entry, entry_width)
@@ -2264,12 +2672,12 @@ def _draw_launcher(
             )
             _addstr(win, row, 2, line, attr)
 
-    if help_open and hub_focus and hub_status is not None:
-        foot = "Hub 首页：Enter 启动 · a 新增 · effort 可调 · Tab/m 管理 · ? 返回"
+    if help_open and hub_focus and hubs:
+        foot = "Hub：首页 Enter 启动 · m/→ 管理 · n 新建 · r 重命名 · ? 返回"
     elif help_open:
         foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
-    elif hub_focus and hub_status is not None:
-        foot = "Hub · a 新增渠道 · ←/→/e effort · Tab/m 完整管理 · q 退出"
+    elif hub_focus and hubs:
+        foot = "Hub · Enter 启动 · m/→ 槽位与渠道 · n 新建 · r 重命名 · q 退出"
     else:
         visible_range = ""
         if start > 0 or end < len(view):
@@ -2307,11 +2715,12 @@ def _draw_hub_workspace(
     idx: int,
     tab: str = "slots",
     notice: str | None = None,
+    hub_name: str = "Claude-Hub",
 ) -> None:
     """Render native slots followed by the unbound model pool."""
     win.erase()
     h, w = win.getmaxyx()
-    _addstr(win, 0, 2, "Claude1  ›  Claude-Hub", C.get("dim", 0))
+    _addstr(win, 0, 2, f"Claude1  ›  {hub_name}", C.get("dim", 0))
     tabs = "[Slots]   Channels" if tab == "slots" else " Slots   [Channels]"
     _addstr(win, 1, 2, tabs, C.get("lime", 0) | curses.A_BOLD)
     if status.healthy is True:
@@ -2565,6 +2974,50 @@ def _prompt_hub_text(
             value += chr(ch)
 
 
+def _prompt_named_hub(
+    win,
+    title: str,
+    initial: str,
+    detail: str,
+) -> str | None:
+    """Edit a top-level Hub display name on a dedicated visual surface."""
+    value = initial
+    while True:
+        win.erase()
+        h, w = win.getmaxyx()
+        width = max(0, w - 4)
+        _addstr(win, 0, 2, "Claude1  ›  Hub 工作区", C.get("dim", 0))
+        _addstr(win, 2, 2, title, C.get("teal", 0) | curses.A_BOLD)
+        _addstr(win, 3, 2, detail, C.get("dim", 0))
+        _addstr(win, 5, 2, "Hub 名称", C.get("dim", 0))
+        _addstr(
+            win,
+            min(7, max(0, h - 2)),
+            2,
+            _pad_display(f"› {value or '请输入…'}", width),
+            C.get("sel", curses.A_REVERSE),
+        )
+        _addstr(
+            win,
+            max(0, h - 1),
+            2,
+            "Esc 取消 · Backspace 删除 · Enter 确认",
+            C.get("dim", 0),
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (10, 13, curses.KEY_ENTER):
+            return value.strip()
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+        elif 32 <= ch <= 0x10FFFF:
+            char = chr(ch)
+            if not unicodedata.category(char).startswith("C"):
+                value += char
+
+
 def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
     if not providers:
         return None
@@ -2815,7 +3268,11 @@ def _confirm_hub_channel_add(win, alias: str, models: list[str]) -> bool:
             return True
 
 
-def _hub_add_channel_wizard(win) -> dict | None:
+def _hub_add_channel_wizard(
+    win,
+    *,
+    hub: HubRef | None = None,
+) -> dict | None:
     """Run the pure provider/models/settings/confirmation add flow."""
     provider = _choose_hub_provider(win, list_providers())
     if provider is None:
@@ -2857,6 +3314,7 @@ def _hub_add_channel_wizard(win) -> dict | None:
         alias=alias,
         models=models,
         api_format=api_format,
+        hub=hub,
     )
 
 
@@ -2865,6 +3323,7 @@ def _hub_workspace(
     status: "HubStatus",
     options: list["HubModelOption"],
     initial_slot: str | None = None,
+    hub: HubRef | None = None,
 ) -> tuple[str, "HubLaunch | None"]:
     """Run the Hub model picker loop.
 
@@ -2873,7 +3332,9 @@ def _hub_workspace(
       "back"   — Esc, return to the Claude1 home screen,
       "quit"   — q or terminal EOF, exit the launcher entirely.
     """
-    config = load_hub_config(migrate=True)
+    config = load_hub_config(migrate=True, hub=hub)
+    hub_name = hub.name if hub is not None else "Claude-Hub"
+    hub_id = hub.hub_id if hub is not None else None
     slots, pool = build_hub_workspace(config)
     channels = build_hub_channels(config)
     tab = "slots"
@@ -2886,9 +3347,20 @@ def _hub_workspace(
     tab_indices = {"slots": idx, "channels": 0}
     notice: str | None = None
     # Draw once while probing so a down hub does not freeze the screen silently.
-    _draw_hub_workspace(win, status, rows, idx, tab)
-    status = replace(status, healthy=hub_healthy(status.port))
-    _draw_hub_workspace(win, status, rows, idx, tab)
+    _draw_hub_workspace(win, status, rows, idx, tab, hub_name=hub_name)
+    instance_id = config.get("instance_id")
+    health_token = (
+        _hub_local_token(config) if isinstance(instance_id, str) else None
+    )
+    status = replace(
+        status,
+        healthy=hub_healthy(
+            status.port,
+            health_token,
+            instance_id=instance_id if isinstance(instance_id, str) else None,
+        ),
+    )
+    _draw_hub_workspace(win, status, rows, idx, tab, hub_name=hub_name)
     while True:
         ch = win.getch()
         notice = None
@@ -2913,11 +3385,12 @@ def _hub_workspace(
                     item.slot,
                     item.effort,
                     direction,
+                    hub=hub,
                 )
             except ValueError as exc:
                 notice = str(exc)
                 try:
-                    config = load_hub_config()
+                    config = load_hub_config(hub=hub)
                     slots, pool = build_hub_workspace(config)
                     channels = build_hub_channels(config)
                     rows = [*slots, *pool]
@@ -2958,11 +3431,15 @@ def _hub_workspace(
                 latest["model_slots"][target_slot] = item.selector
 
             try:
-                config = mutate_hub_config(bind_slot)
+                config = (
+                    mutate_hub_config(bind_slot)
+                    if hub is None
+                    else mutate_hub_config(bind_slot, hub=hub)
+                )
             except ValueError as exc:
                 notice = str(exc)
                 try:
-                    config = load_hub_config()
+                    config = load_hub_config(hub=hub)
                     slots, pool = build_hub_workspace(config)
                     channels = build_hub_channels(config)
                     rows = [*slots, *pool]
@@ -2993,7 +3470,7 @@ def _hub_workspace(
                 status = replace(refreshed, healthy=status.healthy)
         elif ch == ord("a") and tab == "channels":
             try:
-                updated = _hub_add_channel_wizard(win)
+                updated = _hub_add_channel_wizard(win, hub=hub)
             except ValueError as exc:
                 notice = str(exc)
                 updated = None
@@ -3015,7 +3492,7 @@ def _hub_workspace(
             if not _confirm(win, f"删除 Hub 渠道 {item.alias}?"):
                 continue
             try:
-                config = remove_hub_channel(item.alias)
+                config = remove_hub_channel(item.alias, hub=hub)
             except ValueError as exc:
                 notice = str(exc)
             except (OSError, json.JSONDecodeError):
@@ -3030,15 +3507,18 @@ def _hub_workspace(
         elif ch in (10, 13, curses.KEY_ENTER):
             item = rows[idx]
             if isinstance(item, HubSlotOption):
-                return ("launch", HubLaunch(slot=item.slot))
+                return ("launch", HubLaunch(slot=item.slot, hub_id=hub_id))
             if isinstance(item, HubChannel):
                 _status, all_options = build_hub_view(config)
                 selector = f"{item.alias},{item.models[0]}"
                 option = next(
                     option for option in all_options if option.selector == selector
                 )
-                return ("launch", HubLaunch(option=option))
-            return ("launch", HubLaunch(option=item))
+                return (
+                    "launch",
+                    HubLaunch(option=option, hub_id=hub_id),
+                )
+            return ("launch", HubLaunch(option=item, hub_id=hub_id))
         elif ch == 27:
             return ("back", None)
         elif ch == ord("q"):
@@ -3046,7 +3526,15 @@ def _hub_workspace(
         else:
             continue
         tab_indices[tab] = idx
-        _draw_hub_workspace(win, status, rows, idx, tab, notice)
+        _draw_hub_workspace(
+            win,
+            status,
+            rows,
+            idx,
+            tab,
+            notice,
+            hub_name=hub_name,
+        )
 
 
 def _launcher_main(win, cfg, db_ids):
@@ -3064,26 +3552,26 @@ def _launcher_main(win, cfg, db_ids):
     show_hidden = False
     view = _build_view(cfg, db_ids, mru, show_hidden)
     idx = _initial_index(view, mru)
-    hub_state = _load_hub_launcher_state()
-    hub_status = hub_state.status if hub_state is not None else None
-    hub_options = list(hub_state.options) if hub_state is not None else []
-    hub_slots = list(hub_state.slots) if hub_state is not None else []
-    hub_focus = hub_state is not None
-    hub_slot_idx = next(
-        (
-            index
-            for index, slot in enumerate(hub_slots)
-            if hub_status is not None and slot.slot == hub_status.launch_slot
-        ),
-        0,
-    )
+    hubs = _load_named_hub_launcher_states()
+    hub_focus = bool(hubs)
+    hub_idx = 0
+    if HUB_CATALOG_ENABLED and hubs:
+        try:
+            default_id = load_hub_catalog(migrate=True)["default_hub"]
+            hub_idx = next(
+                index
+                for index, named in enumerate(hubs)
+                if named.hub.hub_id == default_id
+            )
+        except (OSError, ValueError, json.JSONDecodeError, StopIteration):
+            hub_idx = 0
     help_open = False
     notice: str | None = None
     rows, cols = win.getmaxyx()
     intro_animate = (
         _animation_enabled()
         and _large_logo_supported(rows, cols)
-        and (not hub_slots or rows >= 21)
+        and (not hubs or rows >= 21)
     )
     pending_key = _intro(win) if intro_animate else None
     # The logo motion is a finite entrance, not a background task. Keep the
@@ -3097,10 +3585,9 @@ def _launcher_main(win, cfg, db_ids):
         show_hidden,
         mru,
         show_brand=True,
-        hub_status=hub_status,
         hub_focus=hub_focus,
-        hub_slots=hub_slots,
-        hub_slot_idx=hub_slot_idx,
+        hubs=hubs,
+        hub_idx=hub_idx,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -3109,9 +3596,6 @@ def _launcher_main(win, cfg, db_ids):
             # timeout(-1) returning -1 means the controlling terminal closed.
             return None
         notice = None
-        controls_expanded = _home_hub_controls_expanded(
-            *win.getmaxyx(), hub_slots
-        )
         direct_index = _digit_index(ch)
         if direct_index is not None:
             if direct_index < len(view):
@@ -3119,91 +3603,103 @@ def _launcher_main(win, cfg, db_ids):
             notice = f"没有第 {direct_index + 1} 个渠道"
         if ch in (curses.KEY_UP, ord("k")):
             if hub_focus:
-                if controls_expanded and hub_slot_idx > 0:
-                    hub_slot_idx -= 1
-            elif hub_status is not None:
+                if hub_idx > 0:
+                    hub_idx -= 1
+            elif hubs:
                 if idx <= 0:
                     hub_focus = True
-                    hub_slot_idx = len(hub_slots) - 1 if controls_expanded else 0
+                    hub_idx = len(hubs) - 1
                 else:
                     idx -= 1
             elif view:
                 idx = (idx - 1) % len(view)
         elif ch in (curses.KEY_DOWN, ord("j")):
             if hub_focus:
-                if controls_expanded and hub_slot_idx < len(hub_slots) - 1:
-                    hub_slot_idx += 1
+                if hub_idx < len(hubs) - 1:
+                    hub_idx += 1
                 else:
                     hub_focus = False
                     idx = 0
-            elif hub_status is not None:
+            elif hubs:
                 if view and idx < len(view) - 1:
                     idx += 1
             elif view:
                 idx = (idx + 1) % len(view)
-        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("e")) and hub_focus:
-            if not hub_slots:
-                continue
-            item = hub_slots[hub_slot_idx]
-            direction = -1 if ch == curses.KEY_LEFT else 1
+        elif (
+            ch == ord("a")
+            and hub_focus
+            and hubs
+            and not HUB_CATALOG_ENABLED
+        ):
             try:
-                updated = cycle_hub_slot_effort(
-                    item.slot,
-                    item.effort,
-                    direction,
-                )
-                hub_state = build_hub_launcher_state(updated)
+                updated = _hub_add_channel_wizard(win)
             except ValueError as exc:
                 notice = str(exc)
-                hub_state = _load_hub_launcher_state()
-            except (OSError, json.JSONDecodeError):
-                notice = "Hub 配置保存失败"
-                hub_state = _load_hub_launcher_state()
-            if hub_state is not None:
-                hub_status = hub_state.status
-                hub_options = list(hub_state.options)
-                hub_slots = list(hub_state.slots)
-                hub_slot_idx = next(
-                    (
-                        index
-                        for index, slot in enumerate(hub_slots)
-                        if slot.slot == item.slot
-                    ),
-                    0,
-                )
-        elif ch == ord("a"):
-            if hub_focus and hub_status is not None:
-                selected_slot = (
-                    hub_slots[hub_slot_idx].slot if hub_slots else None
-                )
+                updated = None
+            except (
+                OSError,
+                RuntimeError,
+                json.JSONDecodeError,
+                sqlite3.Error,
+            ):
+                notice = "Hub 渠道添加失败"
+                updated = None
+            if updated is not None:
+                hubs = _load_named_hub_launcher_states()
+                hub_idx = 0
+                notice = "Hub 渠道已添加"
+        elif ch in (ord("a"), ord("n")) and hub_focus and hubs:
+            source = hubs[hub_idx].hub
+            name = _prompt_named_hub(
+                win,
+                "新增 Hub 工作区",
+                "",
+                f"复制 {source.name} 的渠道、四槽与 effort；端口和进程独立",
+            )
+            if name:
                 try:
-                    updated = _hub_add_channel_wizard(win)
-                except ValueError as exc:
-                    notice = str(exc)
-                    updated = None
+                    created = clone_named_hub(source, name)
+                    hubs = _load_named_hub_launcher_states()
+                    hub_idx = next(
+                        index
+                        for index, named in enumerate(hubs)
+                        if named.hub.hub_id == created.hub_id
+                    )
+                    notice = f"已新增 Hub：{created.name}"
                 except (
                     OSError,
-                    RuntimeError,
+                    ValueError,
                     json.JSONDecodeError,
-                    sqlite3.Error,
-                ):
-                    notice = "Hub 渠道添加失败"
-                    updated = None
-                if updated is not None:
-                    hub_state = build_hub_launcher_state(updated)
-                    hub_status = hub_state.status
-                    hub_options = list(hub_state.options)
-                    hub_slots = list(hub_state.slots)
-                    hub_slot_idx = next(
-                        (
-                            index
-                            for index, slot in enumerate(hub_slots)
-                            if slot.slot == selected_slot
-                        ),
-                        0,
+                    StopIteration,
+                ) as exc:
+                    notice = str(exc)
+        elif ch == ord("r") and hub_focus and hubs:
+            selected = hubs[hub_idx].hub
+            name = _prompt_named_hub(
+                win,
+                "重命名 Hub",
+                selected.name,
+                "只修改显示名；稳定 ID、配置、端口和运行身份保持不变",
+            )
+            if name and name != selected.name:
+                try:
+                    renamed = rename_named_hub(selected.hub_id, name)
+                    hubs = _load_named_hub_launcher_states()
+                    hub_idx = next(
+                        index
+                        for index, named in enumerate(hubs)
+                        if named.hub.hub_id == renamed.hub_id
                     )
-                    notice = "Hub 渠道已添加"
-            elif view:
+                    notice = f"已重命名为 {renamed.name}"
+                except (
+                    OSError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    StopIteration,
+                ) as exc:
+                    notice = str(exc)
+        elif ch == ord("a") and not hub_focus:
+            if view:
                 provider_id = view[idx]
                 previous_alias = meta[provider_id].get("alias")
                 had_alias = "alias" in meta[provider_id]
@@ -3238,47 +3734,38 @@ def _launcher_main(win, cfg, db_ids):
         elif ch == ord("?"):
             help_open = not help_open
         elif ch in (10, 13, curses.KEY_ENTER):
-            if hub_focus and hub_status is not None:
-                selected_slot = (
-                    hub_slots[hub_slot_idx].slot
-                    if controls_expanded and hub_slots
-                    else hub_status.launch_slot
+            if hub_focus and hubs:
+                named = hubs[hub_idx]
+                return HubLaunch(
+                    slot=named.state.status.launch_slot,
+                    hub_id=(named.hub.hub_id if HUB_CATALOG_ENABLED else None),
                 )
-                return HubLaunch(slot=selected_slot)
             elif view:
                 return view[idx]
-        elif ch in (ord("\t"), ord("m")) and hub_focus and hub_status is not None:
-            selected_slot = (
-                hub_slots[hub_slot_idx].slot if hub_slots else hub_status.launch_slot
-            )
+        elif ch in (ord("\t"), ord("m"), curses.KEY_RIGHT) and hub_focus and hubs:
+            named = hubs[hub_idx]
             outcome, launch = _hub_workspace(
                 win,
-                hub_status,
-                hub_options,
-                initial_slot=selected_slot,
+                named.state.status,
+                list(named.state.options),
+                initial_slot=named.state.status.launch_slot,
+                hub=named.hub if HUB_CATALOG_ENABLED else None,
             )
             if outcome == "launch" and launch is not None:
                 return launch
             if outcome == "quit":
                 return None
             # "back": refresh mutations made in the workspace before redraw.
-            refreshed_hub_state = _load_hub_launcher_state()
-            if refreshed_hub_state is not None:
-                selected_slot = (
-                    hub_slots[hub_slot_idx].slot if hub_slots else None
-                )
-                hub_state = refreshed_hub_state
-                hub_status = hub_state.status
-                hub_options = list(hub_state.options)
-                hub_slots = list(hub_state.slots)
-                hub_slot_idx = next(
-                    (
-                        index
-                        for index, slot in enumerate(hub_slots)
-                        if slot.slot == selected_slot
-                    ),
-                    0,
-                )
+            selected_id = named.hub.hub_id
+            hubs = _load_named_hub_launcher_states()
+            hub_idx = next(
+                (
+                    index
+                    for index, item in enumerate(hubs)
+                    if item.hub.hub_id == selected_id
+                ),
+                0,
+            )
         elif ch in (27, ord("q")):
             return None
         idx = 0 if not view else max(0, min(idx, len(view) - 1))
@@ -3292,10 +3779,9 @@ def _launcher_main(win, cfg, db_ids):
             show_brand=True,
             help_open=help_open,
             notice=notice,
-            hub_status=hub_status,
             hub_focus=hub_focus,
-            hub_slots=hub_slots,
-            hub_slot_idx=hub_slot_idx,
+            hubs=hubs,
+            hub_idx=hub_idx,
         )
 
 
@@ -3334,10 +3820,20 @@ def run_tui_launcher():
         return ("quit", None)
     if isinstance(result, HubLaunch):
         if result.slot is not None:
-            return ("hub-slot", result.slot)
+            payload = (
+                (result.hub_id, result.slot)
+                if result.hub_id is not None
+                else result.slot
+            )
+            return ("hub-slot", payload)
         if result.option is None:
             raise RuntimeError("Hub 启动结果缺少槽位或模型")
-        return ("hub", result.option.selector)
+        payload = (
+            (result.hub_id, result.option.selector)
+            if result.hub_id is not None
+            else result.option.selector
+        )
+        return ("hub", payload)
     return ("launch", result)
 
 
@@ -3821,18 +4317,21 @@ def _hub_effort_capabilities(effort_level: str | None) -> str:
     return ",".join(capabilities)
 
 
-def exec_hub(claude_args: list[str]) -> int:
+def exec_hub(
+    claude_args: list[str],
+    *,
+    hub_id: str | None = None,
+) -> int:
     """Launch one Claude session through the isolated multi-channel hub."""
     requested_model, claude_args = _extract_hub_model(claude_args)
     requested_slot, claude_args = _extract_hub_slot(claude_args)
     if requested_model is not None and requested_slot is not None:
         raise RuntimeError("hub --model 与 --slot 不能同时指定")
-    if not HUB_CONFIG.is_file():
-        raise RuntimeError(f"hub 配置不存在: {HUB_CONFIG}")
     try:
-        hub_cfg = load_hub_config(migrate=True)
+        hub_ref = resolve_hub_ref(hub_id, migrate=True)
+        hub_cfg = load_hub_config(migrate=True, hub=hub_ref)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"hub 配置无法读取: {HUB_CONFIG}: {exc}") from exc
+        raise RuntimeError(f"hub 配置无法读取: {exc}") from exc
 
     port = _hub_port(hub_cfg)
     token_env = _hub_token_env_name(hub_cfg)
@@ -3877,7 +4376,18 @@ def exec_hub(claude_args: list[str]) -> int:
             selected_slot = launch_slot
             main_model = slot_models[launch_slot.upper()]
     effort_level = efforts[selected_slot] if selected_slot is not None else "high"
-    ensure_hub(port, token=token, token_env=token_env)
+    instance_id = hub_cfg.get("instance_id")
+    runtime_hub = hub_ref if HUB_CATALOG_ENABLED else None
+    if runtime_hub is None and not isinstance(instance_id, str):
+        ensure_hub(port, token=token, token_env=token_env)
+    else:
+        ensure_hub(
+            port,
+            token=token,
+            token_env=token_env,
+            hub=runtime_hub,
+            instance_id=instance_id if isinstance(instance_id, str) else None,
+        )
     settings_env = {
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
         "ANTHROPIC_AUTH_TOKEN": token,
@@ -3898,10 +4408,10 @@ def exec_hub(claude_args: list[str]) -> int:
     _seal_model_slots(settings_env)
     settings = {"env": settings_env}
     settings["effortLevel"] = effort_level
-    record_backend("hub")
+    record_backend("hub", hub_ref.hub_id)
     aliases = ", ".join(str(alias) for alias in channels)
     print(
-        f"[claude1] 后端: hub (127.0.0.1:{port}, 默认 {main_model})"
+        f"[claude1] 后端: {hub_ref.name} (127.0.0.1:{port}, 默认 {main_model})"
     )
     print(f"[claude1] 会话内切渠道: /model 别名,模型   渠道: {aliases}")
     return launch_with_settings(settings, claude_args)
@@ -4265,7 +4775,20 @@ def cli_usage(args: list[str]) -> int:
         return 2
     mode, span = parsed
     now = time.time()
-    rows = _load_usage_rows(HUB_USAGE, now - span)
+    usage_paths = [HUB_USAGE]
+    if HUB_CATALOG_ENABLED and HUB_CATALOG.is_file():
+        try:
+            usage_paths = [
+                hub.usage_path for hub in list_hub_refs(migrate=False)
+            ]
+        except (OSError, ValueError, json.JSONDecodeError):
+            usage_paths = [HUB_USAGE]
+    rows = [
+        row
+        for usage_path in usage_paths
+        for row in _load_usage_rows(usage_path, now - span)
+    ]
+    rows.sort(key=lambda row: float(row.get("ts", 0)))
     if not rows:
         print(
             "claude1: 还没有经过 hub 的用量记录。\n"
@@ -4520,8 +5043,20 @@ def main(argv: list[str]) -> int:
             print("Bye，欢迎下次使用 claude1。")
             return 0
         elif action == "hub":
+            if isinstance(payload, tuple):
+                selected_hub, selector = payload
+                return exec_hub(
+                    ["--model", selector, *claude_args],
+                    hub_id=selected_hub,
+                )
             return exec_hub(["--model", payload, *claude_args])
         elif action == "hub-slot":
+            if isinstance(payload, tuple):
+                selected_hub, slot = payload
+                return exec_hub(
+                    ["--slot", slot, *claude_args],
+                    hub_id=selected_hub,
+                )
             return exec_hub(["--slot", payload, *claude_args])
         else:
             selected = provider_by_id(payload)
