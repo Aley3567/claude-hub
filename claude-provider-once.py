@@ -1264,6 +1264,29 @@ def mutate_hub_config(mutator) -> dict:
         return normalized
 
 
+def cycle_hub_slot_effort(
+    slot: str,
+    expected_effort: str,
+    direction: int,
+) -> dict:
+    """Cycle one slot with compare-and-swap protection across TUI surfaces."""
+    if slot not in HUB_SLOT_ORDER or expected_effort not in HUB_EFFORT_LEVELS:
+        raise ValueError("hub 槽位 effort 无效")
+    if direction not in (-1, 1):
+        raise ValueError("effort direction 必须是 -1 或 1")
+    current_index = HUB_EFFORT_LEVELS.index(expected_effort)
+    next_effort = HUB_EFFORT_LEVELS[
+        (current_index + direction) % len(HUB_EFFORT_LEVELS)
+    ]
+
+    def set_effort(latest: dict) -> None:
+        if latest["effort_by_slot"][slot] != expected_effort:
+            raise ValueError("槽位 effort 已被另一窗口修改，请重试")
+        latest["effort_by_slot"][slot] = next_effort
+
+    return mutate_hub_config(set_effort)
+
+
 def add_hub_channel(
     provider: dict,
     *,
@@ -1425,6 +1448,15 @@ class HubSlotOption:
     option: HubModelOption
 
 
+@dataclass(frozen=True)
+class HubLauncherState:
+    """One coherent config snapshot shared by the home and workspace views."""
+
+    status: HubStatus
+    options: tuple[HubModelOption, ...]
+    slots: tuple[HubSlotOption, ...]
+
+
 def build_hub_workspace(
     hub_cfg: dict,
 ) -> tuple[list[HubSlotOption], list[HubModelOption]]:
@@ -1538,19 +1570,33 @@ def build_hub_view(hub_cfg: dict) -> tuple[HubStatus, list[HubModelOption]]:
     return status, ordered
 
 
+def build_hub_launcher_state(hub_cfg: dict) -> HubLauncherState:
+    """Build all launcher-facing Hub rows from one normalized config snapshot."""
+    config = normalize_hub_config(hub_cfg)
+    status, options = build_hub_view(config)
+    slots, _pool = build_hub_workspace(config)
+    return HubLauncherState(status, tuple(options), tuple(slots))
+
+
+def _load_hub_launcher_state() -> HubLauncherState | None:
+    if not HUB_CONFIG.is_file():
+        return None
+    try:
+        return build_hub_launcher_state(load_hub_config(migrate=True))
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+        return None
+
+
 def _load_hub_view() -> tuple[HubStatus, list[HubModelOption]] | None:
     """Read HUB_CONFIG for the launcher; return None when hub is unavailable.
 
     A missing/invalid config (or missing uv) must never break plain provider
     selection, so any failure degrades silently to “no hub entry”.
     """
-    if not HUB_CONFIG.is_file():
+    state = _load_hub_launcher_state()
+    if state is None:
         return None
-    try:
-        hub_cfg = load_hub_config(migrate=True)
-        return build_hub_view(hub_cfg)
-    except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
-        return None
+    return state.status, list(state.options)
 
 
 # ---------------------------------------------------------------------------
@@ -1797,12 +1843,18 @@ def _logo_intensity(phase: int, breathing: bool) -> int:
     return 0
 
 
-def _draw_logo(win, phase: int, *, breathing: bool = False) -> None:
+def _draw_logo(
+    win,
+    phase: int,
+    *,
+    breathing: bool = False,
+    force_compact: bool = False,
+) -> None:
     """Flow the logo palette and optionally pulse its brightness."""
     n = len(_logo_pairs) or 1
     h, w = win.getmaxyx()
     intensity = _logo_intensity(phase, breathing)
-    if _large_logo_supported(h, w):
+    if not force_compact and _large_logo_supported(h, w):
         limit = w - 1
         for row, column, char in _LOGO_CELLS:
             x = 2 + column
@@ -2031,6 +2083,26 @@ def _provider_meta_label(meta: dict, provider_id: str) -> str:
     return name
 
 
+def _home_hub_controls_expanded(
+    rows: int,
+    cols: int,
+    hub_slots: tuple[HubSlotOption, ...] | list[HubSlotOption],
+) -> bool:
+    """Keep four visible slots only when at least one provider row still fits."""
+    if len(hub_slots) != len(HUB_SLOT_ORDER):
+        return False
+    large_logo = _large_logo_supported(rows, cols) and rows >= 21
+    head = _LOGO_TOP + len(LOGO) if large_logo else 1
+    list_top = head + 4 + 7  # section label + 4 slots + spacer + provider label
+    return max(0, rows - 1 - list_top) >= 1
+
+
+def _hub_home_slot_text(slot: HubSlotOption, status: HubStatus, width: int) -> str:
+    left = f"{slot.slot.title():<7} {slot.selector}"
+    right = slot.effort + (" · 默认" if slot.slot == status.launch_slot else "")
+    return _compose_row(left, right, width)
+
+
 def _draw_launcher(
     win,
     cfg,
@@ -2046,18 +2118,28 @@ def _draw_launcher(
     logo_breathing: bool = False,
     hub_status: "HubStatus | None" = None,
     hub_focus: bool = False,
+    hub_slots: tuple[HubSlotOption, ...] | list[HubSlotOption] = (),
+    hub_slot_idx: int = 0,
 ) -> None:
     meta = cfg["providers"]
     win.erase()
     h, w = win.getmaxyx()
-    big = _large_logo_supported(h, w)
+    expanded_hub = (
+        hub_status is not None and _home_hub_controls_expanded(h, w, hub_slots)
+    )
+    big = _large_logo_supported(h, w) and (not expanded_hub or h >= 21)
 
     if show_brand and big:
         _addstr(win, 0, 2, "欢迎回来", C.get("pink", 0) | curses.A_BOLD)
         _draw_logo(win, logo_phase, breathing=logo_breathing)
         head = _LOGO_TOP + len(LOGO)
     elif show_brand:
-        _draw_logo(win, logo_phase, breathing=logo_breathing)
+        _draw_logo(
+            win,
+            logo_phase,
+            breathing=logo_breathing,
+            force_compact=True,
+        )
         head = 1
     else:
         _addstr(
@@ -2081,41 +2163,65 @@ def _draw_launcher(
         )
     guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
     if hub_status is not None and not notice:
-        guide = "↑↓ / jk 移动 · Enter 直启 Hub / 启动渠道 · → 管理 Hub · 数字直达渠道"
+        guide = (
+            "↑↓ 槽位/渠道 · Enter 启动 · ←/→ effort · a 新增渠道"
+            " · Tab/m 完整管理"
+        )
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
     _addstr(win, head + 2, 2, guide, guide_attr)
     row_cursor = head + 4
     if hub_status is not None:
-        footer_row = max(0, h - 1)
-        compact_hub = footer_row - (row_cursor + 4) < 1
-        if not compact_hub:
-            _addstr(win, row_cursor, 2, "多渠道会话", C.get("dim", 0))
-            row_cursor += 1
-        entry = (
-            f"◆ Claude-Hub · 多渠道会话 · {hub_status.summary}"
-            " · 会话内 /model 切换"
-        )
-        entry_width = max(0, w - 4)
-        if hub_focus:
+        if expanded_hub:
             _addstr(
                 win,
                 row_cursor,
                 2,
-                _pad_display(entry, entry_width),
-                C.get("sel", curses.A_REVERSE),
+                "Claude-Hub · 首页可调",
+                C.get("dim", 0),
             )
-        else:
-            _addstr(
-                win,
-                row_cursor,
-                2,
-                _truncate_display(entry, entry_width),
-                C.get("orange", 0) | curses.A_BOLD,
-            )
-        row_cursor += 1
-        if not compact_hub:
             row_cursor += 1
+            row_width = max(0, w - 4)
+            for slot_index, slot in enumerate(hub_slots):
+                selected = hub_focus and slot_index == hub_slot_idx
+                marker = "▸" if selected else " "
+                text = marker + " " + _hub_home_slot_text(
+                    slot,
+                    hub_status,
+                    max(0, row_width - 2),
+                )
+                attr = (
+                    C.get("sel", curses.A_REVERSE)
+                    if selected
+                    else C.get(_HUB_FAMILY_COLOR.get(slot.option.family, "violet"), 0)
+                    | curses.A_BOLD
+                )
+                _addstr(
+                    win,
+                    row_cursor + slot_index,
+                    2,
+                    _pad_display(text, row_width) if selected else text,
+                    attr,
+                )
+            row_cursor += len(hub_slots) + 1
             _addstr(win, row_cursor, 2, "单渠道直连", C.get("dim", 0))
+            row_cursor += 1
+        else:
+            entry = (
+                f"◆ Claude-Hub · {hub_status.summary}"
+                " · a 新增 · Tab 管理"
+            )
+            entry_width = max(0, w - 4)
+            attr = (
+                C.get("sel", curses.A_REVERSE)
+                if hub_focus
+                else C.get("orange", 0) | curses.A_BOLD
+            )
+            rendered = (
+                _pad_display(entry, entry_width)
+                if hub_focus
+                else _truncate_display(entry, entry_width)
+            )
+            _addstr(win, row_cursor, 2, rendered, attr)
             row_cursor += 1
     list_top = row_cursor
     footer_row = max(0, h - 1)
@@ -2165,8 +2271,12 @@ def _draw_launcher(
             )
             _addstr(win, row, 2, line, attr)
 
-    if help_open:
+    if help_open and hub_focus and hub_status is not None:
+        foot = "Hub 首页：Enter 启动 · a 新增 · effort 可调 · Tab/m 管理 · ? 返回"
+    elif help_open:
         foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+    elif hub_focus and hub_status is not None:
+        foot = "Hub · a 新增渠道 · ←/→/e effort · Tab/m 完整管理 · q 退出"
     else:
         visible_range = ""
         if start > 0 or end < len(view):
@@ -2501,6 +2611,7 @@ def _hub_workspace(
     win,
     status: "HubStatus",
     options: list["HubModelOption"],
+    initial_slot: str | None = None,
 ) -> tuple[str, "HubLaunch | None"]:
     """Run the Hub model picker loop.
 
@@ -2514,8 +2625,9 @@ def _hub_workspace(
     channels = build_hub_channels(config)
     tab = "slots"
     rows: list[HubSlotOption | HubModelOption | HubChannel] = [*slots, *pool]
+    initial_slot = initial_slot if initial_slot in HUB_SLOT_ORDER else status.launch_slot
     idx = next(
-        (index for index, item in enumerate(slots) if item.slot == status.launch_slot),
+        (index for index, item in enumerate(slots) if item.slot == initial_slot),
         0,
     )
     tab_indices = {"slots": idx, "channels": 0}
@@ -2543,18 +2655,12 @@ def _hub_workspace(
             if not isinstance(item, HubSlotOption):
                 continue
             direction = -1 if ch == curses.KEY_LEFT else 1
-            current_index = HUB_EFFORT_LEVELS.index(item.effort)
-            next_effort = HUB_EFFORT_LEVELS[
-                (current_index + direction) % len(HUB_EFFORT_LEVELS)
-            ]
-
-            def set_effort(latest: dict) -> None:
-                if latest["effort_by_slot"][item.slot] != item.effort:
-                    raise ValueError("槽位 effort 已被另一窗口修改，请重试")
-                latest["effort_by_slot"][item.slot] = next_effort
-
             try:
-                config = mutate_hub_config(set_effort)
+                config = cycle_hub_slot_effort(
+                    item.slot,
+                    item.effort,
+                    direction,
+                )
             except ValueError as exc:
                 notice = str(exc)
                 try:
@@ -2705,13 +2811,27 @@ def _launcher_main(win, cfg, db_ids):
     show_hidden = False
     view = _build_view(cfg, db_ids, mru, show_hidden)
     idx = _initial_index(view, mru)
-    hub_view = _load_hub_view()
-    hub_status, hub_options = hub_view if hub_view is not None else (None, [])
-    hub_focus = hub_view is not None
+    hub_state = _load_hub_launcher_state()
+    hub_status = hub_state.status if hub_state is not None else None
+    hub_options = list(hub_state.options) if hub_state is not None else []
+    hub_slots = list(hub_state.slots) if hub_state is not None else []
+    hub_focus = hub_state is not None
+    hub_slot_idx = next(
+        (
+            index
+            for index, slot in enumerate(hub_slots)
+            if hub_status is not None and slot.slot == hub_status.launch_slot
+        ),
+        0,
+    )
     help_open = False
     notice: str | None = None
     rows, cols = win.getmaxyx()
-    intro_animate = _animation_enabled() and _large_logo_supported(rows, cols)
+    intro_animate = (
+        _animation_enabled()
+        and _large_logo_supported(rows, cols)
+        and (not hub_slots or rows >= 21)
+    )
     pending_key = _intro(win) if intro_animate else None
     # The logo motion is a finite entrance, not a background task. Keep the
     # finished logo visible while blocking indefinitely with zero timer wakeups.
@@ -2726,6 +2846,8 @@ def _launcher_main(win, cfg, db_ids):
         show_brand=True,
         hub_status=hub_status,
         hub_focus=hub_focus,
+        hub_slots=hub_slots,
+        hub_slot_idx=hub_slot_idx,
     )
     while True:
         ch = pending_key if pending_key is not None else win.getch()
@@ -2734,6 +2856,9 @@ def _launcher_main(win, cfg, db_ids):
             # timeout(-1) returning -1 means the controlling terminal closed.
             return None
         notice = None
+        controls_expanded = _home_hub_controls_expanded(
+            *win.getmaxyx(), hub_slots
+        )
         direct_index = _digit_index(ch)
         if direct_index is not None:
             if direct_index < len(view):
@@ -2741,25 +2866,91 @@ def _launcher_main(win, cfg, db_ids):
             notice = f"没有第 {direct_index + 1} 个渠道"
         if ch in (curses.KEY_UP, ord("k")):
             if hub_focus:
-                pass
+                if controls_expanded and hub_slot_idx > 0:
+                    hub_slot_idx -= 1
             elif hub_status is not None:
                 if idx <= 0:
                     hub_focus = True
+                    hub_slot_idx = len(hub_slots) - 1 if controls_expanded else 0
                 else:
                     idx -= 1
             elif view:
                 idx = (idx - 1) % len(view)
         elif ch in (curses.KEY_DOWN, ord("j")):
             if hub_focus:
-                hub_focus = False
-                idx = 0
+                if controls_expanded and hub_slot_idx < len(hub_slots) - 1:
+                    hub_slot_idx += 1
+                else:
+                    hub_focus = False
+                    idx = 0
             elif hub_status is not None:
                 if view and idx < len(view) - 1:
                     idx += 1
             elif view:
                 idx = (idx + 1) % len(view)
+        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("e")) and hub_focus:
+            if not hub_slots:
+                continue
+            item = hub_slots[hub_slot_idx]
+            direction = -1 if ch == curses.KEY_LEFT else 1
+            try:
+                updated = cycle_hub_slot_effort(
+                    item.slot,
+                    item.effort,
+                    direction,
+                )
+                hub_state = build_hub_launcher_state(updated)
+            except ValueError as exc:
+                notice = str(exc)
+                hub_state = _load_hub_launcher_state()
+            except (OSError, json.JSONDecodeError):
+                notice = "Hub 配置保存失败"
+                hub_state = _load_hub_launcher_state()
+            if hub_state is not None:
+                hub_status = hub_state.status
+                hub_options = list(hub_state.options)
+                hub_slots = list(hub_state.slots)
+                hub_slot_idx = next(
+                    (
+                        index
+                        for index, slot in enumerate(hub_slots)
+                        if slot.slot == item.slot
+                    ),
+                    0,
+                )
         elif ch == ord("a"):
-            if not hub_focus and view:
+            if hub_focus and hub_status is not None:
+                selected_slot = (
+                    hub_slots[hub_slot_idx].slot if hub_slots else None
+                )
+                try:
+                    updated = _hub_add_channel_wizard(win)
+                except ValueError as exc:
+                    notice = str(exc)
+                    updated = None
+                except (
+                    OSError,
+                    RuntimeError,
+                    json.JSONDecodeError,
+                    sqlite3.Error,
+                ):
+                    notice = "Hub 渠道添加失败"
+                    updated = None
+                if updated is not None:
+                    hub_state = build_hub_launcher_state(updated)
+                    hub_status = hub_state.status
+                    hub_options = list(hub_state.options)
+                    hub_slots = list(hub_state.slots)
+                    hub_slot_idx = next(
+                        (
+                            index
+                            for index, slot in enumerate(hub_slots)
+                            if slot.slot == selected_slot
+                        ),
+                        0,
+                    )
+                    notice = "Hub 渠道已添加"
+            elif view:
                 provider_id = view[idx]
                 previous_alias = meta[provider_id].get("alias")
                 had_alias = "alias" in meta[provider_id]
@@ -2786,7 +2977,7 @@ def _launcher_main(win, cfg, db_ids):
                     else:
                         meta[provider_id]["hidden"] = nowh
                         notice = "无法保存隐藏状态，已撤销本次修改"
-        elif ch == ord("h"):  # 切换「显示隐藏项」
+        elif ch == ord("h") and not hub_focus:  # 切换「显示隐藏项」
             preferred = view[idx] if view else None
             show_hidden = not show_hidden
             view = _build_view(cfg, db_ids, mru, show_hidden)
@@ -2795,19 +2986,46 @@ def _launcher_main(win, cfg, db_ids):
             help_open = not help_open
         elif ch in (10, 13, curses.KEY_ENTER):
             if hub_focus and hub_status is not None:
-                return HubLaunch(slot=hub_status.launch_slot)
+                selected_slot = (
+                    hub_slots[hub_slot_idx].slot
+                    if controls_expanded and hub_slots
+                    else hub_status.launch_slot
+                )
+                return HubLaunch(slot=selected_slot)
             elif view:
                 return view[idx]
-        elif ch == curses.KEY_RIGHT and hub_focus and hub_status is not None:
-            outcome, launch = _hub_workspace(win, hub_status, hub_options)
+        elif ch in (ord("\t"), ord("m")) and hub_focus and hub_status is not None:
+            selected_slot = (
+                hub_slots[hub_slot_idx].slot if hub_slots else hub_status.launch_slot
+            )
+            outcome, launch = _hub_workspace(
+                win,
+                hub_status,
+                hub_options,
+                initial_slot=selected_slot,
+            )
             if outcome == "launch" and launch is not None:
                 return launch
             if outcome == "quit":
                 return None
             # "back": refresh mutations made in the workspace before redraw.
-            refreshed_hub_view = _load_hub_view()
-            if refreshed_hub_view is not None:
-                hub_status, hub_options = refreshed_hub_view
+            refreshed_hub_state = _load_hub_launcher_state()
+            if refreshed_hub_state is not None:
+                selected_slot = (
+                    hub_slots[hub_slot_idx].slot if hub_slots else None
+                )
+                hub_state = refreshed_hub_state
+                hub_status = hub_state.status
+                hub_options = list(hub_state.options)
+                hub_slots = list(hub_state.slots)
+                hub_slot_idx = next(
+                    (
+                        index
+                        for index, slot in enumerate(hub_slots)
+                        if slot.slot == selected_slot
+                    ),
+                    0,
+                )
         elif ch in (27, ord("q")):
             return None
         idx = 0 if not view else max(0, min(idx, len(view) - 1))
@@ -2823,6 +3041,8 @@ def _launcher_main(win, cfg, db_ids):
             notice=notice,
             hub_status=hub_status,
             hub_focus=hub_focus,
+            hub_slots=hub_slots,
+            hub_slot_idx=hub_slot_idx,
         )
 
 
@@ -3443,6 +3663,7 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 
 快捷键:
   ↑↓ / jk 移动 · Enter 启动 · 1–9/0 数字直达 · ? 更多操作 · q 退出
+  Hub 首页：←/→/e effort · a 新增渠道 · Tab/m 完整管理
 
 默认启动只影响本次会话，不修改普通 claude 或 CC Switch 当前渠道。
 """

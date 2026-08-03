@@ -2382,14 +2382,39 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(result.slot, "fable")
                 self.assertIsNone(result.option)
 
-    def test_right_opens_slots_and_enter_preserves_the_selected_slot(self) -> None:
+    def test_home_arrow_navigation_selects_and_launches_each_hub_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            with loaded_launcher(env) as launcher:
+                result = self._run_home(launcher, [ord("j"), 10])
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.slot, "opus")
+
+    def test_home_effort_key_updates_the_selected_hub_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            with loaded_launcher(env) as launcher:
+                self._run_home(launcher, [ord("j"), ord("e"), ord("q")])
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["effort_by_slot"]["opus"], "xhigh")
+            self.assertEqual(persisted["effort_by_slot"]["fable"], "xhigh")
+
+    def test_tab_opens_slots_and_enter_preserves_the_selected_slot(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
             config = Path(env["CLAUDE1_HUB_CONFIG"])
             config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
             with loaded_launcher(env) as launcher:
                 result = self._run_home(
-                    launcher, [launcher.curses.KEY_RIGHT, ord("j"), 10]
+                    launcher, [ord("\t"), ord("j"), 10]
                 )
             self.assertIsInstance(result, launcher.HubLaunch)
             self.assertEqual(result.slot, "opus")
@@ -2404,7 +2429,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 result = self._run_home(
                     launcher,
                     [
-                        launcher.curses.KEY_RIGHT,
+                        ord("\t"),
                         ord("j"),
                         ord("\t"),
                         ord("\t"),
@@ -2425,7 +2450,7 @@ class HubWorkspaceTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 result = self._run_home(
                     launcher,
-                    [launcher.curses.KEY_RIGHT, ord("e"), 27, ord("q")],
+                    [ord("\t"), ord("e"), 27, ord("q")],
                 )
 
             self.assertIsNone(result)
@@ -2460,7 +2485,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 ):
                     self._run_home(
                         launcher,
-                        [launcher.curses.KEY_RIGHT, ord("e"), ord("e"), 27, ord("q")],
+                        [ord("\t"), ord("e"), ord("e"), 27, ord("q")],
                     )
 
             persisted = json.loads(config.read_text(encoding="utf-8"))
@@ -2474,7 +2499,7 @@ class HubWorkspaceTests(unittest.TestCase):
             with loaded_launcher(env) as launcher:
                 result = self._run_home(
                     launcher,
-                    [launcher.curses.KEY_RIGHT, ord("\t"), 10],
+                    [ord("\t"), ord("\t"), 10],
                 )
 
             self.assertIsInstance(result, launcher.HubLaunch)
@@ -2492,7 +2517,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 result = self._run_home(
                     launcher,
                     [
-                        launcher.curses.KEY_RIGHT,
+                        ord("\t"),
                         ord("j"), ord("j"), ord("j"), ord("j"),
                         ord("b"), ord("h"), ord("y"), 10,
                         27, ord("q"),
@@ -2621,6 +2646,71 @@ class HubWorkspaceTests(unittest.TestCase):
             )
             self.assertIn("Alpha", rendered)
 
+    def test_home_visibly_exposes_all_hub_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            window = ScriptedWindow([ord("q")], size=(30, 120))
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    self.assertIsNone(
+                        launcher._launcher_main(window, cfg, {"alpha-id"})
+                    )
+
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("Claude-Hub · 首页可调", rendered)
+            for label in ("Fable", "Opus", "Sonnet", "Haiku"):
+                self.assertIn(label, rendered)
+            self.assertIn("a 新增渠道", rendered)
+            self.assertIn("Tab/m 完整管理", rendered)
+            self.assertIn("Alpha", rendered)
+
+    def test_expanded_hub_home_uses_compact_logo_in_medium_height_window(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            window = ScriptedWindow([], size=(18, 90))
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher.C = {}
+                launcher._logo_pairs[:] = [0]
+                state = launcher.build_hub_launcher_state(HUB_V2_FIXTURE)
+                launcher._draw_launcher(
+                    window,
+                    cfg,
+                    ["alpha-id"],
+                    0,
+                    False,
+                    {},
+                    hub_status=state.status,
+                    hub_focus=True,
+                    hub_slots=state.slots,
+                )
+
+            rendered_strings = [
+                value
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            ]
+            self.assertIn("◤ claude1 ◢", rendered_strings)
+            self.assertNotIn("█", rendered_strings)
+
     def test_workspace_failure_is_shown_and_home_reloads_after_back(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
@@ -2630,11 +2720,10 @@ class HubWorkspaceTests(unittest.TestCase):
                 [
                     # Enter workspace, Channels, try deleting fallback, then back.
                     # The confirmation consumes y.
-                    261, ord("\t"), ord("d"), ord("y"), 10, 27, ord("q")
+                    ord("\t"), ord("\t"), ord("d"), ord("y"), 10, 27, ord("q")
                 ]
             )
             with loaded_launcher(env) as launcher:
-                window._keys[0] = launcher.curses.KEY_RIGHT
                 cfg = {
                     "providers": {
                         "alpha-id": {"name": "Alpha", "hidden": False}
@@ -2647,8 +2736,10 @@ class HubWorkspaceTests(unittest.TestCase):
                     mock.patch.object(launcher, "load_mru", return_value={}),
                     mock.patch.object(launcher, "hub_healthy", return_value=True),
                     mock.patch.object(
-                        launcher, "_load_hub_view", wraps=launcher._load_hub_view
-                    ) as load_view,
+                        launcher,
+                        "_load_hub_launcher_state",
+                        wraps=launcher._load_hub_launcher_state,
+                    ) as load_state,
                 ):
                     self.assertIsNone(
                         launcher._launcher_main(window, cfg, {"alpha-id"})
@@ -2661,7 +2752,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 if isinstance(value, str)
             )
             self.assertIn("fallback", rendered)
-            self.assertGreaterEqual(load_view.call_count, 2)
+            self.assertGreaterEqual(load_state.call_count, 2)
 
     def test_channels_add_wizard_uses_provider_defaults_and_adds_to_pool(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2685,7 +2776,7 @@ class HubWorkspaceTests(unittest.TestCase):
                     result = self._run_home(
                         launcher,
                         [
-                            launcher.curses.KEY_RIGHT,
+                            ord("\t"),
                             ord("\t"), ord("a"),
                             10,  # provider
                             10,  # generated alias
@@ -2700,6 +2791,43 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertEqual(
                 persisted["channels"]["new-provider"],
                 {"provider": "id:new-provider-id", "models": ["new-model"]},
+            )
+
+    def test_home_add_key_opens_the_channel_wizard_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            provider = {
+                "id": "home-provider-id",
+                "name": "Home Provider",
+                "settings_config": json.dumps(
+                    {"env": {"ANTHROPIC_MODEL": "home-model"}}
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,
+                            10,
+                            10,
+                            ord("p"),
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["home-provider"],
+                {"provider": "id:home-provider-id", "models": ["home-model"]},
             )
 
     def test_channels_add_wizard_prompts_when_api_format_cannot_be_inferred(self) -> None:
@@ -2724,7 +2852,7 @@ class HubWorkspaceTests(unittest.TestCase):
                     self._run_home(
                         launcher,
                         [
-                            launcher.curses.KEY_RIGHT,
+                            ord("\t"),
                             ord("\t"),
                             ord("a"),
                             10,
@@ -2779,7 +2907,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 result = self._run_home(
                     launcher,
                     [
-                        launcher.curses.KEY_RIGHT, ord("\t"),
+                        ord("\t"), ord("\t"),
                         ord("j"), ord("j"), ord("j"), ord("j"),
                         ord("d"), ord("y"), 10,
                         27, ord("q"),
@@ -2795,7 +2923,7 @@ class HubWorkspaceTests(unittest.TestCase):
             env = self._hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 result = self._run_home(
-                    launcher, [launcher.curses.KEY_RIGHT, 27, ord("q")]
+                    launcher, [ord("\t"), 27, ord("q")]
                 )
                 self.assertIsNone(result)
 
