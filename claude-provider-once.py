@@ -144,6 +144,8 @@ class HubRef:
     log_path: Path
     usage_path: Path
     legacy: bool = False
+    state: str = "ready"
+    draft_path: Path | None = None
 
 # Optional local protocol-translation gateway (cliproxyapi). Providers whose
 # configured base URL points here need the gateway alive before Claude starts.
@@ -1473,14 +1475,22 @@ def _hub_ref_from_catalog(catalog: dict, hub_id: str) -> HubRef:
             HUB_CATALOG, entry["usage"]
         ),
         legacy=(hub_id == hub_catalog.LEGACY_HUB_ID),
+        state=entry.get("state", "ready"),
+        draft_path=(
+            hub_catalog.resolve_catalog_path(HUB_CATALOG, entry["draft"])
+            if entry.get("state") == "setup"
+            else None
+        ),
     )
-    for path in (ref.config_path, ref.log_path, ref.usage_path):
+    for path in (ref.config_path, ref.log_path, ref.usage_path, ref.draft_path):
+        if path is None:
+            continue
         _validate_catalog_path_chain(path)
     return ref
 
 
 def list_hub_refs(*, migrate: bool = False) -> list[HubRef]:
-    """Resolve all named Hubs and reject cross-instance port collisions."""
+    """Resolve all named Hubs and validate only the runnable instances."""
     if not HUB_CATALOG_ENABLED:
         return [_legacy_hub_ref()] if HUB_CONFIG.is_file() else []
     try:
@@ -1493,12 +1503,13 @@ def list_hub_refs(*, migrate: bool = False) -> list[HubRef]:
         _hub_ref_from_catalog(catalog, hub_id)
         for hub_id in catalog["order"]
     ]
+    ready_refs = [ref for ref in refs if ref.state == "ready"]
     configs = {
         ref.hub_id: load_hub_config(migrate=migrate, hub=ref)
-        for ref in refs
+        for ref in ready_refs
     }
     hub_catalog.validate_unique_hub_ports(configs)
-    for ref in refs:
+    for ref in ready_refs:
         instance_id = configs[ref.hub_id].get("instance_id")
         if not ref.legacy and instance_id != ref.hub_id:
             raise ValueError(
@@ -1542,8 +1553,82 @@ def _next_hub_port(configs: dict[str, dict], preferred: int) -> int:
     raise ValueError("没有可分配的 Hub 端口")
 
 
-def clone_named_hub(source: HubRef, name: str) -> HubRef:
-    """Create an isolated v2 Hub by cloning one selected workspace."""
+HUB_SETUP_DRAFT_VERSION = 1
+
+
+def normalize_hub_setup_draft(raw: object) -> dict:
+    """Validate the launcher-only mapping draft for one unconfigured Hub."""
+    if not isinstance(raw, dict) or raw.get("version") != HUB_SETUP_DRAFT_VERSION:
+        raise ValueError("不支持的 Hub 首次设置草稿")
+    raw_mappings = raw.get("mappings")
+    if not isinstance(raw_mappings, dict):
+        raise ValueError("Hub 首次设置草稿缺少 mappings")
+    mappings: dict[str, dict] = {}
+    for slot in HUB_SLOT_ORDER:
+        if slot not in raw_mappings:
+            continue
+        mapping = raw_mappings[slot]
+        if not isinstance(mapping, dict):
+            raise ValueError(f"Hub {slot} 映射无效")
+        provider_id = mapping.get("provider_id")
+        alias = mapping.get("alias")
+        model = mapping.get("model")
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            raise ValueError(f"Hub {slot} 映射缺少 provider_id")
+        if not isinstance(alias, str) or re.fullmatch(
+            r"[a-z][a-z0-9_-]*", alias
+        ) is None:
+            raise ValueError(f"Hub {slot} 映射 alias 无效")
+        if (
+            not isinstance(model, str)
+            or not model.strip()
+            or "," in model
+        ):
+            raise ValueError(f"Hub {slot} 映射 model 无效")
+        normalized = {
+            "provider_id": provider_id.strip(),
+            "provider_name": str(mapping.get("provider_name") or provider_id).strip(),
+            "alias": alias,
+            "model": model.strip(),
+        }
+        api_format = mapping.get("api_format")
+        if api_format is not None:
+            if api_format not in {"anthropic", "openai_chat", "openai_responses"}:
+                raise ValueError(f"Hub {slot} 映射 api_format 无效")
+            normalized["api_format"] = api_format
+        mappings[slot] = normalized
+    extra_slots = set(raw_mappings) - set(HUB_SLOT_ORDER)
+    if extra_slots:
+        raise ValueError("Hub 首次设置草稿包含未知槽位")
+    return {"version": HUB_SETUP_DRAFT_VERSION, "mappings": mappings}
+
+
+def _hub_setup_draft_text(draft: dict) -> str:
+    return json.dumps(draft, ensure_ascii=False, indent=2) + "\n"
+
+
+def load_hub_setup_draft(hub: HubRef) -> dict:
+    if hub.state != "setup" or hub.draft_path is None:
+        raise ValueError(f"Hub {hub.name} 不是待配置状态")
+    _validate_catalog_path_chain(hub.draft_path)
+    return normalize_hub_setup_draft(
+        json.loads(_read_regular_text(hub.draft_path, "Hub 首次设置草稿"))
+    )
+
+
+@contextmanager
+def _hub_setup_draft_lock(hub: HubRef):
+    if hub.draft_path is None:
+        raise ValueError(f"Hub {hub.name} 缺少首次设置草稿路径")
+    with _private_file_lock(
+        hub.draft_path.with_name(hub.draft_path.name + ".lock"),
+        "Hub 首次设置草稿",
+    ):
+        yield
+
+
+def create_named_hub(name: str) -> HubRef:
+    """Create a named setup draft without inheriting models or credentials."""
     if not HUB_CATALOG_ENABLED:
         raise ValueError("显式单 Hub 配置模式不支持新增 Hub")
     display_name = hub_catalog.validate_display_name(name)
@@ -1552,57 +1637,52 @@ def clone_named_hub(source: HubRef, name: str) -> HubRef:
             catalog = hub_catalog.load_hub_catalog(
                 json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
             )
-        else:
+        elif HUB_CONFIG.is_file():
             catalog = _legacy_hub_catalog()
+        else:
+            catalog = {
+                "version": hub_catalog.CATALOG_VERSION,
+                "default_hub": "",
+                "order": [],
+                "hubs": {},
+            }
         hub_id = hub_catalog.unique_hub_id(display_name, catalog["hubs"])
-        source_config = load_hub_config(migrate=True, hub=source)
-        loaded_configs = {
-            existing_id: load_hub_config(
-                hub=_hub_ref_from_catalog(catalog, existing_id)
-            )
-            for existing_id in catalog["order"]
-        }
-        source_port = int(source_config.get("port", 18787))
-        config = json.loads(json.dumps(source_config))
-        config["port"] = _next_hub_port(loaded_configs, source_port + 1)
-        config["instance_id"] = hub_id
-        config = normalize_hub_config(config)
         entry = {
             "name": display_name,
+            "state": "setup",
             "config": f"hubs/{hub_id}.json",
+            "draft": f"hubs/{hub_id}.setup.json",
             "log": f"logs/hubs/{hub_id}.log",
             "usage": f"logs/hubs/{hub_id}-usage.jsonl",
         }
-        new_ref = HubRef(
-            hub_id=hub_id,
-            name=display_name,
-            config_path=hub_catalog.resolve_catalog_path(
-                HUB_CATALOG, entry["config"]
-            ),
-            log_path=hub_catalog.resolve_catalog_path(HUB_CATALOG, entry["log"]),
-            usage_path=hub_catalog.resolve_catalog_path(
-                HUB_CATALOG, entry["usage"]
-            ),
-        )
-        for path in (
-            new_ref.config_path,
-            new_ref.log_path,
-            new_ref.usage_path,
-        ):
-            _validate_catalog_path_chain(path)
-        catalog["hubs"][hub_id] = entry
-        catalog["order"].append(hub_id)
-        normalized = hub_catalog.normalize_hub_catalog(catalog)
+        preview_catalog = json.loads(json.dumps(catalog))
+        preview_catalog["hubs"][hub_id] = entry
+        preview_catalog["order"].append(hub_id)
+        if not preview_catalog["default_hub"]:
+            preview_catalog["default_hub"] = hub_id
+        normalized = hub_catalog.normalize_hub_catalog(preview_catalog)
+        new_ref = _hub_ref_from_catalog(normalized, hub_id)
+        assert new_ref.draft_path is not None
         if new_ref.config_path.exists():
-            raise ValueError(f"Hub 配置路径已存在: {new_ref.config_path}")
-        _atomic_private_write(new_ref.config_path, _hub_config_text(config))
+            raise ValueError(f"Hub 路径已存在: {new_ref.config_path}")
+        empty_draft = {"version": HUB_SETUP_DRAFT_VERSION, "mappings": {}}
+        created_draft = not new_ref.draft_path.exists()
+        if created_draft:
+            _validate_catalog_path_chain(new_ref.draft_path)
+            _atomic_private_write(
+                new_ref.draft_path,
+                _hub_setup_draft_text(empty_draft),
+            )
+        elif load_hub_setup_draft(new_ref) != empty_draft:
+            raise ValueError(f"Hub 草稿路径已存在: {new_ref.draft_path}")
         try:
             _atomic_private_write(HUB_CATALOG, _hub_catalog_text(normalized))
-        except Exception:
-            try:
-                new_ref.config_path.unlink()
-            except OSError:
-                pass
+        except BaseException:
+            if created_draft:
+                try:
+                    new_ref.draft_path.unlink()
+                except OSError:
+                    pass
             raise
         return new_ref
 
@@ -1817,10 +1897,11 @@ class HubLauncherState:
 
 @dataclass(frozen=True)
 class NamedHubLauncherState:
-    """One top-level named Hub plus its independent v2 launcher snapshot."""
+    """One named Hub, including setup entries that have no runnable state."""
 
     hub: HubRef
-    state: HubLauncherState
+    state: HubLauncherState | None
+    setup_count: int = 0
 
 
 def build_hub_workspace(
@@ -1964,6 +2045,16 @@ def _load_named_hub_launcher_states() -> list[NamedHubLauncherState]:
     states: list[NamedHubLauncherState] = []
     for hub in refs:
         try:
+            if hub.state == "setup":
+                draft = load_hub_setup_draft(hub)
+                states.append(
+                    NamedHubLauncherState(
+                        hub,
+                        None,
+                        len(draft["mappings"]),
+                    )
+                )
+                continue
             config = load_hub_config(migrate=True, hub=hub)
             states.append(
                 NamedHubLauncherState(hub, build_hub_launcher_state(config))
@@ -2484,12 +2575,15 @@ def _home_hubs_expanded(
 
 
 def _hub_home_text(named: NamedHubLauncherState, width: int) -> str:
-    status = named.state.status
     left = f"◆ {named.hub.name}"
-    right = (
-        f"4 槽 · {status.channel_count} 渠道"
-        f" · 默认 {status.launch_slot.title()} · {status.launch_effort}"
-    )
+    if named.state is None:
+        right = f"待配置 · {named.setup_count}/4 映射"
+    else:
+        status = named.state.status
+        right = (
+            f"4 槽 · {status.channel_count} 渠道"
+            f" · 默认 {status.launch_slot.title()} · {status.launch_effort}"
+        )
     return _compose_row(left, right, width)
 
 
@@ -2556,11 +2650,24 @@ def _draw_launcher(
             C.get("dim", 0),
         )
     guide = notice or "↑↓ / jk 移动 · Enter 启动 · 数字直达"
+    selected_hub = (
+        hubs[max(0, min(hub_idx, len(hubs) - 1))]
+        if hub_focus and hubs
+        else None
+    )
     if hubs and not notice:
-        guide = (
-            "↑↓ 选择 Hub · Enter 启动 · m/→ 管理 · n 新建 Hub"
-            " · r 重命名"
-        )
+        if selected_hub is not None and selected_hub.state is None:
+            guide = (
+                "↑↓ 选择 Hub · Enter 配置 · m/→ 配置 · n 新建 Hub"
+                " · r 重命名"
+            )
+        else:
+            guide = (
+                "↑↓ 选择 Hub · Enter 启动 · m/→ 管理 · n 新建 Hub"
+                " · r 重命名"
+            )
+    elif HUB_CATALOG_ENABLED and not notice:
+        guide = "↑↓ / jk 移动 · Enter 启动 · n 新建空白 Hub · 数字直达"
     guide_attr = C.get("warning", 0) if notice else C.get("dim", 0)
     _addstr(win, head + 2, 2, guide, guide_attr)
     row_cursor = head + 4
@@ -2672,17 +2779,26 @@ def _draw_launcher(
             )
             _addstr(win, row, 2, line, attr)
 
-    if help_open and hub_focus and hubs:
+    pending_selected = selected_hub is not None and selected_hub.state is None
+    if help_open and hub_focus and hubs and pending_selected:
+        foot = "Hub：首页 Enter/m/→ 继续配置 · n 新建 · r 重命名 · ? 返回"
+    elif help_open and hub_focus and hubs:
         foot = "Hub：首页 Enter 启动 · m/→ 管理 · n 新建 · r 重命名 · ? 返回"
     elif help_open:
         foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+    elif hub_focus and hubs and pending_selected:
+        foot = "Hub · Enter/m/→ 继续配置 · n 新建 · r 重命名 · q 退出"
     elif hub_focus and hubs:
         foot = "Hub · Enter 启动 · m/→ 槽位与渠道 · n 新建 · r 重命名 · q 退出"
     else:
         visible_range = ""
         if start > 0 or end < len(view):
             visible_range = f" · {start + 1}–{end}/{len(view)}"
-        foot = f"共 {len(view)} 个{visible_range} · ? 更多操作 · q 退出"
+        create_hint = " · n 新建 Hub" if HUB_CATALOG_ENABLED else ""
+        foot = (
+            f"共 {len(view)} 个{visible_range}{create_hint}"
+            " · ? 更多操作 · q 退出"
+        )
     _addstr(win, footer_row, 2, foot, C.get("dim", 0))
     win.refresh()
 
@@ -3137,6 +3253,253 @@ def _hub_alias_slug(name: object) -> str:
     return slug or "channel"
 
 
+def set_hub_setup_mapping(
+    hub: HubRef,
+    slot: str,
+    provider: dict,
+    model: str,
+    *,
+    api_format: str | None = None,
+) -> dict:
+    """Persist one exact provider/model choice in a setup-only draft."""
+    if slot not in HUB_SLOT_ORDER:
+        raise ValueError("Hub 首次设置槽位无效")
+    provider_id = str(provider.get("id") or "").strip()
+    provider_name = str(
+        provider.get("alias") or provider.get("name") or provider_id
+    ).strip()
+    model = model.strip() if isinstance(model, str) else ""
+    if not provider_id:
+        raise ValueError("provider 缺少稳定 id")
+    if not model or "," in model:
+        raise ValueError("model 必须是非空且不能包含逗号")
+    if api_format is not None and api_format not in {
+        "anthropic",
+        "openai_chat",
+        "openai_responses",
+    }:
+        raise ValueError("api_format 无效")
+    with _hub_setup_draft_lock(hub):
+        draft = load_hub_setup_draft(hub)
+        mappings = draft["mappings"]
+        alias = next(
+            (
+                mapping["alias"]
+                for other_slot, mapping in mappings.items()
+                if other_slot != slot
+                and mapping["provider_id"] == provider_id
+                and mapping.get("api_format") == api_format
+            ),
+            None,
+        )
+        if alias is None:
+            base = _hub_alias_slug(provider_name)
+            used_by_other = {
+                mapping["alias"]
+                for other_slot, mapping in mappings.items()
+                if other_slot != slot
+            }
+            alias = base
+            suffix = 2
+            while alias in used_by_other:
+                alias = f"{base}-{suffix}"
+                suffix += 1
+        mapping = {
+            "provider_id": provider_id,
+            "provider_name": provider_name,
+            "alias": alias,
+            "model": model,
+        }
+        if api_format is not None:
+            mapping["api_format"] = api_format
+        mappings[slot] = mapping
+        normalized = normalize_hub_setup_draft(draft)
+        assert hub.draft_path is not None
+        _validate_catalog_path_chain(hub.draft_path)
+        _atomic_private_write(
+            hub.draft_path,
+            _hub_setup_draft_text(normalized),
+        )
+        return normalized
+
+
+def clear_hub_setup_mapping(hub: HubRef, slot: str) -> dict:
+    if slot not in HUB_SLOT_ORDER:
+        raise ValueError("Hub 首次设置槽位无效")
+    with _hub_setup_draft_lock(hub):
+        draft = load_hub_setup_draft(hub)
+        draft["mappings"].pop(slot, None)
+        normalized = normalize_hub_setup_draft(draft)
+        assert hub.draft_path is not None
+        _validate_catalog_path_chain(hub.draft_path)
+        _atomic_private_write(
+            hub.draft_path,
+            _hub_setup_draft_text(normalized),
+        )
+        return normalized
+
+
+def _hub_config_from_setup_draft(
+    hub: HubRef,
+    draft: dict,
+    port: int,
+) -> dict:
+    draft = normalize_hub_setup_draft(draft)
+    missing = [slot for slot in HUB_SLOT_ORDER if slot not in draft["mappings"]]
+    if missing:
+        raise ValueError(
+            "还需配置 " + "、".join(slot.title() for slot in missing)
+        )
+    channels: dict[str, dict] = {}
+    model_slots: dict[str, str] = {}
+    for slot in HUB_SLOT_ORDER:
+        mapping = draft["mappings"][slot]
+        alias = mapping["alias"]
+        expected_format = mapping.get("api_format")
+        channel = channels.get(alias)
+        if channel is None:
+            channel = {
+                "provider": f"id:{mapping['provider_id']}",
+                "models": [],
+            }
+            if expected_format is not None:
+                channel["api_format"] = expected_format
+            channels[alias] = channel
+        elif channel["provider"] != f"id:{mapping['provider_id']}" or (
+            channel.get("api_format") != expected_format
+            and ("api_format" in channel or expected_format is not None)
+        ):
+            raise ValueError(f"Hub 渠道 alias 冲突: {alias}")
+        if mapping["model"] not in channel["models"]:
+            channel["models"].append(mapping["model"])
+        model_slots[slot] = f"{alias},{mapping['model']}"
+    return normalize_hub_config(
+        {
+            "version": HUB_CONFIG_VERSION,
+            "instance_id": hub.hub_id,
+            "port": port,
+            "local_token": secrets.token_urlsafe(32),
+            "default_channel": draft["mappings"]["fable"]["alias"],
+            "channels": channels,
+            "model_slots": model_slots,
+            "launch_slot": "fable",
+            "effort_by_slot": dict(HUB_DEFAULT_EFFORTS),
+        }
+    )
+
+
+def _recover_setup_config(
+    hub: HubRef,
+    draft: dict,
+    ready_configs: dict[str, dict],
+) -> dict:
+    """Validate a final config left by an interrupted setup promotion."""
+    actual = load_hub_config(hub=hub)
+    port = _hub_port(actual)
+    expected = _hub_config_from_setup_draft(hub, draft, port)
+    allowed_fields = {
+        "version",
+        "instance_id",
+        "port",
+        "local_token",
+        "default_channel",
+        "channels",
+        "model_slots",
+        "launch_slot",
+        "effort_by_slot",
+    }
+    if set(actual) != allowed_fields:
+        raise ValueError(f"Hub {hub.name} 的恢复配置包含未知字段")
+    compared_fields = (
+        "version",
+        "instance_id",
+        "default_channel",
+        "channels",
+        "model_slots",
+        "launch_slot",
+        "effort_by_slot",
+    )
+    if any(actual.get(field) != expected.get(field) for field in compared_fields):
+        raise ValueError(f"Hub {hub.name} 存在无法恢复的未登记配置")
+    local_token = actual.get("local_token")
+    if not isinstance(local_token, str) or not local_token.strip():
+        raise ValueError(f"Hub {hub.name} 的恢复配置缺少本地凭证")
+    port_available = True
+    try:
+        hub_catalog.validate_unique_hub_ports(
+            {**ready_configs, hub.hub_id: actual}
+        )
+    except ValueError:
+        port_available = False
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        port_available = False
+    finally:
+        probe.close()
+    if not port_available:
+        actual["port"] = _next_hub_port(ready_configs, 18787)
+        actual = normalize_hub_config(actual)
+        _validate_catalog_path_chain(hub.config_path)
+        _atomic_private_write(hub.config_path, _hub_config_text(actual))
+    return actual
+
+
+def complete_hub_setup(hub: HubRef) -> tuple[HubRef, dict]:
+    """Atomically promote a four-slot draft to one runnable Hub v2 config."""
+    if not HUB_CATALOG_ENABLED:
+        raise ValueError("显式单 Hub 配置模式不支持首次设置")
+    with _hub_catalog_lock():
+        catalog = hub_catalog.load_hub_catalog(
+            json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+        )
+        current = _hub_ref_from_catalog(catalog, hub.hub_id)
+        if current.state != "setup" or current.draft_path is None:
+            raise ValueError(f"Hub {current.name} 已完成配置")
+        with _hub_setup_draft_lock(current):
+            draft = load_hub_setup_draft(current)
+            ready_configs = {
+                existing_id: load_hub_config(
+                    hub=_hub_ref_from_catalog(catalog, existing_id)
+                )
+                for existing_id in catalog["order"]
+                if catalog["hubs"][existing_id].get("state", "ready") == "ready"
+            }
+            created_config = not current.config_path.exists()
+            if created_config:
+                port = _next_hub_port(ready_configs, 18787)
+                config = _hub_config_from_setup_draft(current, draft, port)
+            else:
+                config = _recover_setup_config(current, draft, ready_configs)
+            updated_catalog = json.loads(json.dumps(catalog))
+            updated_entry = updated_catalog["hubs"][current.hub_id]
+            updated_entry["state"] = "ready"
+            updated_entry.pop("draft", None)
+            normalized_catalog = hub_catalog.normalize_hub_catalog(updated_catalog)
+            if created_config:
+                _validate_catalog_path_chain(current.config_path)
+                _atomic_private_write(current.config_path, _hub_config_text(config))
+            try:
+                _atomic_private_write(
+                    HUB_CATALOG,
+                    _hub_catalog_text(normalized_catalog),
+                )
+            except BaseException:
+                if created_config:
+                    try:
+                        current.config_path.unlink()
+                    except OSError:
+                        pass
+                raise
+            try:
+                current.draft_path.unlink()
+            except OSError:
+                pass
+    ready_ref = _hub_ref_from_catalog(normalized_catalog, hub.hub_id)
+    return ready_ref, config
+
+
 def _infer_hub_provider_api_format(provider: dict) -> str | None:
     """Return a metadata-backed format, or None when passthrough is uncertain."""
     try:
@@ -3208,6 +3571,451 @@ def _choose_hub_api_format(win, detail: str = "") -> str | None:
         choice = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
         if choice is not None:
             return choice
+
+
+def _draw_hub_setup_choice_shell(
+    win,
+    hub_name: str,
+    slot: str,
+    title: str,
+    *,
+    detail: str = "",
+    footer: str = "Esc 返回四槽页 · ↑↓/jk 选择 · Enter 继续",
+) -> int:
+    win.erase()
+    h, w = win.getmaxyx()
+    width = max(0, w - 4)
+    slot_index = HUB_SLOT_ORDER.index(slot) + 1
+    _addstr(
+        win,
+        0,
+        2,
+        _truncate_display(f"Claude1  ›  {hub_name}  ›  首次设置", width),
+        C.get("dim", 0),
+    )
+    compact = h < 12
+    progress_row = 1 if compact else 2
+    title_row = 2 if compact else 4
+    _addstr(
+        win,
+        progress_row,
+        2,
+        f"映射 {slot.title()} · 第 {slot_index}/4 槽",
+        C.get(_hub_identity_color(slot_index - 1), 0) | curses.A_BOLD,
+    )
+    _addstr(win, title_row, 2, title, C.get("lime", 0) | curses.A_BOLD)
+    show_detail = bool(detail) and (not compact or h >= 10)
+    if show_detail:
+        _addstr(
+            win,
+            title_row + 1,
+            2,
+            _truncate_display(detail, width),
+            C.get("dim", 0),
+        )
+    _addstr(win, max(0, h - 1), 2, footer, C.get("dim", 0))
+    if not compact:
+        return 7
+    return title_row + (2 if show_detail else 1)
+
+
+def _choose_hub_setup_provider(
+    win,
+    hub_name: str,
+    slot: str,
+    providers: list[dict],
+    initial_provider_id: str | None = None,
+) -> dict | None:
+    if not providers:
+        return None
+    idx = next(
+        (
+            index
+            for index, provider in enumerate(providers)
+            if str(provider.get("id")) == initial_provider_id
+        ),
+        0,
+    )
+    while True:
+        list_top = _draw_hub_setup_choice_shell(
+            win,
+            hub_name,
+            slot,
+            "选择渠道",
+            detail="来自 CC Switch；不会切换它当前使用的渠道",
+        )
+        _draw_hub_wizard_options(
+            win,
+            [
+                (
+                    str(provider.get("name") or provider.get("id")),
+                    str(provider.get("alias") or "CC Switch"),
+                )
+                for provider in providers
+            ],
+            idx,
+            list_top,
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(providers)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(providers)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return providers[idx]
+
+
+def _prompt_hub_setup_model(
+    win,
+    hub_name: str,
+    slot: str,
+    provider_name: str,
+) -> str | None:
+    value = ""
+    while True:
+        list_top = _draw_hub_setup_choice_shell(
+            win,
+            hub_name,
+            slot,
+            "手动输入模型 ID",
+            detail=f"渠道 · {provider_name}",
+            footer="Esc 返回四槽页 · 输入模型 ID · Backspace 删除 · Enter 继续",
+        )
+        row_width = max(0, win.getmaxyx()[1] - 4)
+        _addstr(
+            win,
+            list_top,
+            2,
+            _pad_display(f"› {value or '请输入…'}", row_width),
+            C.get("sel", curses.A_REVERSE),
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (10, 13, curses.KEY_ENTER):
+            value = value.strip()
+            if value and "," not in value:
+                return value
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            value = value[:-1]
+        elif 32 <= ch <= 0x10FFFF:
+            char = chr(ch)
+            if not unicodedata.category(char).startswith("C"):
+                value += char
+
+
+def _choose_hub_setup_model(
+    win,
+    hub_name: str,
+    slot: str,
+    provider: dict,
+    models: list[str],
+    initial_model: str | None = None,
+) -> str | None:
+    candidates = list(dict.fromkeys(models))
+    idx = candidates.index(initial_model) if initial_model in candidates else 0
+    provider_name = str(provider.get("name") or provider.get("id"))
+    while True:
+        item_count = len(candidates) + 1
+        list_top = _draw_hub_setup_choice_shell(
+            win,
+            hub_name,
+            slot,
+            "选择一个模型",
+            detail=f"渠道 · {provider_name}",
+            footer="Esc 返回四槽页 · ↑↓/jk 选择 · a 手动输入 · Enter 确认",
+        )
+        options = [
+            (model, _hub_model_family(model)) for model in candidates
+        ] + [("＋ 手动输入模型 ID", "候选中没有时使用")]
+        colors = [
+            _HUB_FAMILY_COLOR.get(_hub_model_family(model), "violet")
+            for model in candidates
+        ] + ["gold"]
+        _draw_hub_wizard_options(
+            win,
+            options,
+            idx,
+            list_top,
+            color_keys=colors,
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % item_count
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % item_count
+        elif ch in (ord("a"), ord("A")) or (
+            ch in (10, 13, curses.KEY_ENTER) and idx == len(candidates)
+        ):
+            custom = _prompt_hub_setup_model(
+                win,
+                hub_name,
+                slot,
+                provider_name,
+            )
+            if custom:
+                return custom
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return candidates[idx]
+
+
+def _choose_hub_setup_api_format(
+    win,
+    hub_name: str,
+    slot: str,
+    detail: str,
+) -> str | None:
+    choices = [
+        ("anthropic", "Anthropic Messages", "原生 Claude / Anthropic 兼容"),
+        ("openai_chat", "OpenAI Chat Completions", "兼容 /chat/completions"),
+        ("openai_responses", "OpenAI Responses", "兼容 /responses"),
+    ]
+    idx = 0
+    while True:
+        list_top = _draw_hub_setup_choice_shell(
+            win,
+            hub_name,
+            slot,
+            "选择上游协议",
+            detail=detail,
+        )
+        _draw_hub_wizard_options(
+            win,
+            [(label, description) for _value, label, description in choices],
+            idx,
+            list_top,
+            color_keys=["orange", "teal", "violet"],
+        )
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % len(choices)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % len(choices)
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return choices[idx][0]
+
+
+def _draw_hub_setup(
+    win,
+    hub: HubRef,
+    draft: dict,
+    idx: int,
+    notice: str | None = None,
+) -> None:
+    win.erase()
+    h, w = win.getmaxyx()
+    width = max(0, w - 4)
+    mappings = draft["mappings"]
+    complete_count = len(mappings)
+    _addstr(
+        win,
+        0,
+        2,
+        _truncate_display(f"Claude1  ›  {hub.name}  ›  首次设置", width),
+        C.get("dim", 0),
+    )
+    compact = h < 12
+    if compact:
+        _addstr(
+            win,
+            1,
+            2,
+            _compose_row(
+                "选择四槽映射",
+                f"已完成 {complete_count}/4",
+                width,
+            ),
+            C.get("lime", 0) | curses.A_BOLD,
+        )
+        list_top = 2
+    else:
+        _addstr(win, 2, 2, "选择四槽映射", C.get("lime", 0) | curses.A_BOLD)
+        _addstr(
+            win,
+            3,
+            2,
+            _compose_row(
+                "每个槽位选择一个渠道和模型",
+                f"已完成 {complete_count}/4",
+                width,
+            ),
+            C.get("dim", 0),
+        )
+        list_top = 5
+    for row_index, slot in enumerate(HUB_SLOT_ORDER):
+        mapping = mappings.get(slot)
+        marker = "▸" if idx == row_index else " "
+        if mapping is None:
+            right = "未设置"
+        else:
+            right = f"{mapping['alias']},{mapping['model']}"
+        text = _compose_row(f"{marker} ◆ {slot.title()}", right, width)
+        attr = (
+            C.get("sel", curses.A_REVERSE)
+            if idx == row_index
+            else C.get(_hub_identity_color(row_index), 0) | curses.A_BOLD
+        )
+        _addstr(
+            win,
+            list_top + row_index,
+            2,
+            _pad_display(text, width) if idx == row_index else text,
+            attr,
+        )
+    finish_index = len(HUB_SLOT_ORDER)
+    finish_marker = "▸" if idx == finish_index else " "
+    finish_right = "可以完成" if complete_count == 4 else f"还差 {4 - complete_count} 槽"
+    finish = _compose_row(f"{finish_marker} ✓ 完成配置", finish_right, width)
+    finish_row = list_top + finish_index + (0 if compact else 1)
+    _addstr(
+        win,
+        finish_row,
+        2,
+        _pad_display(finish, width) if idx == finish_index else finish,
+        (
+            C.get("sel", curses.A_REVERSE)
+            if idx == finish_index
+            else C.get("lime" if complete_count == 4 else "dim", 0)
+            | (curses.A_BOLD if complete_count == 4 else 0)
+        ),
+    )
+    if notice:
+        footer = notice
+    elif idx == finish_index:
+        footer = (
+            "Esc 稍后设置 · Enter 完成配置"
+            if complete_count == 4
+            else f"Esc 稍后设置 · 还需配置 {4 - complete_count} 槽"
+        )
+    else:
+        footer = "Esc 稍后设置 · ↑↓/jk 选择 · Enter 设置映射 · x 清除"
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        footer,
+        C.get("warning", 0) if notice else C.get("dim", 0),
+    )
+    win.refresh()
+
+
+def _hub_setup_wizard(win, hub: HubRef) -> str:
+    """Configure four exact mappings; never launch directly from setup."""
+    draft = load_hub_setup_draft(hub)
+    idx = next(
+        (i for i, slot in enumerate(HUB_SLOT_ORDER) if slot not in draft["mappings"]),
+        len(HUB_SLOT_ORDER),
+    )
+    notice: str | None = None
+    while True:
+        _draw_hub_setup(win, hub, draft, idx, notice)
+        notice = None
+        ch = win.getch()
+        if ch == -1 or ch == ord("q"):
+            return "quit"
+        if ch == 27:
+            return "back"
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % (len(HUB_SLOT_ORDER) + 1)
+            continue
+        if ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % (len(HUB_SLOT_ORDER) + 1)
+            continue
+        if ch == ord("x") and idx < len(HUB_SLOT_ORDER):
+            try:
+                draft = clear_hub_setup_mapping(hub, HUB_SLOT_ORDER[idx])
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                notice = str(exc)
+            continue
+        if ch not in (10, 13, curses.KEY_ENTER):
+            continue
+        if idx == len(HUB_SLOT_ORDER):
+            try:
+                complete_hub_setup(hub)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                notice = str(exc)
+                continue
+            return "completed"
+        slot = HUB_SLOT_ORDER[idx]
+        current_mapping = draft["mappings"].get(slot)
+        try:
+            providers = list_providers()
+        except (OSError, sqlite3.Error, json.JSONDecodeError):
+            providers = []
+        if not providers:
+            notice = "CC Switch 中没有可映射的渠道"
+            continue
+        provider = _choose_hub_setup_provider(
+            win,
+            hub.name,
+            slot,
+            providers,
+            (
+                current_mapping["provider_id"]
+                if current_mapping is not None
+                else None
+            ),
+        )
+        if provider is None:
+            continue
+        try:
+            settings = json.loads(provider.get("settings_config") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            settings = {}
+        model = _choose_hub_setup_model(
+            win,
+            hub.name,
+            slot,
+            provider,
+            _provider_models(settings, include_placeholder=False),
+            (
+                current_mapping["model"]
+                if current_mapping is not None
+                and current_mapping["provider_id"] == str(provider.get("id"))
+                else None
+            ),
+        )
+        if model is None:
+            continue
+        api_format = _infer_hub_provider_api_format(provider)
+        if api_format is None:
+            api_format = _choose_hub_setup_api_format(
+                win,
+                hub.name,
+                slot,
+                f"渠道 · {provider.get('name') or provider.get('id')}",
+            )
+            if api_format is None:
+                continue
+        try:
+            draft = set_hub_setup_mapping(
+                hub,
+                slot,
+                provider,
+                model,
+                api_format=api_format,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            notice = str(exc)
+            continue
+        idx = next(
+            (
+                i
+                for i, candidate in enumerate(HUB_SLOT_ORDER)
+                if candidate not in draft["mappings"]
+            ),
+            len(HUB_SLOT_ORDER),
+        )
 
 
 def _confirm_hub_channel_add(win, alias: str, models: list[str]) -> bool:
@@ -3648,24 +4456,35 @@ def _launcher_main(win, cfg, db_ids):
                 hubs = _load_named_hub_launcher_states()
                 hub_idx = 0
                 notice = "Hub 渠道已添加"
-        elif ch in (ord("a"), ord("n")) and hub_focus and hubs:
-            source = hubs[hub_idx].hub
+        elif (
+            ch == ord("n") and HUB_CATALOG_ENABLED
+        ) or (
+            ch == ord("a") and hub_focus and bool(hubs)
+        ):
             name = _prompt_named_hub(
                 win,
                 "新增 Hub 工作区",
                 "",
-                f"复制 {source.name} 的渠道、四槽与 effort；端口和进程独立",
+                "创建空白 Hub；下一步配置 Fable / Opus / Sonnet / Haiku",
             )
             if name:
                 try:
-                    created = clone_named_hub(source, name)
+                    created = create_named_hub(name)
+                    setup_outcome = _hub_setup_wizard(win, created)
+                    if setup_outcome == "quit":
+                        return None
                     hubs = _load_named_hub_launcher_states()
+                    hub_focus = True
                     hub_idx = next(
                         index
                         for index, named in enumerate(hubs)
                         if named.hub.hub_id == created.hub_id
                     )
-                    notice = f"已新增 Hub：{created.name}"
+                    notice = (
+                        f"{created.name} 配置完成，Enter 启动"
+                        if setup_outcome == "completed"
+                        else f"已创建 {created.name}，尚未配置"
+                    )
                 except (
                     OSError,
                     ValueError,
@@ -3736,14 +4555,56 @@ def _launcher_main(win, cfg, db_ids):
         elif ch in (10, 13, curses.KEY_ENTER):
             if hub_focus and hubs:
                 named = hubs[hub_idx]
-                return HubLaunch(
-                    slot=named.state.status.launch_slot,
-                    hub_id=(named.hub.hub_id if HUB_CATALOG_ENABLED else None),
-                )
+                if named.state is None:
+                    setup_outcome = _hub_setup_wizard(win, named.hub)
+                    if setup_outcome == "quit":
+                        return None
+                    selected_id = named.hub.hub_id
+                    hubs = _load_named_hub_launcher_states()
+                    hub_idx = next(
+                        (
+                            index
+                            for index, item in enumerate(hubs)
+                            if item.hub.hub_id == selected_id
+                        ),
+                        0,
+                    )
+                    notice = (
+                        "配置完成，Enter 启动"
+                        if setup_outcome == "completed"
+                        else "Hub 尚未配置"
+                    )
+                else:
+                    return HubLaunch(
+                        slot=named.state.status.launch_slot,
+                        hub_id=(
+                            named.hub.hub_id if HUB_CATALOG_ENABLED else None
+                        ),
+                    )
             elif view:
                 return view[idx]
         elif ch in (ord("\t"), ord("m"), curses.KEY_RIGHT) and hub_focus and hubs:
             named = hubs[hub_idx]
+            if named.state is None:
+                setup_outcome = _hub_setup_wizard(win, named.hub)
+                if setup_outcome == "quit":
+                    return None
+                selected_id = named.hub.hub_id
+                hubs = _load_named_hub_launcher_states()
+                hub_idx = next(
+                    (
+                        index
+                        for index, item in enumerate(hubs)
+                        if item.hub.hub_id == selected_id
+                    ),
+                    0,
+                )
+                notice = (
+                    "配置完成，Enter 启动"
+                    if setup_outcome == "completed"
+                    else "Hub 尚未配置"
+                )
+                continue
             outcome, launch = _hub_workspace(
                 win,
                 named.state.status,
@@ -4329,7 +5190,13 @@ def exec_hub(
         raise RuntimeError("hub --model 与 --slot 不能同时指定")
     try:
         hub_ref = resolve_hub_ref(hub_id, migrate=True)
+        if hub_ref.state == "setup":
+            raise RuntimeError(
+                f"Hub {hub_ref.name} 尚未配置；请打开 claude1 完成四槽映射"
+            )
         hub_cfg = load_hub_config(migrate=True, hub=hub_ref)
+    except RuntimeError:
+        raise
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"hub 配置无法读取: {exc}") from exc
 

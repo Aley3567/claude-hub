@@ -16,12 +16,14 @@ class HubCatalogTests(unittest.TestCase):
             "hubs": {
                 "work": {
                     "name": "工作 Hub",
+                    "state": "ready",
                     "config": "hubs/work.json",
                     "log": "logs/work.log",
                     "usage": "logs/work-usage.jsonl",
                 },
                 "research": {
                     "name": "Research-Hub",
+                    "state": "ready",
                     "config": "hubs/research.json",
                     "log": "logs/research.log",
                     "usage": "logs/research-usage.jsonl",
@@ -113,11 +115,103 @@ class HubCatalogTests(unittest.TestCase):
             catalog.legacy_hub_entry(),
             {
                 "name": "Claude-Hub",
+                "state": "ready",
                 "config": "claude-hub.json",
                 "log": "logs/claude-hub.log",
                 "usage": "logs/claude-hub-usage.jsonl",
             },
         )
+
+    def test_catalog_normalizes_lifecycle_state_and_setup_draft(self) -> None:
+        raw = {
+            "version": 1,
+            "default_hub": "work",
+            "order": ["work", "research"],
+            "hubs": {
+                "work": {
+                    "name": "Work Hub",
+                    "config": "hubs/work.json",
+                    "log": "logs/work.log",
+                    "usage": "logs/work.jsonl",
+                },
+                "research": {
+                    "name": "Research Hub",
+                    "state": "setup",
+                    "config": "hubs/research.json",
+                    "log": "logs/research.log",
+                    "usage": "logs/research.jsonl",
+                    "draft": "drafts/research.json",
+                },
+            },
+        }
+
+        normalized = catalog.normalize_hub_catalog(raw)
+
+        self.assertEqual(normalized["hubs"]["work"]["state"], "ready")
+        self.assertNotIn("draft", normalized["hubs"]["work"])
+        self.assertEqual(normalized["hubs"]["research"]["state"], "setup")
+        self.assertEqual(
+            normalized["hubs"]["research"]["draft"], "drafts/research.json"
+        )
+
+    def test_catalog_rejects_invalid_lifecycle_entries(self) -> None:
+        base = {
+            "version": 1,
+            "default_hub": "work",
+            "order": ["work"],
+            "hubs": {
+                "work": {
+                    "name": "Work Hub",
+                    "config": "hubs/work.json",
+                    "log": "logs/work.log",
+                    "usage": "logs/work.jsonl",
+                }
+            },
+        }
+        invalid_entries = (
+            {"state": "paused"},
+            {"state": "setup"},
+            {"state": "setup", "draft": "../draft.json"},
+            {"state": "setup", "draft": "/tmp/draft.json"},
+        )
+
+        for changes in invalid_entries:
+            candidate = copy.deepcopy(base)
+            candidate["hubs"]["work"].update(changes)
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    catalog.normalize_hub_catalog(candidate)
+
+    def test_catalog_rejects_paths_reused_across_hubs(self) -> None:
+        base = {
+            "version": 1,
+            "default_hub": "work",
+            "order": ["work", "research"],
+            "hubs": {
+                "work": {
+                    "name": "Work Hub",
+                    "config": "hubs/work.json",
+                    "log": "logs/work.log",
+                    "usage": "logs/work.jsonl",
+                    "draft": "drafts/work.json",
+                },
+                "research": {
+                    "name": "Research Hub",
+                    "state": "setup",
+                    "config": "hubs/research.json",
+                    "log": "logs/research.log",
+                    "usage": "logs/research.jsonl",
+                    "draft": "drafts/research.json",
+                },
+            },
+        }
+
+        for field in ("config", "log", "usage", "draft"):
+            candidate = copy.deepcopy(base)
+            candidate["hubs"]["research"][field] = candidate["hubs"]["work"][field]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "path.*unique"):
+                    catalog.normalize_hub_catalog(candidate)
 
     def test_resolve_catalog_path_accepts_only_safe_relative_paths(self) -> None:
         catalog_path = Path("/private/state/claude-hubs.json")

@@ -2425,6 +2425,17 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "glm,glm-5.2")
             self.assertEqual(settings["effortLevel"], "medium")
 
+    def test_exec_hub_refuses_an_incomplete_named_hub(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("pending-hub")
+                with mock.patch.object(launcher, "ensure_hub") as ensure:
+                    with self.assertRaisesRegex(RuntimeError, "尚未配置"):
+                        launcher.exec_hub([], hub_id=created.hub_id)
+
+            ensure.assert_not_called()
+
     def test_usage_aggregates_every_named_hubs_usage_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._multi_hub_env(Path(raw_home))
@@ -2604,12 +2615,12 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertNotIn("gpt-5.6-sol", rendered)
             self.assertNotIn("claude-fixture-5[1m]", rendered)
 
-    def test_home_add_creates_and_selects_an_isolated_named_hub(self) -> None:
+    def test_home_add_creates_empty_hub_and_opens_first_mapping_setup(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
             env = self._multi_hub_env(home)
             window = ScriptedWindow(
-                [ord("a"), *map(ord, "any-hub"), 10, 10],
+                [ord("a"), *map(ord, "any-hub"), 10, 27, ord("q")],
                 size=(30, 120),
             )
             cfg = {
@@ -2627,21 +2638,258 @@ class HubWorkspaceTests(unittest.TestCase):
                     )
                 catalog = launcher.load_hub_catalog()
                 created = launcher.resolve_hub_ref("any-hub")
-                created_config = launcher.load_hub_config(hub=created)
+                draft = json.loads(created.draft_path.read_text(encoding="utf-8"))
 
-            self.assertIsInstance(result, launcher.HubLaunch)
-            self.assertEqual(result.hub_id, "any-hub")
+            self.assertIsNone(result)
             self.assertEqual(catalog["order"][-1], "any-hub")
             self.assertEqual(created.name, "any-hub")
-            self.assertEqual(created_config["instance_id"], "any-hub")
-            self.assertEqual(created_config["port"], 18789)
-            self.assertEqual(created.config_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(created.state, "setup")
+            self.assertFalse(created.config_path.exists())
+            self.assertEqual(draft, {"version": 1, "mappings": {}})
+            self.assertEqual(created.draft_path.stat().st_mode & 0o777, 0o600)
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("首次设置", rendered)
+            self.assertIn("0/4", rendered)
+            self.assertIn("Fable", rendered)
+            self.assertNotIn("glm-5.2", rendered)
+            self.assertNotIn("gpt-5.6-sol", rendered)
 
-    def test_failed_catalog_write_removes_the_new_hub_config(self) -> None:
+    def test_home_n_creates_the_first_hub_without_a_legacy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home, write_config=False)
+            env["CLAUDE1_HUB_CATALOG"] = str(
+                home / ".cc-switch" / "claude-hubs.json"
+            )
+            window = ScriptedWindow(
+                [ord("n"), *map(ord, "first-hub"), 10, 27, ord("q")],
+                size=(18, 90),
+            )
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            with loaded_launcher(env) as launcher:
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+                catalog = launcher.load_hub_catalog()
+                created = launcher.resolve_hub_ref("first-hub")
+
+            self.assertIsNone(result)
+            self.assertEqual(catalog["default_hub"], "first-hub")
+            self.assertEqual(catalog["order"], ["first-hub"])
+            self.assertEqual(created.state, "setup")
+            self.assertFalse(created.config_path.exists())
+            self.assertTrue(created.draft_path.is_file())
+
+    def test_enter_on_incomplete_hub_resumes_first_unmapped_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            window = ScriptedWindow(
+                [ord("j"), ord("j"), 10, 27, ord("q")],
+                size=(30, 120),
+            )
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            provider = {
+                "id": "fable-provider-id",
+                "name": "Fable Provider",
+            }
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("draft-hub")
+                launcher.set_hub_setup_mapping(
+                    created,
+                    "fable",
+                    provider,
+                    "fable-model",
+                    api_format="anthropic",
+                )
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+                persisted = launcher.load_hub_setup_draft(created)
+
+            self.assertIsNone(result)
+            self.assertEqual(
+                persisted["mappings"]["fable"]["model"], "fable-model"
+            )
+            rendered_strings = [
+                value
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            ]
+            rendered = " ".join(rendered_strings)
+            self.assertIn("已完成 1/4", rendered)
+            self.assertTrue(any("▸ ◆ Opus" in value for value in rendered_strings))
+            self.assertIn("未设置", rendered)
+
+    def test_setup_overview_keeps_all_slots_and_finish_visible_at_eight_rows(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._multi_hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
-                source = launcher.resolve_hub_ref("kimi-hub")
+                created = launcher.create_named_hub("compact-setup")
+                window = ScriptedWindow([], size=(8, 80))
+                launcher.C = {}
+                launcher._draw_hub_setup(
+                    window,
+                    created,
+                    launcher.load_hub_setup_draft(created),
+                    0,
+                )
+
+            writes = [
+                (call[0], call[2])
+                for call in window.added
+                if len(call) >= 3
+                and isinstance(call[0], int)
+                and isinstance(call[2], str)
+            ]
+            rendered = " ".join(text for _row, text in writes)
+            for label in ("Fable", "Opus", "Sonnet", "Haiku", "完成配置"):
+                self.assertIn(label, rendered)
+            finish_row = next(row for row, text in writes if "完成配置" in text)
+            footer_row = next(row for row, text in writes if "Esc 稍后设置" in text)
+            self.assertLess(finish_row, footer_row)
+
+    def test_setup_provider_picker_scrolls_above_footer_at_eight_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            providers = [
+                {"id": f"provider-{index}", "name": f"Provider {index}"}
+                for index in range(7)
+            ]
+            window = ScriptedWindow(
+                [ord("j"), ord("j"), ord("j"), ord("j"), 10],
+                size=(8, 80),
+            )
+            with loaded_launcher(env) as launcher:
+                launcher.C = {}
+                selected = launcher._choose_hub_setup_provider(
+                    window,
+                    "Compact Hub",
+                    "fable",
+                    providers,
+                )
+
+            self.assertEqual(selected["id"], "provider-4")
+            selected_rows = [
+                call[0]
+                for call in window.added
+                if len(call) >= 3
+                and isinstance(call[2], str)
+                and "▸ Provider 4" in call[2]
+            ]
+            self.assertTrue(selected_rows)
+            self.assertTrue(all(row < 7 for row in selected_rows))
+
+    def test_completing_fourth_mapping_makes_hub_launchable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            window = ScriptedWindow(
+                [
+                    ord("j"),
+                    ord("j"),
+                    10,  # pending Hub -> setup
+                    10,  # set the selected Haiku row
+                    10,  # choose the only provider for Haiku
+                    10,  # choose its exact model
+                    10,  # finish the now-complete setup
+                    10,  # launch from home
+                ],
+                size=(30, 120),
+            )
+            cfg = {
+                "providers": {"alpha-id": {"name": "Alpha", "hidden": False}}
+            }
+            final_provider = {
+                "id": "haiku-provider-id",
+                "name": "Haiku Provider",
+                "settings_config": json.dumps(
+                    {"env": {"ANTHROPIC_MODEL": "haiku-model"}}
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("ready-after-setup")
+                for slot in ("fable", "opus", "sonnet"):
+                    launcher.set_hub_setup_mapping(
+                        created,
+                        slot,
+                        {"id": f"{slot}-provider-id", "name": f"{slot} Provider"},
+                        f"{slot}-model",
+                        api_format="anthropic",
+                    )
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(
+                        launcher, "list_providers", return_value=[final_provider]
+                    ),
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+                ready = launcher.resolve_hub_ref("ready-after-setup")
+                config = launcher.load_hub_config(hub=ready)
+                catalog = launcher.load_hub_catalog()
+
+            self.assertIsInstance(result, launcher.HubLaunch)
+            self.assertEqual(result.hub_id, "ready-after-setup")
+            self.assertEqual(result.slot, "fable")
+            self.assertEqual(ready.state, "ready")
+            self.assertIsNone(ready.draft_path)
+            self.assertTrue(ready.config_path.is_file())
+            self.assertEqual(
+                config["model_slots"],
+                {
+                    "fable": "fable-provider,fable-model",
+                    "opus": "opus-provider,opus-model",
+                    "sonnet": "sonnet-provider,sonnet-model",
+                    "haiku": "haiku-provider,haiku-model",
+                },
+            )
+            self.assertEqual(
+                {
+                    alias: channel["models"]
+                    for alias, channel in config["channels"].items()
+                },
+                {
+                    "fable-provider": ["fable-model"],
+                    "opus-provider": ["opus-model"],
+                    "sonnet-provider": ["sonnet-model"],
+                    "haiku-provider": ["haiku-model"],
+                },
+            )
+            self.assertEqual(catalog["hubs"][ready.hub_id]["state"], "ready")
+            self.assertNotIn("draft", catalog["hubs"][ready.hub_id])
+
+    def test_failed_catalog_write_removes_the_new_hub_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
                 real_write = launcher._atomic_private_write
 
                 def fail_catalog(path, text):
@@ -2655,15 +2903,136 @@ class HubWorkspaceTests(unittest.TestCase):
                     side_effect=fail_catalog,
                 ):
                     with self.assertRaisesRegex(OSError, "catalog failure"):
-                        launcher.clone_named_hub(source, "orphan-hub")
+                        launcher.create_named_hub("orphan-hub")
 
                 catalog = launcher.load_hub_catalog()
-                orphan = launcher.HUB_CATALOG.parent / "hubs" / "orphan-hub.json"
+                orphan = (
+                    launcher.HUB_CATALOG.parent
+                    / "hubs"
+                    / "orphan-hub.setup.json"
+                )
 
             self.assertNotIn("orphan-hub", catalog["hubs"])
             self.assertFalse(orphan.exists())
 
-    def test_clone_rejects_a_symlinked_catalog_parent_directory(self) -> None:
+    def test_failed_setup_promotion_keeps_draft_and_removes_config(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("retry-setup")
+                for slot in launcher.HUB_SLOT_ORDER:
+                    launcher.set_hub_setup_mapping(
+                        created,
+                        slot,
+                        {"id": f"{slot}-id", "name": slot},
+                        f"{slot}-model",
+                        api_format="anthropic",
+                    )
+                real_write = launcher._atomic_private_write
+
+                def fail_catalog(path, text):
+                    if path == launcher.HUB_CATALOG:
+                        raise OSError("fixture promotion failure")
+                    return real_write(path, text)
+
+                with mock.patch.object(
+                    launcher,
+                    "_atomic_private_write",
+                    side_effect=fail_catalog,
+                ):
+                    with self.assertRaisesRegex(OSError, "promotion failure"):
+                        launcher.complete_hub_setup(created)
+
+                catalog = launcher.load_hub_catalog()
+                persisted = launcher.load_hub_setup_draft(created)
+
+            self.assertEqual(
+                catalog["hubs"][created.hub_id]["state"], "setup"
+            )
+            self.assertEqual(len(persisted["mappings"]), 4)
+            self.assertTrue(created.draft_path.is_file())
+            self.assertFalse(created.config_path.exists())
+
+    def test_setup_promotion_recovers_a_config_left_before_catalog_write(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("recover-setup")
+                for slot in launcher.HUB_SLOT_ORDER:
+                    launcher.set_hub_setup_mapping(
+                        created,
+                        slot,
+                        {"id": f"{slot}-id", "name": slot},
+                        f"{slot}-model",
+                        api_format="anthropic",
+                    )
+                draft = launcher.load_hub_setup_draft(created)
+                ready_configs = {
+                    ref.hub_id: launcher.load_hub_config(hub=ref)
+                    for ref in launcher.list_hub_refs()
+                    if ref.state == "ready"
+                }
+                port = launcher._next_hub_port(ready_configs, 18787)
+                interrupted_config = launcher._hub_config_from_setup_draft(
+                    created, draft, port
+                )
+                launcher._atomic_private_write(
+                    created.config_path,
+                    launcher._hub_config_text(interrupted_config),
+                )
+
+                ready, recovered = launcher.complete_hub_setup(created)
+                catalog = launcher.load_hub_catalog()
+
+            self.assertEqual(ready.state, "ready")
+            self.assertEqual(recovered, interrupted_config)
+            self.assertEqual(catalog["hubs"][ready.hub_id]["state"], "ready")
+            self.assertFalse(created.draft_path.exists())
+
+    def test_setup_recovery_reassigns_a_port_taken_after_the_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                crashed = launcher.create_named_hub("crashed-setup")
+                other = launcher.create_named_hub("completed-later")
+                for hub in (crashed, other):
+                    for slot in launcher.HUB_SLOT_ORDER:
+                        launcher.set_hub_setup_mapping(
+                            hub,
+                            slot,
+                            {"id": f"{hub.hub_id}-{slot}", "name": slot},
+                            f"{slot}-model",
+                            api_format="anthropic",
+                        )
+                ready_configs = {
+                    ref.hub_id: launcher.load_hub_config(hub=ref)
+                    for ref in launcher.list_hub_refs()
+                    if ref.state == "ready"
+                }
+                crashed_port = launcher._next_hub_port(ready_configs, 18787)
+                crashed_config = launcher._hub_config_from_setup_draft(
+                    crashed,
+                    launcher.load_hub_setup_draft(crashed),
+                    crashed_port,
+                )
+                launcher._atomic_private_write(
+                    crashed.config_path,
+                    launcher._hub_config_text(crashed_config),
+                )
+
+                _other_ref, other_config = launcher.complete_hub_setup(other)
+                recovered_ref, recovered_config = launcher.complete_hub_setup(
+                    crashed
+                )
+
+            self.assertEqual(other_config["port"], crashed_port)
+            self.assertNotEqual(recovered_config["port"], crashed_port)
+            self.assertEqual(recovered_ref.state, "ready")
+            self.assertEqual(
+                recovered_config["local_token"], crashed_config["local_token"]
+            )
+
+    def test_create_rejects_a_symlinked_catalog_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
             env = self._multi_hub_env(home)
@@ -2683,11 +3052,10 @@ class HubWorkspaceTests(unittest.TestCase):
             (root / "hubs").symlink_to(outside, target_is_directory=True)
 
             with loaded_launcher(env) as launcher:
-                source = launcher.resolve_hub_ref("claude-hub1")
                 with self.assertRaisesRegex(ValueError, "符号链接"):
-                    launcher.clone_named_hub(source, "escape-hub")
+                    launcher.create_named_hub("escape-hub")
 
-            self.assertFalse((outside / "escape-hub.json").exists())
+            self.assertFalse((outside / "escape-hub.setup.json").exists())
 
     def test_renaming_hub_preserves_its_stable_identity_and_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
