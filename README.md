@@ -135,8 +135,10 @@ mode、permission-mode、last-prompt、file-history 和 system 统计元条目�
 ## 可选：启用 claude-hub
 
 Hub 适合需要在一个长会话里频繁切换渠道和模型的人。它监听本机
-`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。启动页聚焦 Hub 时，
-Enter 按配置的 `launch_slot` 直接启动，按 `→` 才进入 Slots / Channels 管理页。
+`127.0.0.1`，Claude Code 仍使用原生 `/model` 选择器。启动页会直接展开四个
+Hub 槽位及各自的渠道、模型、effort 和默认标记：使用 `↑↓` 选择槽位、Enter
+启动，使用 `←`、`→` 或 `e` 调整 effort，按 `a` 直接新增渠道。模型池绑定和
+渠道删除等完整操作通过 `Tab` 或 `m` 进入 Slots / Channels 管理页。
 
 1. 安装 uv。
 2. 从仓库复制示例配置，并将 provider 名改成 CC Switch 中的真实名称：
@@ -175,9 +177,9 @@ Enter 按配置的 `launch_slot` 直接启动，按 `→` 才进入 Slots / Chan
 不会显示上游地址或 token。Hub 会要求配置、CC Switch 数据库以及当前存在的
 `-wal`、`-shm` 文件权限不超过 `0600`；检查失败时按输出修正后再启动。
 
-进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。Slots
-页可用 `←`、`→` 或 `e` 修改当前槽位的默认 effort，用 `b` 将模型池里的模型绑定
-到某个槽位；Channels 页可添加或删除未被回退路由和槽位引用的渠道。槽位默认
+进入 Claude Code 后运行 `/model`，模型以 `渠道别名,模型名` 的形式出现。首页与
+Slots 页都可修改当前槽位的默认 effort；Slots 页额外用 `b` 将模型池里的模型绑定
+到某个槽位，Channels 页可添加或删除未被回退路由和槽位引用的渠道。槽位默认
 effort 通过本次会话的临时 settings 注入，不会用环境变量锁死，进入会话后仍可用
 原生 `/effort` 调整。Hub 会在请求发生时从 CC Switch DB 只读获取对应 provider
 的凭证，不修改 DB、provider 或 current 状态。
