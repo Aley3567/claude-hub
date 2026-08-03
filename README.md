@@ -140,9 +140,10 @@ Hub 适合需要在不同工作区或一个长会话里频繁切换渠道和模�
 
 启动首页只列命名 Hub，不展开模型或四个槽位。使用 `↑↓` 选择 Hub，按 Enter
 直接从该 Hub 的 `launch_slot` 启动；按 `m`、`→` 或 `Tab` 进入该 Hub 的
-Slots / Channels 管理页。首页按 `a` 或 `n` 会复制当前 Hub 的渠道、四槽和
-effort，创建一份端口与进程隔离的新 Hub；按 `r` 只修改显示名，不改变稳定 id、
-配置路径或运行身份。
+Slots / Channels 管理页。首页按 `a` 或 `n` 创建一个不继承任何渠道或模型的空白
+Hub，并立即进入首次设置页，为 Fable、Opus、Sonnet、Haiku 逐槽选择“渠道,模型”
+映射。四槽完成前首页显示“待配置”，Enter、`m` 或 `→` 只会继续设置，不会启动；
+按 `r` 只修改显示名，不改变稳定 id、配置路径或运行身份。
 
 进入 Channels 页后，新增渠道使用“渠道 → 模型 → 设置 → 确认”四阶段面板。选择
 CC Switch 渠道后，该渠道声明的模型默认全部勾选，可用空格取消或重新勾选；候选
@@ -166,7 +167,9 @@ CC Switch 渠道后，该渠道声明的模型默认全部勾选，可用空格�
    首次打开 `claude1` 时，启动器会把现有 `~/.cc-switch/claude-hub.json`
    自动登记为名为 `Claude-Hub` 的工作区，并创建目录
    `~/.cc-switch/claude-hubs.json`。旧配置文件只被目录引用，不会被移动或改名。
-   新增 Hub 的独立配置写入 `~/.cc-switch/hubs/<hub-id>.json`。
+   新建 Hub 先把不含模型的设置草稿写入
+   `~/.cc-switch/hubs/<hub-id>.setup.json`；四槽映射确认完成后才原子生成独立的
+   `~/.cc-switch/hubs/<hub-id>.json`，并分配端口与运行身份。
 
    目录文件的结构如下；其中所有路径都相对于目录文件所在位置：
 
@@ -178,6 +181,7 @@ CC Switch 渠道后，该渠道声明的模型默认全部勾选，可用空格�
      "hubs": {
        "claude-hub": {
          "name": "Claude-Hub",
+         "state": "ready",
          "config": "claude-hub.json",
          "log": "logs/claude-hub.log",
          "usage": "logs/claude-hub-usage.jsonl"

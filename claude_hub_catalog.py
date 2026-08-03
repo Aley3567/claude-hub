@@ -15,6 +15,7 @@ MAX_DISPLAY_NAME_WIDTH = 48
 
 _HUB_ID_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
 _ENTRY_PATH_FIELDS = ("config", "log", "usage")
+_ENTRY_STATES = {"ready", "setup"}
 
 
 def legacy_hub_entry(
@@ -73,6 +74,10 @@ def normalize_hub_catalog(raw: object) -> dict:
                 f"{previous_owner} and {hub_id}"
             )
         display_name_owners[folded_name] = hub_id
+        state = entry.get("state", "ready")
+        if not isinstance(state, str) or state not in _ENTRY_STATES:
+            raise ValueError(f"hubs.{hub_id}.state must be ready or setup")
+        entry["state"] = state
         for field in _ENTRY_PATH_FIELDS:
             value = entry.get(field)
             if not isinstance(value, str) or not value.strip():
@@ -83,10 +88,28 @@ def normalize_hub_catalog(raw: object) -> dict:
             owner = path_owners.get(canonical)
             if owner is not None:
                 raise ValueError(
-                    f"hub catalog path is shared by {owner} and {hub_id}.{field}"
+                    "hub catalog path is shared; paths must be unique: "
+                    f"{owner} and {hub_id}.{field} share {value}"
                 )
             path_owners[canonical] = f"{hub_id}.{field}"
             entry[field] = value
+        draft = entry.get("draft")
+        if state == "setup" and draft is None:
+            raise ValueError(f"hubs.{hub_id}.draft is required while setup")
+        if draft is not None:
+            if not isinstance(draft, str) or not draft.strip():
+                raise ValueError(f"hubs.{hub_id}.draft must be a relative path")
+            draft = draft.strip()
+            _validate_relative_path(draft)
+            canonical = PurePosixPath(draft.replace("\\", "/")).as_posix().casefold()
+            owner = path_owners.get(canonical)
+            if owner is not None:
+                raise ValueError(
+                    "hub catalog path is shared; paths must be unique: "
+                    f"{owner} and {hub_id}.draft share {draft}"
+                )
+            path_owners[canonical] = f"{hub_id}.draft"
+            entry["draft"] = draft
     return catalog
 
 
