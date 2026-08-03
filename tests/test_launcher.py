@@ -2558,7 +2558,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 updated = launcher.add_hub_channel(
                     provider,
                     alias="new_channel",
-                    model="new-model",
+                    models=["new-model"],
                 )
 
             self.assertEqual(
@@ -2567,27 +2567,6 @@ class HubWorkspaceTests(unittest.TestCase):
             )
             serialized = config.read_text(encoding="utf-8")
             self.assertNotIn("fixture-private-value", serialized)
-
-    def test_slot_binding_compare_and_swap_refuses_a_stale_confirmation(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_home:
-            home = Path(raw_home)
-            env = self._hub_env(home)
-            config = Path(env["CLAUDE1_HUB_CONFIG"])
-            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
-            config.chmod(0o600)
-            provider = {"id": "new-id", "name": "New"}
-            with loaded_launcher(env) as launcher:
-                with self.assertRaisesRegex(ValueError, "另一窗口"):
-                    launcher.add_hub_channel(
-                        provider,
-                        alias="new-channel",
-                        model="new-model",
-                        slot="fable",
-                        expected_slot_selector="stale,selector",
-                    )
-
-            persisted = json.loads(config.read_text(encoding="utf-8"))
-            self.assertNotIn("new-channel", persisted["channels"])
 
     def test_hub_provider_picker_scrolls_to_the_selected_provider(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2781,7 +2760,7 @@ class HubWorkspaceTests(unittest.TestCase):
                             10,  # provider
                             10,  # generated alias
                             10,  # provider model
-                            ord("p"),  # pool only
+                            10,  # confirm add
                             27, ord("q"),
                         ],
                     )
@@ -2819,7 +2798,7 @@ class HubWorkspaceTests(unittest.TestCase):
                             10,
                             10,
                             10,
-                            ord("p"),
+                            10,  # confirm add
                             ord("q"),
                         ],
                     )
@@ -2859,9 +2838,10 @@ class HubWorkspaceTests(unittest.TestCase):
                         [
                             ord("a"),
                             10,  # provider
-                            ord("j"), 10,  # second model
+                            ord(" "),  # deselect default model
+                            ord("j"), 10,  # continue with second model selected
                             10,  # generated alias
-                            10,  # pool only
+                            10,  # confirm add
                             ord("q"),
                         ],
                     )
@@ -2871,6 +2851,50 @@ class HubWorkspaceTests(unittest.TestCase):
                 persisted["channels"]["multi-model"]["models"],
                 ["model-preferred"],
             )
+
+    def test_home_add_keeps_all_provider_models_without_replacing_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home)
+            config = Path(env["CLAUDE1_HUB_CONFIG"])
+            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+            config.chmod(0o600)
+            original_slots = dict(HUB_V2_FIXTURE["model_slots"])
+            provider = {
+                "id": "all-models-id",
+                "name": "All Models",
+                "settings_config": json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "model-default",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL": "model-opus",
+                        }
+                    }
+                ),
+                "meta": json.dumps({"apiFormat": "anthropic"}),
+            }
+            with loaded_launcher(env) as launcher:
+                with mock.patch.object(
+                    launcher, "list_providers", return_value=[provider]
+                ):
+                    self._run_home(
+                        launcher,
+                        [
+                            ord("a"),
+                            10,  # provider
+                            10,  # accept the default model selection
+                            10,  # generated alias
+                            10,  # add channel
+                            ord("q"),
+                        ],
+                    )
+
+            persisted = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["channels"]["all-models"]["models"],
+                ["model-default", "model-opus"],
+            )
+            self.assertEqual(persisted["model_slots"], original_slots)
 
     def test_add_wizard_accepts_a_custom_model_not_in_provider_settings(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2902,11 +2926,14 @@ class HubWorkspaceTests(unittest.TestCase):
                         [
                             ord("a"),
                             10,  # provider
-                            ord("j"), ord("j"), 10,  # custom model row
+                            ord(" "),  # deselect first declared model
+                            ord("j"), ord(" "),  # deselect second declared model
+                            ord("a"),  # manually add a model
                             *(ord(char) for char in custom_model),
                             10,  # custom model input
+                            10,  # continue with custom model selected
                             10,  # generated alias
-                            10,  # pool only
+                            10,  # confirm add
                             ord("q"),
                         ],
                     )
@@ -2943,8 +2970,9 @@ class HubWorkspaceTests(unittest.TestCase):
                             10,  # only the custom-model row
                             *(ord(char) for char in custom_model),
                             10,
+                            10,  # continue with custom model selected
                             10,  # generated alias
-                            10,  # pool only
+                            10,  # confirm add
                             ord("q"),
                         ],
                     )
@@ -3000,51 +3028,50 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertIn("新增 Hub 渠道", rendered)
             self.assertIn("● 渠道", rendered)
             self.assertIn("选择 CC Switch 渠道", rendered)
-            self.assertIn("选择模型", rendered)
-            self.assertIn("手动输入模型 ID", rendered)
+            self.assertIn("选择要加入 Hub 的模型", rendered)
+            self.assertIn("手动添加模型 ID", rendered)
             self.assertIn("设置渠道", rendered)
-            self.assertIn("选择添加去向", rendered)
-            self.assertIn("仅加入模型池", rendered)
-            self.assertIn("绑定 Fable", rendered)
+            self.assertIn("确认新增渠道", rendered)
+            self.assertIn("只新增到 Claude-Hub", rendered)
+            self.assertNotIn("替换", rendered)
+            self.assertNotIn("绑定 Fable", rendered)
             self.assertFalse(any("Step" in value for value in rendered_strings))
 
-    def test_add_wizard_can_choose_a_slot_without_memorizing_shortcuts(self) -> None:
+    def test_add_wizard_uses_distinct_stage_and_model_family_colors(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
-            home = Path(raw_home)
-            env = self._hub_env(home)
-            config = Path(env["CLAUDE1_HUB_CONFIG"])
-            config.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
-            config.chmod(0o600)
-            provider = {
-                "id": "arrow-bind-id",
-                "name": "Arrow Bind",
-                "settings_config": json.dumps(
-                    {"env": {"ANTHROPIC_MODEL": "arrow-model"}}
-                ),
-                "meta": json.dumps({"apiFormat": "anthropic"}),
-            }
+            env = self._hub_env(Path(raw_home))
+            window = ScriptedWindow([27], size=(24, 100))
             with loaded_launcher(env) as launcher:
-                with mock.patch.object(
-                    launcher, "list_providers", return_value=[provider]
-                ):
-                    self._run_home(
-                        launcher,
-                        [
-                            ord("a"),
-                            10,  # provider
-                            10,  # model
-                            10,  # generated alias
-                            ord("j"), 10,  # Fable destination
-                            ord("y"), 10,  # confirm replacement
-                            ord("q"),
-                        ],
+                launcher.C = {
+                    "dim": 1,
+                    "lime": 2,
+                    "orange": 4,
+                    "accent": 8,
+                    "sel": 16,
+                    "gold": 32,
+                    "violet": 64,
+                }
+                launcher._row_pairs[:] = [128, 256]
+                self.assertIsNone(
+                    launcher._choose_hub_models(
+                        window,
+                        {"id": "color-id", "name": "Color Provider"},
+                        ["claude-color", "glm-color"],
                     )
+                )
 
-            persisted = json.loads(config.read_text(encoding="utf-8"))
-            self.assertEqual(
-                persisted["model_slots"]["fable"],
-                "arrow-bind,arrow-model",
-            )
+            writes = {
+                value: call[3]
+                for call in window.added
+                for value in call[2:3]
+                if isinstance(value, str) and len(call) >= 4
+            }
+            self.assertEqual(writes["✓ 渠道"], 2)
+            self.assertNotEqual(writes["✓ 渠道"], writes["● 模型"])
+            self.assertNotEqual(writes["● 模型"], writes["○ 设置"])
+            glm_row = next(text for text in writes if "[✓] glm-color" in text)
+            manual_row = next(text for text in writes if "手动添加模型 ID" in text)
+            self.assertNotEqual(writes[glm_row], writes[manual_row])
 
     def test_channels_add_wizard_prompts_when_api_format_cannot_be_inferred(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -3075,7 +3102,7 @@ class HubWorkspaceTests(unittest.TestCase):
                             10,
                             10,
                             ord("c"),
-                            ord("p"),
+                            10,  # confirm add
                             27,
                             ord("q"),
                         ],
@@ -3118,7 +3145,7 @@ class HubWorkspaceTests(unittest.TestCase):
             provider = {"id": "removable-id", "name": "Removable"}
             with loaded_launcher(env) as launcher:
                 launcher.add_hub_channel(
-                    provider, alias="removable", model="temporary-model"
+                    provider, alias="removable", models=["temporary-model"]
                 )
                 result = self._run_home(
                     launcher,

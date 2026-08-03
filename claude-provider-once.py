@@ -1291,25 +1291,25 @@ def add_hub_channel(
     provider: dict,
     *,
     alias: str,
-    model: str,
-    slot: str | None = None,
-    expected_slot_selector: str | None = None,
+    models: list[str],
     api_format: str | None = None,
 ) -> dict:
-    """Add one credential-free channel referencing a stable CC Switch id."""
+    """Add one credential-free, multi-model channel without changing slots."""
     alias = alias.strip().casefold()
-    model = model.strip()
     provider_id = str(provider.get("id") or "").strip()
     if re.fullmatch(r"[a-z][a-z0-9_-]*", alias) is None:
         raise ValueError("渠道 alias 必须匹配 [a-z][a-z0-9_-]*")
     if not provider_id:
         raise ValueError("provider 缺少稳定 id")
-    if not model or "," in model:
-        raise ValueError("model 必须是非空且不能包含逗号")
-    if slot is not None and slot not in HUB_SLOT_ORDER:
-        raise ValueError("slot 必须是 fable、opus、sonnet 或 haiku")
-    if expected_slot_selector is not None and slot is None:
-        raise ValueError("expected_slot_selector 只能与 slot 一起使用")
+    if not isinstance(models, list) or not models:
+        raise ValueError("models 必须是非空模型列表")
+    normalized_models: list[str] = []
+    for raw_model in models:
+        model = raw_model.strip() if isinstance(raw_model, str) else ""
+        if not model or "," in model:
+            raise ValueError("model 必须是非空且不能包含逗号")
+        if model not in normalized_models:
+            normalized_models.append(model)
     if api_format is not None and api_format not in {
         "anthropic",
         "openai_chat",
@@ -1322,17 +1322,10 @@ def add_hub_channel(
             raise ValueError(f"hub 渠道已存在: {alias}")
         latest["channels"][alias] = {
             "provider": f"id:{provider_id}",
-            "models": [model],
+            "models": normalized_models,
         }
         if api_format is not None:
             latest["channels"][alias]["api_format"] = api_format
-        if slot is not None:
-            if (
-                expected_slot_selector is not None
-                and latest["model_slots"][slot] != expected_slot_selector
-            ):
-                raise ValueError("槽位已被另一窗口修改，请重新确认")
-            latest["model_slots"][slot] = f"{alias},{model}"
 
     return mutate_hub_config(add)
 
@@ -2425,7 +2418,7 @@ def _choose_hub_slot(win, prompt: str) -> str | None:
             return slot
 
 
-_HUB_WIZARD_STAGES = ("渠道", "模型", "设置", "去向")
+_HUB_WIZARD_STAGES = ("渠道", "模型", "设置", "确认")
 
 
 def _draw_hub_wizard_shell(
@@ -2447,26 +2440,31 @@ def _draw_hub_wizard_shell(
         _truncate_display("Claude1  ›  Claude-Hub  ›  新增 Hub 渠道", width),
         C.get("dim", 0),
     )
-    progress = "  ─  ".join(
-        f"{'✓' if index < stage else '●' if index == stage else '○'} {label}"
-        for index, label in enumerate(_HUB_WIZARD_STAGES)
-    )
     compact = h < 10
     progress_row = 1 if compact else 2
     title_row = 2 if compact else 4
-    _addstr(
-        win,
-        progress_row,
-        2,
-        _truncate_display(progress, width),
-        C.get("lime", 0),
-    )
+    progress_x = 2
+    for index, label in enumerate(_HUB_WIZARD_STAGES):
+        marker = "✓" if index < stage else "●" if index == stage else "○"
+        token = f"{marker} {label}"
+        if index < stage:
+            attr = C.get("lime", 0)
+        elif index == stage:
+            attr = C.get("orange", C.get("accent", 0)) | curses.A_BOLD
+        else:
+            attr = C.get("dim", 0)
+        _addstr(win, progress_row, progress_x, token, attr)
+        progress_x += _dwidth(token)
+        if index < len(_HUB_WIZARD_STAGES) - 1:
+            separator = "  ─  "
+            _addstr(win, progress_row, progress_x, separator, C.get("dim", 0))
+            progress_x += _dwidth(separator)
     _addstr(
         win,
         title_row,
         2,
         _truncate_display(title, width),
-        C.get("base", 0) | curses.A_BOLD,
+        C.get("accent", 0) | curses.A_BOLD,
     )
     if detail and h >= 8:
         _addstr(
@@ -2493,6 +2491,7 @@ def _draw_hub_wizard_options(
     options: list[tuple[str, str]],
     idx: int,
     list_top: int,
+    color_keys: list[str] | None = None,
 ) -> None:
     """Render one selectable option list inside the add-channel surface."""
     h, w = win.getmaxyx()
@@ -2508,6 +2507,12 @@ def _draw_hub_wizard_options(
             secondary,
             max(0, row_width - 2),
         )
+        if color_keys and option_index < len(color_keys):
+            row_attr = C.get(color_keys[option_index], 0)
+        elif _row_pairs:
+            row_attr = _row_pairs[option_index % len(_row_pairs)]
+        else:
+            row_attr = C.get("base", 0)
         _addstr(
             win,
             list_top + offset,
@@ -2515,7 +2520,7 @@ def _draw_hub_wizard_options(
             _pad_display(line, row_width) if selected else line,
             C.get("sel", curses.A_REVERSE)
             if selected
-            else C.get("base", 0) | curses.A_BOLD,
+            else row_attr | curses.A_BOLD,
         )
 
 
@@ -2591,48 +2596,85 @@ def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
             return providers[idx]
 
 
-def _choose_hub_model(
+def _choose_hub_models(
     win,
     provider: dict,
     models: list[str],
-) -> str | None:
-    """Choose one model exposed by the selected CC Switch provider."""
+) -> list[str] | None:
+    """Choose one or more provider models; declared models start selected."""
+    candidates = list(models)
+    selected = set(candidates)
     idx = 0
-    item_count = len(models) + 1
+    notice = ""
     while True:
+        item_count = len(candidates) + 1
+        idx = max(0, min(idx, item_count - 1))
         provider_name = provider.get("name") or provider.get("id")
+        selection_summary = f"已选 {len(selected)} 个"
+        if notice:
+            selection_summary += f" · {notice}"
         list_top = _draw_hub_wizard_shell(
             win,
             1,
-            "选择模型",
-            detail=f"渠道 · {provider_name}",
+            "选择要加入 Hub 的模型",
+            detail=f"渠道 · {provider_name} · {selection_summary}",
+            footer="Esc 取消 · ↑↓/jk 移动 · Space 勾选 · a 手动添加 · Enter 继续",
         )
         options = [
-            (model, _hub_model_family(model))
-            for model in models
+            (
+                f"[{'✓' if model in selected else ' '}] {model}",
+                _hub_model_family(model),
+            )
+            for model in candidates
         ]
-        options.append(("＋ 手动输入模型 ID", "候选中没有时使用"))
-        _draw_hub_wizard_options(win, options, idx, list_top)
+        options.append(("＋ 手动添加模型 ID", "候选中没有时使用"))
+        color_keys = [
+            _HUB_FAMILY_COLOR.get(_hub_model_family(model), "violet")
+            for model in candidates
+        ]
+        color_keys.append("gold")
+        _draw_hub_wizard_options(
+            win,
+            options,
+            idx,
+            list_top,
+            color_keys=color_keys,
+        )
         win.refresh()
         ch = win.getch()
         if ch in (-1, 27):
             return None
+        notice = ""
         if ch in (curses.KEY_UP, ord("k")):
             idx = (idx - 1) % item_count
         elif ch in (curses.KEY_DOWN, ord("j")):
             idx = (idx + 1) % item_count
+        elif ch == ord(" ") and idx < len(candidates):
+            model = candidates[idx]
+            if model in selected:
+                selected.remove(model)
+            else:
+                selected.add(model)
+        elif ch in (ord("a"), ord("A")) or (
+            ch in (10, 13, curses.KEY_ENTER) and idx == len(candidates)
+        ):
+            custom = _prompt_hub_text(
+                win,
+                "模型 ID",
+                "",
+                stage=1,
+                title="手动添加模型 ID",
+                detail=f"渠道 · {provider_name}",
+            )
+            if custom:
+                if custom not in candidates:
+                    candidates.append(custom)
+                selected.add(custom)
+                idx = candidates.index(custom)
         elif ch in (10, 13, curses.KEY_ENTER):
-            if idx == len(models):
-                custom = _prompt_hub_text(
-                    win,
-                    "模型 ID",
-                    "",
-                    stage=1,
-                    title="输入模型 ID",
-                    detail=f"渠道 · {provider_name}",
-                )
-                return custom if custom else None
-            return models[idx]
+            if selected:
+                return [model for model in candidates if model in selected]
+            notice = "请至少勾选一个模型"
 
 
 def _hub_alias_slug(name: object) -> str:
@@ -2696,6 +2738,7 @@ def _choose_hub_api_format(win, detail: str = "") -> str | None:
             [(label, description) for _value, label, description in choices],
             idx,
             list_top,
+            color_keys=["orange", "teal", "violet"],
         )
         win.refresh()
         ch = win.getch()
@@ -2714,55 +2757,66 @@ def _choose_hub_api_format(win, detail: str = "") -> str | None:
             return choice
 
 
-def _choose_hub_destination(win, alias: str, model: str) -> str | None:
-    """Choose pool-only or one native slot; None means the user cancelled."""
-    config = load_hub_config()
-    options = [
-        ("pool", "仅加入模型池", "稍后可在 Slots 页绑定"),
-        *[
-            (
-                slot,
-                f"绑定 {slot.title()}",
-                f"替换 {config['model_slots'][slot]}",
-            )
-            for slot in HUB_SLOT_ORDER
-        ],
-    ]
-    shortcuts = {"p": "pool", "f": "fable", "o": "opus", "s": "sonnet", "h": "haiku"}
-    idx = 0
+def _confirm_hub_channel_add(win, alias: str, models: list[str]) -> bool:
+    """Confirm a pure Hub channel addition without offering slot replacement."""
     while True:
         list_top = _draw_hub_wizard_shell(
             win,
             3,
-            "选择添加去向",
-            detail=f"{alias},{model}",
-            footer="Esc 取消 · ↑↓/jk 选择 · Enter 添加 · p/f/o/s/h 快捷选择",
+            "确认新增渠道",
+            detail="只新增到 Claude-Hub，不修改 Fable / Opus / Sonnet / Haiku",
+            footer="Esc 取消 · Enter 添加到 Hub",
         )
-        _draw_hub_wizard_options(
+        h, w = win.getmaxyx()
+        row_width = max(0, w - 4)
+        _addstr(
             win,
-            [(label, description) for _value, label, description in options],
-            idx,
             list_top,
+            2,
+            _compose_row("渠道别名", alias, row_width),
+            C.get("teal", 0) | curses.A_BOLD,
         )
+        _addstr(
+            win,
+            list_top + 1,
+            2,
+            f"模型 · {len(models)} 个",
+            C.get("gold", 0) | curses.A_BOLD,
+        )
+        model_capacity = max(0, h - 1 - (list_top + 2))
+        visible_count = model_capacity
+        if len(models) > model_capacity and model_capacity > 0:
+            visible_count -= 1
+        visible_models = models[:visible_count]
+        for offset, model in enumerate(visible_models):
+            family = _hub_model_family(model)
+            _addstr(
+                win,
+                list_top + 2 + offset,
+                2,
+                _truncate_display(f"  • {model}", row_width),
+                C.get(_HUB_FAMILY_COLOR.get(family, "violet"), 0)
+                | curses.A_BOLD,
+            )
+        hidden_count = len(models) - len(visible_models)
+        if hidden_count > 0 and model_capacity > 0:
+            _addstr(
+                win,
+                list_top + 2 + len(visible_models),
+                2,
+                f"  … 另 {hidden_count} 个模型",
+                C.get("dim", 0),
+            )
         win.refresh()
         ch = win.getch()
         if ch in (-1, 27):
-            return None
-        if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(options)
-            continue
-        if ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(options)
-            continue
+            return False
         if ch in (10, 13, curses.KEY_ENTER):
-            return options[idx][0]
-        choice = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
-        if choice is not None:
-            return choice
+            return True
 
 
 def _hub_add_channel_wizard(win) -> dict | None:
-    """Run the four-stage provider/model/settings/destination wizard."""
+    """Run the pure provider/models/settings/confirmation add flow."""
     provider = _choose_hub_provider(win, list_providers())
     if provider is None:
         return None
@@ -2771,12 +2825,12 @@ def _hub_add_channel_wizard(win) -> dict | None:
     except (TypeError, json.JSONDecodeError):
         settings = {}
     inferred_api_format = _infer_hub_provider_api_format(provider)
-    model = _choose_hub_model(
+    models = _choose_hub_models(
         win,
         provider,
         _provider_models(settings, include_placeholder=False),
     )
-    if model is None:
+    if models is None:
         return None
     alias = _prompt_hub_text(
         win,
@@ -2784,34 +2838,24 @@ def _hub_add_channel_wizard(win) -> dict | None:
         _hub_alias_slug(provider.get("name")),
         stage=2,
         title="设置渠道",
-        detail=f"{provider.get('name') or provider.get('id')} · {model}",
+        detail=f"{provider.get('name') or provider.get('id')} · {len(models)} 个模型",
     )
     if alias is None:
         return None
     api_format = None
     if inferred_api_format is None:
-        api_format = _choose_hub_api_format(win, detail=f"{alias},{model}")
+        api_format = _choose_hub_api_format(
+            win,
+            detail=f"{alias} · {len(models)} 个模型",
+        )
         if api_format is None:
             return None
-    destination = _choose_hub_destination(win, alias, model)
-    if destination is None:
+    if not _confirm_hub_channel_add(win, alias, models):
         return None
-    slot = None if destination == "pool" else destination
-    expected_slot_selector = None
-    if slot is not None:
-        latest = load_hub_config()
-        expected_slot_selector = latest["model_slots"][slot]
-        if not _confirm(
-            win,
-            f"用 {alias},{model} 替换 {slot} 的 {expected_slot_selector}?",
-        ):
-            return None
     return add_hub_channel(
         provider,
         alias=alias,
-        model=model,
-        slot=slot,
-        expected_slot_selector=expected_slot_selector,
+        models=models,
         api_format=api_format,
     )
 
