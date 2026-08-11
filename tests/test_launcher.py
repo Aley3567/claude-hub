@@ -1033,6 +1033,227 @@ class LauncherTuiLogicTests(unittest.TestCase):
                         launcher.current_provider()
 
 
+class ProviderModelEffortOverrideTests(unittest.TestCase):
+    """普通 provider 的模型/effort 本地覆盖：读写、normalize 与生效优先级。"""
+
+    def _provider(self) -> dict:
+        return {
+            "id": "p1",
+            "name": "Fixture Override",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://api.example.com",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                        "ANTHROPIC_MODEL": "fixture-env-model",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "fixture-sonnet",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+
+    def _write_config(self, env: dict[str, str], providers: dict) -> None:
+        config_path = Path(env["CLAUDE1_CONFIG_PATH"])
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps({"version": 3, "providers": providers}),
+            encoding="utf-8",
+        )
+
+    def test_sync_config_sanitizes_model_and_effort_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                cfg = {
+                    "version": 3,
+                    "providers": {
+                        "p1": {
+                            "name": "Fixture Override",
+                            "hidden": False,
+                            "model": "  fixture-override-model  ",
+                            "effort": "ultra",
+                        },
+                        "p2": {
+                            "name": "Fixture Empty",
+                            "hidden": False,
+                            "model": "   ",
+                            "effort": "high",
+                        },
+                    },
+                }
+                providers = [
+                    {"id": "p1", "name": "Fixture Override"},
+                    {"id": "p2", "name": "Fixture Empty"},
+                ]
+
+                self.assertTrue(launcher.sync_config(cfg, providers))
+
+                self.assertEqual(
+                    cfg["providers"]["p1"]["model"], "fixture-override-model"
+                )
+                self.assertNotIn("effort", cfg["providers"]["p1"])
+                self.assertNotIn("model", cfg["providers"]["p2"])
+                self.assertEqual(cfg["providers"]["p2"]["effort"], "high")
+                self.assertEqual(
+                    launcher.provider_launch_overrides(cfg["providers"], "p1"),
+                    ("fixture-override-model", None),
+                )
+                self.assertEqual(
+                    launcher.provider_launch_overrides(cfg["providers"], "p2"),
+                    (None, "high"),
+                )
+
+    def test_override_roundtrip_through_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            self._write_config(
+                env,
+                {
+                    "p1": {
+                        "name": "Fixture Override",
+                        "hidden": False,
+                        "model": "fixture-override-model",
+                        "effort": "xhigh",
+                    }
+                },
+            )
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.load_provider_launch_overrides("p1"),
+                    ("fixture-override-model", "xhigh"),
+                )
+                self.assertEqual(
+                    launcher.load_provider_launch_overrides("missing"),
+                    (None, None),
+                )
+
+    def test_model_setter_and_effort_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                meta = {"p1": {"name": "Fixture Override", "hidden": False}}
+
+                changed, _ = launcher._set_model_override(meta, "p1", "")
+                self.assertFalse(changed)
+                changed, _ = launcher._set_model_override(
+                    meta, "p1", "  fixture-override-model  "
+                )
+                self.assertTrue(changed)
+                self.assertEqual(meta["p1"]["model"], "fixture-override-model")
+                changed, _ = launcher._set_model_override(
+                    meta, "p1", "fixture-override-model"
+                )
+                self.assertFalse(changed)
+                changed, _ = launcher._set_model_override(meta, "p1", "")
+                self.assertTrue(changed)
+                self.assertNotIn("model", meta["p1"])
+
+                seen = [
+                    launcher._cycle_effort_override(meta, "p1", 1)
+                    for _ in range(5)
+                ]
+                self.assertEqual(seen, ["low", "medium", "high", "xhigh", ""])
+                self.assertNotIn("effort", meta["p1"])
+                self.assertEqual(
+                    launcher._cycle_effort_override(meta, "p1", -1), "xhigh"
+                )
+                # 坏值按「未设置」参与循环。
+                meta["p1"]["effort"] = "ultra"
+                self.assertEqual(
+                    launcher._cycle_effort_override(meta, "p1", 1), "low"
+                )
+
+    def test_build_settings_applies_model_and_effort_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            self._write_config(
+                env,
+                {
+                    "p1": {
+                        "name": "Fixture Override",
+                        "hidden": False,
+                        "model": "fixture-override-model",
+                        "effort": "xhigh",
+                    }
+                },
+            )
+            with loaded_launcher(env) as launcher:
+                settings = launcher.build_settings(self._provider())
+
+        # 覆盖优先于 CC Switch env；其余 DEFAULT_* 槽位保持 provider 原值。
+        self.assertEqual(
+            settings["env"]["ANTHROPIC_MODEL"], "fixture-override-model"
+        )
+        self.assertEqual(
+            settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "fixture-sonnet"
+        )
+        self.assertEqual(settings["effortLevel"], "xhigh")
+
+    def test_build_settings_without_overrides_keeps_env_and_no_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                settings = launcher.build_settings(self._provider())
+
+        self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "fixture-env-model")
+        self.assertNotIn("effortLevel", settings)
+
+    def test_build_settings_ignores_invalid_override_values(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            self._write_config(
+                env,
+                {
+                    "p1": {
+                        "name": "Fixture Override",
+                        "hidden": False,
+                        "model": "   ",
+                        "effort": "ultra",
+                    }
+                },
+            )
+            with loaded_launcher(env) as launcher:
+                settings = launcher.build_settings(self._provider())
+
+        self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "fixture-env-model")
+        self.assertNotIn("effortLevel", settings)
+
+    def test_resolve_effective_model_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                provider = self._provider()
+                meta = {"p1": {"name": "Fixture Override", "hidden": False}}
+
+                self.assertEqual(
+                    launcher.resolve_effective_model(provider, meta),
+                    ("fixture-env-model", "CC Switch"),
+                )
+                meta["p1"]["model"] = "fixture-override-model"
+                self.assertEqual(
+                    launcher.resolve_effective_model(provider, meta),
+                    ("fixture-override-model", "本地覆盖"),
+                )
+                bare = {
+                    "id": "p2",
+                    "name": "Fixture Bare",
+                    "settings_config": json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "https://api.example.com",
+                                "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                            }
+                        }
+                    ),
+                }
+                self.assertEqual(
+                    launcher.resolve_effective_model(bare, {}),
+                    ("Claude Code 默认", "内置默认"),
+                )
+
+
 class LauncherSafetyTests(unittest.TestCase):
     def test_usage_loader_reads_rotated_backup_and_skips_malformed_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

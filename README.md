@@ -83,6 +83,16 @@ Provider 名称匹配不区分大小写；如果 CC Switch 中存在重名 provi
 `claude1 id:<provider-id>`。别名不能与 `hub`、`list`、`doctor` 等保留命令
 冲突。隐藏、别名和最近使用状态均按 provider id 保存，重命名不会丢失设置。
 
+首页选中某个渠道后按 `m` 打开模型/effort 快捷面板：文本编辑模型覆盖
+（留空清除），`←`/`→` 或 `e` 在「未设置 → low → medium → high → xhigh」
+之间循环 effort，`Esc` 保存关闭；`Enter` 仍然一键启动，不被面板打断。有覆盖
+的渠道行尾部会显示 `模型:<模型>` 和 `effort:<级别>` 标记。覆盖保存在
+`~/.cc-switch/claude1-config.json` 的 `providers.<id>.model` /
+`providers.<id>.effort` 可选键，绝不写 CC Switch 数据库，只影响 claude1 启动
+的本次会话。生效优先级：本地覆盖 > CC Switch env > Claude Code 内置默认；
+模型覆盖只写 `ANTHROPIC_MODEL`（其余 `DEFAULT_*` 槽位不动），effort 覆盖写入
+临时 settings 的 `effortLevel`，与 Hub 槽位走同一字段。
+
 ## 默认隔离边界
 
 - `claude1` 的普通启动只影响本次 Claude Code 会话；

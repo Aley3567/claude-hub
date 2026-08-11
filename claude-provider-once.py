@@ -362,7 +362,59 @@ def sync_config(cfg: dict, db_providers: list[dict]) -> bool:
         if "enabled" in meta:
             meta.pop("enabled", None)
             changed = True
+        if _sanitize_provider_overrides(meta):
+            changed = True
     return changed
+
+
+def _sanitize_provider_overrides(meta: dict) -> bool:
+    """丢弃 provider 元数据里非法的 model/effort 覆盖（normalize 坏值处理）。
+
+    ``model`` 去空白、空串视为无覆盖；``effort`` 只接受 HUB_EFFORT_LEVELS，
+    其余直接丢弃。与 sync_config 对坏 alias/hidden 的处理一致：静默修正并
+    标记 changed，由调用方落盘，不在 TUI 加载路径上打印。
+    """
+    changed = False
+    model = meta.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            meta.pop("model", None)
+            changed = True
+        elif model != model.strip():
+            meta["model"] = model.strip()
+            changed = True
+    effort = meta.get("effort")
+    if effort is not None and effort not in HUB_EFFORT_LEVELS:
+        meta.pop("effort", None)
+        changed = True
+    return changed
+
+
+def provider_launch_overrides(
+    meta: dict, provider_id: str
+) -> tuple[str | None, str | None]:
+    """读取某个 provider 的 (model, effort) 覆盖；坏值一律视为无覆盖。"""
+    entry = meta.get(provider_id)
+    if not isinstance(entry, dict):
+        return (None, None)
+    model = entry.get("model")
+    model = model.strip() if isinstance(model, str) else ""
+    effort = entry.get("effort")
+    return (
+        model or None,
+        effort if effort in HUB_EFFORT_LEVELS else None,
+    )
+
+
+def load_provider_launch_overrides(
+    provider_id: str,
+) -> tuple[str | None, str | None]:
+    """从 claude1 本地配置读覆盖；只读 ~/.cc-switch/claude1-config.json。"""
+    cfg = load_config()
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return (None, None)
+    return provider_launch_overrides(providers, provider_id)
 
 
 def provider_by_id(provider_id: str) -> dict | None:
@@ -745,6 +797,14 @@ def build_settings(provider: dict) -> dict:
             if all(part.casefold() != host.casefold() for part in parts):
                 parts.append(host)
             env[key] = ",".join(parts)
+    # claude1 本地覆盖（~/.cc-switch/claude1-config.json，绝不写 CC Switch
+    # 数据库）：model 覆盖只写 ANTHROPIC_MODEL，其余 DEFAULT_* 槽位不动；
+    # effort 覆盖走与 Hub 槽位相同的 effortLevel 字段。两者只影响本次会话。
+    model_override, effort_override = load_provider_launch_overrides(
+        str(provider.get("id") or "")
+    )
+    if model_override:
+        env["ANTHROPIC_MODEL"] = model_override
     _seal_model_slots(env)
     cfg["env"] = env
 
@@ -752,6 +812,8 @@ def build_settings(provider: dict) -> dict:
     # Claude Code --settings does not read it, and model selection is already
     # fully expressed by the ANTHROPIC_*_MODEL env vars above.
     cfg.pop("model", None)
+    if effort_override:
+        cfg["effortLevel"] = effort_override
 
     return cfg
 
@@ -2818,6 +2880,194 @@ def _edit_alias(win, provider_id, meta) -> tuple[bool, str]:
     return _set_alias(meta, provider_id, s)
 
 
+def _set_model_override(
+    meta: dict, provider_id: str, candidate: str
+) -> tuple[bool, str]:
+    """设置/清除 model 覆盖；留空即清除，与 _set_alias 同款语义。"""
+    candidate = candidate.strip()
+    if not candidate:
+        changed = bool(meta[provider_id].pop("model", None))
+        return (changed, "模型覆盖已清除" if changed else "未设置模型覆盖")
+    if meta[provider_id].get("model") == candidate:
+        return (False, f"模型覆盖仍为 {candidate}")
+    meta[provider_id]["model"] = candidate
+    return (True, f"模型覆盖已设为 {candidate}")
+
+
+def _cycle_effort_override(meta: dict, provider_id: str, direction: int) -> str:
+    """effort 覆盖循环：未设置 → low → medium → high → xhigh，返回新值或 ''。"""
+    cycle = ("",) + tuple(HUB_EFFORT_LEVELS)
+    current = meta[provider_id].get("effort")
+    current = current if current in HUB_EFFORT_LEVELS else ""
+    nxt = cycle[(cycle.index(current) + direction) % len(cycle)]
+    if nxt:
+        meta[provider_id]["effort"] = nxt
+    else:
+        meta[provider_id].pop("effort", None)
+    return nxt
+
+
+def _edit_model_override(win, provider_id, meta) -> tuple[bool, str]:
+    """底部行文本输入，复用 _edit_alias 的 getstr 模式；留空清除覆盖。"""
+    h, w = win.getmaxyx()
+    prompt = "模型覆盖（留空清除）: "
+    _safe_curs_set(1)
+    try:
+        curses.echo()
+    except curses.error:
+        pass
+    _addstr(win, h - 1, 0, " " * max(0, w - 1))
+    _addstr(win, h - 1, 2, prompt, C.get("accent", 0))
+    win.refresh()
+    input_x = min(max(2, 2 + _dwidth(prompt)), max(2, w - 2))
+    input_limit = max(1, min(64, w - input_x - 1))
+    try:
+        raw = win.getstr(h - 1, input_x, input_limit)
+        s = raw.decode("utf-8", "ignore").strip()
+    except Exception:
+        return (False, "模型覆盖未修改")
+    finally:
+        try:
+            curses.noecho()
+        except curses.error:
+            pass
+        _safe_curs_set(0)
+    return _set_model_override(meta, provider_id, s)
+
+
+def resolve_effective_model(provider: dict, meta: dict | None) -> tuple[str, str]:
+    """返回 (生效模型, 来源)；优先级：本地覆盖 > CC Switch env > 内置默认。"""
+    if isinstance(meta, dict):
+        model_override, _ = provider_launch_overrides(
+            meta, str(provider.get("id") or "")
+        )
+        if model_override:
+            return (model_override, "本地覆盖")
+    env_models = _provider_models(
+        _provider_settings(provider), include_placeholder=False
+    )
+    if env_models:
+        return (env_models[0], "CC Switch")
+    return ("Claude Code 默认", "内置默认")
+
+
+def _draw_provider_quick_panel(
+    win,
+    name: str,
+    model: str,
+    source: str,
+    effort: str | None,
+    notice: str | None,
+) -> None:
+    """模型/effort 快捷小面板；低行数终端省略面包屑与说明行。"""
+    win.erase()
+    h, w = win.getmaxyx()
+    row_width = max(0, w - 4)
+    row = 0
+    if h >= 8:
+        _addstr(win, row, 2, "Claude1  ›  模型 / effort", C.get("dim", 0))
+        row = 2
+    _addstr(
+        win,
+        row,
+        2,
+        _truncate_display(name, row_width),
+        C.get("lime", 0) | curses.A_BOLD,
+    )
+    row += 2 if h >= 8 else 1
+    model_text = f"生效模型  {model}"
+    if source:
+        model_text += f"（{source}）"
+    _addstr(
+        win,
+        row,
+        2,
+        _truncate_display(model_text, row_width),
+        C.get("base", 0),
+    )
+    row += 1
+    effort_text = f"effort    {effort or '未设置（跟随默认）'}"
+    _addstr(
+        win,
+        row,
+        2,
+        _truncate_display(effort_text, row_width),
+        C.get("accent", 0) | curses.A_BOLD,
+    )
+    if h >= 10:
+        _addstr(
+            win,
+            row + 2,
+            2,
+            _truncate_display(
+                "覆盖只影响 claude1 启动的本次会话，不修改 CC Switch 配置",
+                row_width,
+            ),
+            C.get("dim", 0),
+        )
+    footer = notice or "m/Enter 编辑模型（留空清除） · ←/→/e 切换 effort · Esc 保存返回"
+    _addstr(
+        win,
+        max(0, h - 1),
+        2,
+        _truncate_display(footer, row_width),
+        C.get("warning", 0) if notice else C.get("dim", 0),
+    )
+    win.refresh()
+
+
+def _provider_model_effort_panel(
+    win, cfg, provider, provider_id
+) -> str | None:
+    """普通 provider 的模型/effort 快捷面板；编辑即时生效于内存，Esc 落盘关闭。"""
+    meta = cfg["providers"]
+    name = _provider_meta_label(meta, provider_id)
+    backup = (
+        meta[provider_id].get("model"),
+        meta[provider_id].get("effort"),
+    )
+    notice: str | None = None
+    while True:
+        try:
+            model, source = resolve_effective_model(provider, meta)
+        except RuntimeError:
+            model_override, _ = provider_launch_overrides(meta, provider_id)
+            model, source = (
+                (model_override, "本地覆盖")
+                if model_override
+                else ("读取失败", "CC Switch 配置无效")
+            )
+        _, effort = provider_launch_overrides(meta, provider_id)
+        _draw_provider_quick_panel(win, name, model, source, effort, notice)
+        notice = None
+        ch = win.getch()
+        if ch in (-1, 27, ord("q")):
+            break
+        if ch == curses.KEY_LEFT:
+            _cycle_effort_override(meta, provider_id, -1)
+        elif ch in (curses.KEY_RIGHT, ord("e")):
+            _cycle_effort_override(meta, provider_id, 1)
+        elif ch in (ord("m"), 10, 13, curses.KEY_ENTER):
+            _, notice = _edit_model_override(win, provider_id, meta)
+    if (
+        meta[provider_id].get("model") == backup[0]
+        and meta[provider_id].get("effort") == backup[1]
+    ):
+        return None
+    if save_config(cfg):
+        return "模型/effort 覆盖已保存"
+    # 与别名流程一致：落盘失败时回滚内存修改，避免界面展示与磁盘状态分叉。
+    if backup[0] is None:
+        meta[provider_id].pop("model", None)
+    else:
+        meta[provider_id]["model"] = backup[0]
+    if backup[1] is None:
+        meta[provider_id].pop("effort", None)
+    else:
+        meta[provider_id]["effort"] = backup[1]
+    return "无法保存模型/effort 覆盖，已撤销本次修改"
+
+
 def _confirm(win, msg) -> bool:
     """底部 y/n 选择条：←→ 或 y/n 切换，回车确认，Esc 取消。默认 n。"""
     h, _ = win.getmaxyx()
@@ -3058,6 +3308,13 @@ def _draw_launcher(
         status: list[str] = []
         if m.get("alias"):
             status.append(str(m["alias"]))
+        model_override, effort_override = provider_launch_overrides(
+            meta, provider_id
+        )
+        if model_override:
+            status.append(f"模型:{model_override}")
+        if effort_override:
+            status.append(f"effort:{effort_override}")
         if provider_id == recent:
             status.append("最近")
         if hidden:
@@ -3091,7 +3348,7 @@ def _draw_launcher(
     elif help_open and hub_focus and hubs:
         foot = "Hub：首页 Enter 启动 · m/→ 管理 · n 新建 · r 重命名 · ? 返回"
     elif help_open:
-        foot = "a 设置别名 · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
+        foot = "a 设置别名 · m 模型/effort · x 隐藏/显示 · h 隐藏项 · ? 返回 · q 退出"
     elif hub_focus and hubs and pending_selected:
         foot = "Hub · Enter/m/→ 继续配置 · n 新建 · r 重命名 · q 退出"
     elif hub_focus and hubs:
@@ -4850,6 +5107,16 @@ def _launcher_main(win, cfg, db_ids):
                     else:
                         meta[provider_id].pop("alias", None)
                     notice = "无法保存别名，已撤销本次修改"
+        elif ch == ord("m") and not hub_focus and view:
+            # 普通 provider 的模型/effort 快捷面板；Enter 启动行为不受影响。
+            provider_id = view[idx]
+            provider = provider_by_id(provider_id)
+            if provider is None:
+                notice = "找不到该渠道的 CC Switch 配置"
+            else:
+                notice = _provider_model_effort_panel(
+                    win, cfg, provider, provider_id
+                )
         elif ch == ord("x"):
             if not hub_focus and view:
                 provider_id = view[idx]
@@ -5676,6 +5943,7 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
 
 快捷键:
   ↑↓ / jk 移动 · Enter 启动 · 1–9/0 数字直达 · ? 更多操作 · q 退出
+  渠道行：a 别名 · m 模型/effort 覆盖 · x 隐藏 · h 显示隐藏项
   Hub 首页：←/→/e effort · a 新增渠道 · Tab/m 完整管理
 
 默认启动只影响本次会话，不修改普通 claude 或 CC Switch 当前渠道。
