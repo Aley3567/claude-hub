@@ -140,6 +140,18 @@ class _FakeSession:
         return self.upstream
 
 
+class _SequencedFakeSession:
+    def __init__(self, upstreams):
+        self.upstreams = list(upstreams)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if not self.upstreams:
+            raise AssertionError("unexpected extra upstream attempt")
+        return self.upstreams.pop(0)
+
+
 class _FakeDownstream:
     def __init__(self, status):
         self.status = status
@@ -176,6 +188,8 @@ class ClaudeHubTests(unittest.TestCase):
         self.db_file = root / "fixture ?#%.db"
         self.log_file = root / "logs" / "hub.log"
         self.usage_file = root / "logs" / "hub-usage.jsonl"
+        self.account_pool_config = root / "account-pools.json"
+        self.account_pool_state = root / "account-state.sqlite3"
         self._write_db(
             [
                 (
@@ -212,6 +226,8 @@ class ClaudeHubTests(unittest.TestCase):
                 "CLAUDE_HUB_LOG": str(self.log_file),
                 "CLAUDE_HUB_USAGE": str(self.usage_file),
                 "CLAUDE_HUB_LOCAL_TOKEN": "fixture-local-token",
+                "CLAUDE1_ACCOUNT_POOL_CONFIG": str(self.account_pool_config),
+                "CLAUDE1_ACCOUNT_POOL_STATE": str(self.account_pool_state),
             },
             clear=False,
         )
@@ -285,6 +301,111 @@ class ClaudeHubTests(unittest.TestCase):
             self.assertEqual(self.usage_file.stat().st_mode & 0o777, 0o600)
             self.assertEqual(rotated.stat().st_mode & 0o777, 0o600)
 
+    def test_usage_log_preserves_provenance_and_does_not_invent_cache_fields(self):
+        hub.record_usage(
+            "fast",
+            "fixture-model",
+            "openai_chat",
+            {
+                "input_tokens": 11,
+                "output_tokens": 3,
+                "cache_creation": {"ephemeral_5m_input_tokens": 2},
+                "server_tool_use": {"web_search_requests": 1},
+            },
+        )
+
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["source"], "upstream")
+        self.assertEqual((row["in"], row["out"]), (11, 3))
+        self.assertNotIn("cr", row)
+        self.assertNotIn("cw", row)
+        self.assertEqual(
+            row["cache_creation"],
+            {"ephemeral_5m_input_tokens": 2},
+        )
+        self.assertEqual(
+            row["server_tool_use"],
+            {"web_search_requests": 1},
+        )
+
+    def test_native_compressed_json_usage_is_shadow_decoded_with_provenance(self):
+        encoded = gzip.compress(
+            json.dumps(
+                {
+                    "usage": {
+                        "input_tokens": 17,
+                        "output_tokens": 4,
+                        "cache_read_input_tokens": 5,
+                    }
+                },
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            mtime=0,
+        )
+        self.assertEqual(
+            hub._usage_from_json_bytes(
+                encoded,
+                {"content-encoding": "gzip"},
+            ),
+            {
+                "input_tokens": 17,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 5,
+            },
+        )
+        self.assertIsNone(
+            hub._usage_from_json_bytes(
+                b"not-a-valid-gzip-stream",
+                {"content-encoding": "gzip"},
+            )
+        )
+
+        hub.record_usage(
+            "fast",
+            "fixture-model",
+            "anthropic",
+            None,
+            source="unavailable",
+        )
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["source"], "unavailable")
+        self.assertNotIn("in", row)
+        self.assertNotIn("out", row)
+
+    def test_transformed_usage_log_filters_schema_only_zero_placeholders(self):
+        prepared = hub.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        observed, source = hub._usage_for_recording(
+            prepared.payload.get("usage"),
+            prepared.plan,
+        )
+        self.assertEqual(observed, {})
+        self.assertEqual(source, "unavailable")
+
+        partial = hub.prepare_response(
+            {
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 9},
+            },
+            "openai_responses",
+        )
+        observed, source = hub._usage_for_recording(
+            partial.payload.get("usage"),
+            partial.plan,
+        )
+        self.assertEqual(observed, {"input_tokens": 9})
+        self.assertEqual(source, "upstream")
+
     @unittest.skipUnless(os.name == "posix", "POSIX file safety")
     def test_log_open_tightens_existing_file_and_rejects_special_paths(self):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +471,104 @@ class ClaudeHubTests(unittest.TestCase):
         finally:
             connection.close()
         self.db_file.chmod(0o600)
+
+    def _set_provider_endpoint(self, name, endpoint, api_format):
+        connection = sqlite3.connect(self.db_file)
+        try:
+            connection.execute("ALTER TABLE providers ADD COLUMN meta TEXT")
+            connection.execute(
+                "UPDATE providers SET settings_config=?, meta=? WHERE name=?",
+                (
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": endpoint,
+                                "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+                            }
+                        }
+                    ),
+                    json.dumps({"isFullUrl": True, "apiFormat": api_format}),
+                    name,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _write_account_pool_db(self, *, api_format="anthropic"):
+        self.db_file.unlink(missing_ok=True)
+        connection = sqlite3.connect(self.db_file)
+        try:
+            connection.execute(
+                "CREATE TABLE providers ("
+                "id TEXT, name TEXT, app_type TEXT, settings_config TEXT, meta TEXT)"
+            )
+            for provider_id, token, base_url in (
+                ("primary", "fixture-primary-account-token", "https://upstream.invalid/v1"),
+                ("secondary", "fixture-secondary-account-token", "https://upstream.invalid/v1"),
+            ):
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
+                    (
+                        provider_id,
+                        "Pooled account",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": base_url,
+                                    "ANTHROPIC_AUTH_TOKEN": token,
+                                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "pooled-model",
+                                }
+                            }
+                        ),
+                        json.dumps({"apiFormat": api_format}),
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        self.db_file.chmod(0o600)
+        self._write_config(
+            channels={
+                "fast": {
+                    "provider": "id:primary",
+                    "models": ["pooled-model"],
+                }
+            },
+            default_channel="fast",
+        )
+
+    def _write_account_pool_config(self, *, strategy="round_robin"):
+        self.account_pool_config.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "providers": {
+                        "id:primary": {
+                            "strategy": strategy,
+                            "cooldown_seconds": 60,
+                            "max_cooldown_seconds": 3600,
+                            "members": [
+                                {
+                                    "provider": "id:primary",
+                                    "weight": 1,
+                                    "priority": 0,
+                                    "enabled": True,
+                                },
+                                {
+                                    "provider": "id:secondary",
+                                    "weight": 1,
+                                    "priority": 0,
+                                    "enabled": True,
+                                },
+                            ],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.account_pool_config.chmod(0o600)
 
     def _request(
         self,
@@ -571,7 +790,7 @@ class ClaudeHubTests(unittest.TestCase):
         ):
             hub.get_config()
 
-    def test_explicit_and_default_routes(self):
+    def test_explicit_channel_and_declared_default_routes(self):
         cfg = hub.get_config()
 
         self.assertEqual(
@@ -580,10 +799,34 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(
             hub.route("claude-opus-4", cfg),
-            ("fast", "upstream-opus"),
+            ("fast", "claude-opus-4"),
         )
 
-    def test_bare_fable_model_uses_the_fallback_providers_fable_mapping(self):
+    def test_declared_bare_model_is_not_rewritten_by_tier_name(self):
+        cfg = hub.get_config()
+        model = "claude-sonnet-4-20250929"
+        cfg["channels"]["fast"]["models"].append(model)
+
+        self.assertEqual(
+            hub.route(model, cfg),
+            ("fast", model),
+        )
+
+    def test_unique_declared_bare_model_routes_to_its_channel(self):
+        cfg = hub.get_config()
+
+        self.assertEqual(
+            hub.route("local-model", cfg),
+            ("local", "local-model"),
+        )
+
+    def test_ambiguous_declared_bare_model_requires_a_channel(self):
+        cfg = hub.get_config()
+
+        with self.assertRaisesRegex(hub.RouteError, "ambiguous model"):
+            hub.route("remote-model", cfg)
+
+    def test_bare_fable_slot_uses_the_fallback_providers_fable_mapping(self):
         cfg = hub.get_config()
         providers = {
             "Fixture HTTPS": {
@@ -592,9 +835,20 @@ class ClaudeHubTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            hub.route("claude-fable-5", cfg, providers),
+            hub.route("fable", cfg, providers),
             ("fast", "upstream-fable"),
         )
+
+    def test_unlisted_model_containing_tier_name_fails_clearly(self):
+        cfg = hub.get_config()
+        providers = {
+            "Fixture HTTPS": {
+                "model_map": {"fable": "upstream-fable"},
+            }
+        }
+
+        with self.assertRaisesRegex(hub.RouteError, "unknown model"):
+            hub.route("claude-fable-5", cfg, providers)
 
     def test_local_auth_accepts_bearer_raw_and_api_key(self):
         cfg = hub.get_config()
@@ -769,13 +1023,65 @@ class ClaudeHubTests(unittest.TestCase):
                 alias="fast",
                 model_in="fast,custom-model",
                 model_out="custom-model",
-                is_count=False,
                 started=0,
             )
         )
 
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.text)["content"][0]["text"], "compressed")
+
+    def test_cross_protocol_capability_rejection_is_a_client_4xx_before_network(self):
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "future_native_block", "opaque": True}],
+                    }
+                ],
+            },
+            session=session,
+        )
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+
+        response = asyncio.run(
+            hub._handle_transformed_messages(
+                request,
+                cfg=hub.get_config(),
+                provider=provider,
+                payload={
+                    "model": "fixture-model",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "future_native_block", "opaque": True}
+                            ],
+                        }
+                    ],
+                },
+                alias="fast",
+                model_in="fast,fixture-model",
+                model_out="fixture-model",
+                started=0,
+            )
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(
+            response.headers["x-hub-protocol-code"],
+            "HUB_UNSUPPORTED_CONTENT_BLOCK",
+        )
+        body = json.loads(response.text)
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("$.messages[0].content[0]", body["error"]["message"])
+        self.assertEqual(session.calls, [])
 
     def test_usage_record_includes_configured_hub_instance(self):
         instance_id = "fixture-hub_01"
@@ -833,7 +1139,6 @@ class ClaudeHubTests(unittest.TestCase):
                 alias="fast",
                 model_in="fast,custom-model",
                 model_out="custom-model",
-                is_count=False,
                 started=0,
             )
         )
@@ -861,6 +1166,36 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(tracker.usage["input_tokens"], 17)
         self.assertFalse(tracker._discarding_line)
 
+    def test_native_usage_tracker_preserves_cache_and_server_detail(self):
+        tracker = hub._SSEUsageTracker()
+        event = json.dumps(
+            {
+                "type": "message_delta",
+                "usage": {
+                    "output_tokens": 9,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 4,
+                        "ephemeral_1h_input_tokens": 2,
+                    },
+                    "server_tool_use": {"web_search_requests": 1},
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        tracker.feed(b"data:" + event + b"\n\n")
+
+        self.assertEqual(
+            tracker.usage["cache_creation"],
+            {
+                "ephemeral_5m_input_tokens": 4,
+                "ephemeral_1h_input_tokens": 2,
+            },
+        )
+        self.assertEqual(
+            tracker.usage["server_tool_use"],
+            {"web_search_requests": 1},
+        )
+
     def test_usage_json_buffer_has_the_same_64_mib_cap_as_transform_bodies(self):
         buffer = bytearray(b"a" * (hub.MAX_UPSTREAM_BODY_BYTES - 1))
         self.assertIsNone(hub._append_bounded_json_buffer(buffer, b"bc"))
@@ -875,7 +1210,10 @@ class ClaudeHubTests(unittest.TestCase):
             {"Content-Type": "text/event-stream"},
             [b"data: fixture\n\n"],
         )
-        request = self._request({"model": "fast,model", "messages": []}, session=_FakeSession(upstream))
+        request = self._request(
+            {"model": "fast,model", "messages": [], "stream": True},
+            session=_FakeSession(upstream),
+        )
         downstream = _FakeDownstream(200)
 
         class TypeFailingBridge:
@@ -895,9 +1233,7 @@ class ClaudeHubTests(unittest.TestCase):
             "base_url": "https://upstream.invalid/v1",
             "token": "fixture-upstream-token",
         }
-        with mock.patch.object(
-            hub, "transform_request", return_value=("/chat/completions", {"stream": True})
-        ), mock.patch.object(hub, "AnthropicStreamBridge", TypeFailingBridge), mock.patch.object(
+        with mock.patch.object(hub, "AnthropicStreamBridge", TypeFailingBridge), mock.patch.object(
             hub.web, "StreamResponse", return_value=downstream
         ):
             with self.assertRaises(hub.UpstreamStreamAborted):
@@ -906,15 +1242,106 @@ class ClaudeHubTests(unittest.TestCase):
                         request,
                         cfg=hub.get_config(),
                         provider=provider,
-                        payload={"model": "model", "messages": []},
+                        payload={"model": "model", "messages": [], "stream": True},
                         alias="fast",
                         model_in="fast,model",
                         model_out="model",
-                        is_count=False,
                         started=0,
                     )
                 )
         self.assertTrue(request.transport.aborted)
+
+    def test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n'
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b'"text":"partial"', rendered)
+        self.assertNotIn(b"event: message_delta\n", rendered)
+        self.assertNotIn(b"event: message_stop\n", rendered)
+        self.assertFalse(downstream.eof)
+        self.assertTrue(request.transport.aborted)
+
+    def test_transformed_stream_runtime_degradation_codes_are_logged(self):
+        events = [
+            {
+                "choices": [
+                    {
+                        "delta": {"reasoning_content": "unsigned thought"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b"data:"
+                + json.dumps(event, separators=(",", ":")).encode()
+                + b"\n\n"
+                for event in events
+            ],
+        )
+        request = self._request(
+            {"model": "fast,model", "messages": [], "stream": True},
+            session=_FakeSession(upstream),
+        )
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+        downstream = _FakeDownstream(200)
+        observed = []
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ), mock.patch.object(hub, "log", side_effect=observed.append):
+            asyncio.run(
+                hub._handle_transformed_messages(
+                    request,
+                    cfg=hub.get_config(),
+                    provider=provider,
+                    payload={"model": "model", "messages": [], "stream": True},
+                    alias="fast",
+                    model_in="fast,model",
+                    model_out="model",
+                    started=0,
+                )
+            )
+
+        self.assertTrue(
+            any("HUB_DEGRADE_UNSIGNED_THINKING" in entry for entry in observed)
+        )
 
     def test_request_too_large_returns_anthropic_json_error(self):
         async def handler(_request):
@@ -927,6 +1354,25 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(response.status, 413)
         self.assertEqual(json.loads(response.text)["error"]["type"], "invalid_request_error")
+
+    def test_missing_upstream_session_returns_controlled_configuration_error(self):
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            }
+        )
+        request.app = {}
+
+        response = asyncio.run(
+            hub.controlled_error_middleware(request, hub.handle_messages)
+        )
+
+        payload = json.loads(response.text)
+        self.assertEqual(response.status, 503)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "api_error")
+        self.assertIn("configuration is unavailable", payload["error"]["message"])
 
     def test_health_payload_is_fixed_and_does_not_disclose_routing(self):
         response = asyncio.run(hub.handle_healthz(None))
@@ -1290,6 +1736,50 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertTrue(sessions[0].closed)
 
+    def test_server_uses_the_inherited_loopback_listener(self):
+        async def scenario(inherited_fd, port):
+            sock_site = mock.Mock()
+            sock_site.start = mock.AsyncMock(
+                side_effect=OSError("fixture inherited listener stop")
+            )
+            inherited_address = []
+
+            def use_inherited_listener(_runner, inherited):
+                inherited_address.append(inherited.getsockname())
+                return sock_site
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    hub.ENV_LISTEN_FD: str(inherited_fd),
+                    hub.ENV_PORT: str(port),
+                },
+            ), mock.patch.object(hub, "open_log"), mock.patch.object(
+                hub.web, "SockSite", side_effect=use_inherited_listener
+            ), mock.patch.object(
+                hub.web, "TCPSite"
+            ) as tcp_site:
+                with self.assertRaisesRegex(
+                    OSError, "fixture inherited listener stop"
+                ):
+                    await hub.run_server(fg=False)
+
+            tcp_site.assert_not_called()
+            self.assertEqual(inherited_address, [listener.getsockname()])
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            inherited_fd = os.dup(listener.fileno())
+            try:
+                asyncio.run(scenario(inherited_fd, listener.getsockname()[1]))
+            finally:
+                try:
+                    os.close(inherited_fd)
+                except OSError:
+                    pass
+
     def test_malformed_non_object_and_invalid_model_never_reach_upstream(self):
         cases = [
             (b"{", "valid JSON"),
@@ -1316,6 +1806,28 @@ class ClaudeHubTests(unittest.TestCase):
                 )
                 self.assertIn(message, payload["error"]["message"])
                 self.assertEqual(session.calls, [])
+
+    def test_excessively_nested_json_returns_400_without_reaching_upstream(self):
+        session = _NeverSession()
+        nesting = 2_000
+        body = (
+            b'{"model":"fast,fixture-model","nested":'
+            + b"[" * nesting
+            + b"0"
+            + b"]" * nesting
+            + b"}"
+        )
+
+        response = asyncio.run(
+            hub.handle_messages(self._request(body, session=session))
+        )
+
+        payload = json.loads(response.text)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["message"], "request body must be valid JSON")
+        self.assertEqual(session.calls, [])
 
     def test_compressed_request_body_is_rejected_before_decode_or_forward(self):
         for headers in (
@@ -1551,6 +2063,8 @@ class ClaudeHubTests(unittest.TestCase):
         response = asyncio.run(hub.handle_messages(request))
 
         self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["x-hub-token-count-source"], "estimate")
+        self.assertEqual(response.headers["x-hub-token-count-exact"], "0")
         self.assertEqual(len(session.calls), 1)
         url, kwargs = session.calls[0]
         self.assertEqual(
@@ -1570,6 +2084,523 @@ class ClaudeHubTests(unittest.TestCase):
         rejected_response = asyncio.run(hub.handle_messages(rejected))
         self.assertEqual(rejected_response.status, 401)
         self.assertEqual(rejected_session.calls, [])
+
+    def test_native_count_tokens_marks_upstream_result_as_exact(self):
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"input_tokens":17}'],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+            path="/v1/messages/count_tokens",
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.headers["x-hub-token-count-source"], "upstream")
+        self.assertEqual(
+            response.headers["x-hub-token-count-method"],
+            "anthropic_count_tokens",
+        )
+        self.assertEqual(response.headers["x-hub-token-count-exact"], "1")
+        self.assertNotIn("x-hub-estimated", response.headers)
+
+    def test_account_pool_round_robin_is_shared_across_requests(self):
+        self._write_account_pool_db()
+        self._write_account_pool_config()
+
+        observed_tokens = []
+        for _ in range(2):
+            upstream = _FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                [b'{"usage":{"input_tokens":1,"output_tokens":1}}'],
+            )
+            session = _FakeSession(upstream)
+            request = self._request(
+                {
+                    "model": "fast,pooled-model",
+                    "messages": [{"role": "user", "content": "fixture"}],
+                },
+                session=session,
+            )
+            with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+                response = asyncio.run(hub.handle_messages(request))
+            self.assertEqual(response.status, 200)
+            observed_tokens.append(session.calls[0][1]["headers"]["x-api-key"])
+
+        self.assertEqual(
+            observed_tokens,
+            [
+                "fixture-primary-account-token",
+                "fixture-secondary-account-token",
+            ],
+        )
+        self.assertTrue(self.account_pool_state.is_file())
+        self.assertNotIn(
+            b"fixture-primary-account-token",
+            self.account_pool_state.read_bytes(),
+        )
+        if hub._usage_fp is not None:
+            hub._usage_fp.flush()
+        usage_rows = [
+            json.loads(line)
+            for line in self.usage_file.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [row["account"] for row in usage_rows[-2:]],
+            ["id:primary", "id:secondary"],
+        )
+
+    def test_account_pool_429_retries_next_key_before_downstream_prepare(self):
+        self._write_account_pool_db()
+        self._write_account_pool_config()
+        session = _SequencedFakeSession(
+            [
+                _FakeUpstream(
+                    429,
+                    {
+                        "Content-Type": "application/json",
+                        "Retry-After": "120",
+                    },
+                    [b'{"type":"error"}'],
+                ),
+                _FakeUpstream(
+                    200,
+                    {"Content-Type": "application/json"},
+                    [b'{"usage":{"input_tokens":1,"output_tokens":1}}'],
+                ),
+            ]
+        )
+        request = self._request(
+            {
+                "model": "fast,pooled-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            [call[1]["headers"]["x-api-key"] for call in session.calls],
+            [
+                "fixture-primary-account-token",
+                "fixture-secondary-account-token",
+            ],
+        )
+        self.assertEqual(response.headers["x-hub-account"], "id:secondary")
+
+        next_session = _FakeSession(
+            _FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                [b'{"usage":{}}'],
+            )
+        )
+        next_request = self._request(
+            {"model": "fast,pooled-model", "messages": []},
+            session=next_session,
+        )
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(hub.handle_messages(next_request))
+        self.assertEqual(
+            next_session.calls[0][1]["headers"]["x-api-key"],
+            "fixture-secondary-account-token",
+        )
+
+    def test_account_pool_never_retries_a_stream_after_downstream_commit(self):
+        self._write_account_pool_db()
+        self._write_account_pool_config()
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [b'event: message_start\ndata: {"type":"message_start"}\n\n'],
+            fail_after=True,
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {"model": "fast,pooled-model", "stream": True, "messages": []},
+            session=session,
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_account_pool_failover_also_wraps_openai_transformation(self):
+        self._write_account_pool_db(api_format="openai_chat")
+        self._write_account_pool_config()
+        transformed = {
+            "id": "pooled-response",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        session = _SequencedFakeSession(
+            [
+                _FakeUpstream(
+                    429,
+                    {"Content-Type": "application/json", "Retry-After": "60"},
+                    [b'{"error":{"message":"limited"}}'],
+                ),
+                _FakeUpstream(
+                    200,
+                    {"Content-Type": "application/json"},
+                    [json.dumps(transformed).encode("utf-8")],
+                ),
+            ]
+        )
+        request = self._request(
+            {
+                "model": "fast,pooled-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": False,
+            },
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            [call[1]["headers"]["authorization"] for call in session.calls],
+            [
+                "Bearer fixture-primary-account-token",
+                "Bearer fixture-secondary-account-token",
+            ],
+        )
+        self.assertEqual(response.headers["x-hub-account"], "id:secondary")
+
+    def test_transformed_final_429_preserves_retry_after_and_account(self):
+        self._write_account_pool_db(api_format="openai_chat")
+        self._write_account_pool_config()
+        session = _SequencedFakeSession(
+            [
+                _FakeUpstream(
+                    429,
+                    {"Content-Type": "application/json", "Retry-After": "30"},
+                    [b'{"error":{"message":"limited-primary"}}'],
+                ),
+                _FakeUpstream(
+                    429,
+                    {"Content-Type": "application/json", "Retry-After": "45"},
+                    [b'{"error":{"message":"limited-secondary"}}'],
+                ),
+            ]
+        )
+        request = self._request(
+            {"model": "fast,pooled-model", "messages": []},
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 429)
+        self.assertEqual(response.headers["retry-after"], "45")
+        self.assertEqual(response.headers["x-hub-account"], "id:secondary")
+
+    def test_channel_api_format_override_does_not_break_single_account(self):
+        self._write_account_pool_db(api_format="anthropic")
+        self._write_config(
+            channels={
+                "fast": {
+                    "provider": "id:primary",
+                    "models": ["pooled-model"],
+                    "api_format": "openai_chat",
+                }
+            },
+            default_channel="fast",
+        )
+        transformed = {
+            "id": "override-response",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        session = _FakeSession(
+            _FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                [json.dumps(transformed).encode("utf-8")],
+            )
+        )
+        request = self._request(
+            {"model": "fast,pooled-model", "messages": []},
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_auth_disabled_pool_is_not_reported_as_rate_limit(self):
+        response = hub._account_pool_error(
+            hub.PoolExhausted(reason="auth_disabled")
+        )
+
+        self.assertEqual(response.status, 503)
+        self.assertNotIn("retry-after", response.headers)
+        self.assertIn("credentials", response.text)
+
+    def test_account_pool_member_with_different_endpoint_fails_closed(self):
+        self._write_account_pool_db()
+        self._write_account_pool_config()
+        connection = sqlite3.connect(self.db_file)
+        try:
+            settings = json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://different.invalid/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-secondary-account-token",
+                    }
+                }
+            )
+            connection.execute(
+                "UPDATE providers SET settings_config=? WHERE id='secondary'",
+                (settings,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        session = _NeverSession()
+        request = self._request(
+            {"model": "fast,pooled-model", "messages": []},
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 502)
+        self.assertIn("account pool", response.text)
+
+    def test_anthropic_full_url_provider_uses_the_complete_endpoint(self):
+        endpoint = "http://127.0.0.1:19090/custom/messages"
+        self._set_provider_endpoint("Fixture HTTPS", endpoint, "anthropic")
+
+        upstream = _FakeUpstream(
+            429,
+            {"Content-Type": "application/json"},
+            [b'{"type":"error","error":{"type":"rate_limit_error"}}'],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {"model": "fast,custom-model", "messages": []},
+            session=session,
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(session.calls[0][0], endpoint)
+
+    def test_anthropic_full_url_count_tokens_is_estimated_locally(self):
+        endpoint = "http://127.0.0.1:19090/v1/messages"
+        self._set_provider_endpoint("Fixture HTTPS", endpoint, "anthropic")
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+            path="/v1/messages/count_tokens",
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["x-hub-estimated"], "1")
+        self.assertEqual(response.headers["x-hub-token-count-source"], "estimate")
+        self.assertEqual(
+            response.headers["x-hub-token-count-method"],
+            "json_utf8_bytes_div_4",
+        )
+        self.assertEqual(response.headers["x-hub-token-count-exact"], "0")
+        self.assertEqual(response.headers["x-hub-token-count-error-bound"], "unbounded")
+        self.assertEqual(session.calls, [])
+
+    def test_transformed_full_url_provider_uses_the_complete_endpoint(self):
+        endpoint = "http://127.0.0.1:19090/custom/chat"
+        self._set_provider_endpoint("Fixture HTTPS", endpoint, "openai_chat")
+        upstream_payload = {
+            "id": "fixture-response",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(upstream_payload).encode()],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {"model": "fast,custom-model", "messages": []},
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(session.calls[0][0], endpoint)
+
+    def test_check_uses_a_full_url_providers_complete_endpoint(self):
+        endpoint = "http://127.0.0.1:19090/custom/messages"
+        self._set_provider_endpoint("Fixture HTTPS", endpoint, "anthropic")
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _traceback):
+                return False
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse()
+
+        session = FakeSession()
+        with mock.patch.object(
+            hub.aiohttp, "ClientSession", return_value=session
+        ), redirect_stdout(io.StringIO()):
+            asyncio.run(hub.cli_check("fast"))
+
+        self.assertEqual(session.calls[0][0], endpoint)
+
+    def test_check_uses_each_openai_protocols_endpoint_headers_and_payload(self):
+        connection = sqlite3.connect(self.db_file)
+        try:
+            connection.execute("ALTER TABLE providers ADD COLUMN meta TEXT")
+            connection.commit()
+        finally:
+            connection.close()
+
+        cases = (
+            (
+                "openai_chat",
+                "http://127.0.0.1:19090",
+                False,
+                "http://127.0.0.1:19090/v1/chat/completions",
+                "messages",
+            ),
+            (
+                "openai_responses",
+                "http://127.0.0.1:19090/custom/responses",
+                True,
+                "http://127.0.0.1:19090/custom/responses",
+                "input",
+            ),
+        )
+
+        for api_format, base_url, is_full_url, expected_url, payload_key in cases:
+            with self.subTest(api_format=api_format):
+                connection = sqlite3.connect(self.db_file)
+                try:
+                    connection.execute(
+                        "UPDATE providers SET settings_config=?, meta=? WHERE name=?",
+                        (
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": base_url,
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+                                    }
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "isFullUrl": is_full_url,
+                                    "apiFormat": api_format,
+                                }
+                            ),
+                            "Fixture HTTPS",
+                        ),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                hub.reset_caches()
+
+                class FakeResponse:
+                    status = 200
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, _exc_type, _exc, _traceback):
+                        return False
+
+                class FakeSession:
+                    def __init__(self):
+                        self.calls = []
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, _exc_type, _exc, _traceback):
+                        return False
+
+                    def post(self, url, **kwargs):
+                        self.calls.append((url, kwargs))
+                        return FakeResponse()
+
+                session = FakeSession()
+                with mock.patch.object(
+                    hub.aiohttp, "ClientSession", return_value=session
+                ), redirect_stdout(io.StringIO()):
+                    asyncio.run(hub.cli_check("fast"))
+
+                url, kwargs = session.calls[0]
+                self.assertEqual(url, expected_url)
+                self.assertIn(payload_key, kwargs["json"])
+                self.assertEqual(
+                    kwargs["headers"]["authorization"],
+                    "Bearer fixture-upstream-token",
+                )
+                self.assertNotIn("x-api-key", kwargs["headers"])
 
     def test_forwarding_preserves_protocol_fields_headers_query_and_error_body(self):
         chunks = [b'{"type":"error",', b'"error":{"type":"rate_limit_error"}}']
@@ -1678,6 +2709,63 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(response.writes, chunks)
         self.assertEqual(b"".join(response.writes), b"".join(chunks))
         self.assertTrue(response.eof)
+
+    def test_native_forwarding_promotes_system_role_for_strict_upstreams(self):
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"type":"message","content":[]}'],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,strict-model",
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "top-level",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "machine context",
+                                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                            }
+                        ],
+                    },
+                    {"role": "user", "content": "hello"},
+                ],
+                "future_native_extension": {"opaque": True},
+            },
+            session=session,
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(hub.handle_messages(request))
+
+        forwarded = json.loads(session.calls[0][1]["data"])
+        self.assertEqual(
+            forwarded["system"],
+            [
+                {
+                    "type": "text",
+                    "text": "top-level",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": "machine context",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        )
+        self.assertEqual(forwarded["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(forwarded["future_native_extension"], {"opaque": True})
 
     def test_ambiguous_upstream_representation_headers_fail_before_prepare(self):
         cases = {
@@ -1887,6 +2975,34 @@ class ClaudeHubTests(unittest.TestCase):
         commented.feed(valid + b": provider heartbeat\n\n")
         commented.finish()
         self.assertTrue(commented.complete)
+
+    def test_native_sse_protocol_error_is_aborted_before_the_bad_chunk_is_written(self):
+        invalid = (
+            b"event: message_stop\ndata: {}\n\n"
+            b"event: content_block_delta\ndata: {}\n\n"
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [invalid],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(hub.web, "StreamResponse", return_value=downstream):
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(downstream.writes, [])
+        self.assertFalse(downstream.eof)
+        self.assertTrue(request.transport.aborted)
 
     def test_sse_invalid_or_incomplete_utf8_is_not_complete(self):
         invalid = hub._SSETerminalTracker()
@@ -2118,7 +3234,9 @@ class ClaudeHubTests(unittest.TestCase):
             with self.assertRaises(hub.UpstreamStreamAborted):
                 asyncio.run(hub.handle_messages(request))
 
-        self.assertEqual(downstream.writes, [compressed])
+        # The decoded chunk contains protocol data after the terminal event.
+        # Fail closed before forwarding the corresponding raw bytes.
+        self.assertEqual(downstream.writes, [])
         self.assertFalse(downstream.eof)
         self.assertTrue(request.transport.aborted)
 
@@ -2566,6 +3684,30 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("permissions 0644 exceed 0600", output.getvalue())
         self.assertEqual(self.config_file.stat().st_mode & 0o777, 0o644)
+
+    def test_doctor_rejects_a_known_full_endpoint_for_the_wrong_format(self):
+        self._write_config(
+            default_channel="fast",
+            channels={
+                "fast": {
+                    "provider": "Fixture HTTPS",
+                    "models": ["claude-sonnet-4"],
+                }
+            },
+        )
+        hub.reset_caches()
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "http://127.0.0.1:19090/v1/messages",
+            "openai_chat",
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            status = hub.cli_doctor()
+
+        self.assertEqual(status, 1)
+        self.assertIn("full endpoint format mismatch", output.getvalue())
 
 
 class ExampleConfigTests(unittest.TestCase):

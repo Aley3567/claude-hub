@@ -27,7 +27,88 @@ class ProviderFormatTests(unittest.TestCase):
         self.assertEqual(protocol.provider_api_format(), "anthropic")
 
 
+class CanonicalRequestContractTests(unittest.TestCase):
+    def test_native_system_role_is_promoted_without_losing_metadata_or_extensions(self) -> None:
+        payload = {
+            "model": "strict-anthropic-model",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "top-level",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "machine context",
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+            "future_native_extension": {"opaque": True},
+        }
+
+        prepared = protocol.prepare_request(payload, "anthropic")
+
+        self.assertEqual(prepared.endpoint, "/v1/messages")
+        self.assertEqual(
+            prepared.payload["system"],
+            [
+                {
+                    "type": "text",
+                    "text": "top-level",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": "machine context",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                },
+            ],
+        )
+        self.assertEqual(prepared.payload["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(prepared.payload["future_native_extension"], {"opaque": True})
+        self.assertIn("HUB_DEGRADE_SYSTEM_ROLE_PROMOTED", prepared.plan.warning_codes)
+        self.assertEqual(payload["messages"][0]["role"], "system")
+
+
 class RequestTransformTests(unittest.TestCase):
+    def test_system_message_role_is_preserved_for_current_claude_code(self) -> None:
+        payload = {
+            "model": "system-message-model",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "machine context"}]},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        _, chat = protocol.transform_request(payload, "openai_chat")
+        _, responses = protocol.transform_request(payload, "openai_responses")
+
+        self.assertEqual(
+            chat["messages"][:2],
+            [
+                {"role": "system", "content": "machine context"},
+                {"role": "user", "content": "hello"},
+            ],
+        )
+        self.assertEqual(
+            responses["input"][:2],
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "machine context"}],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        )
+
     def test_orphan_or_duplicate_tool_results_fail_closed_for_both_formats(self) -> None:
         orphan = {
             "model": "tool-model",
@@ -88,7 +169,7 @@ class RequestTransformTests(unittest.TestCase):
                             {
                                 "type": "tool_result",
                                 "tool_use_id": "call_1",
-                                "content": {"ok": True},
+                                "content": '{"ok":true}',
                             }
                         ],
                     },
@@ -276,6 +357,74 @@ class RequestTransformTests(unittest.TestCase):
 
 
 class ResponseTransformTests(unittest.TestCase):
+    def test_response_wrapper_terminal_conflicts_fail_closed(self) -> None:
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.prepare_response(
+                {
+                    "choices": [
+                        {
+                            "index": 1,
+                            "message": {"content": "alternate"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                "openai_chat",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_MULTI_CHOICE_UNSUPPORTED",
+        )
+
+        for status, details in (
+            ("completed", None),
+            ("incomplete", {"reason": "max_output_tokens"}),
+        ):
+            with self.subTest(status=status):
+                body = {
+                    "status": status,
+                    "output": [],
+                    "error": {"code": "upstream_failed"},
+                }
+                if details is not None:
+                    body["incomplete_details"] = details
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(body, "openai_responses")
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_UPSTREAM_RESPONSE_INVALID",
+                )
+
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.prepare_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "index": 1,
+                                        "id": "call_wrong_index",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+                "openai_chat",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_TOOL_CALL_INVALID",
+        )
+
     def test_chat_tool_call_becomes_anthropic_tool_use(self) -> None:
         body = protocol.transform_response(
             {
@@ -310,10 +459,67 @@ class ResponseTransformTests(unittest.TestCase):
             {
                 "input_tokens": 7,
                 "output_tokens": 3,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
             },
         )
+
+    def test_explicit_truncation_or_refusal_cannot_be_masked_by_tool_output(self) -> None:
+        for finish_reason in ("length", "content_filter"):
+            with self.subTest(api_format="openai_chat", reason=finish_reason):
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_conflict",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "lookup",
+                                                    "arguments": "{}",
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": finish_reason,
+                                }
+                            ]
+                        },
+                        "openai_chat",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_UPSTREAM_STOP_REASON_UNMAPPABLE",
+                )
+
+        for incomplete_reason in ("max_output_tokens", "content_filter"):
+            with self.subTest(
+                api_format="openai_responses",
+                reason=incomplete_reason,
+            ):
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(
+                        {
+                            "status": "incomplete",
+                            "incomplete_details": {"reason": incomplete_reason},
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "call_id": "call_conflict",
+                                    "name": "lookup",
+                                    "status": "completed",
+                                    "arguments": "{}",
+                                }
+                            ],
+                        },
+                        "openai_responses",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_UPSTREAM_STOP_REASON_UNMAPPABLE",
+                )
 
     def test_upstream_error_is_redacted_to_anthropic_shape(self) -> None:
         body = protocol.transform_error(
@@ -364,6 +570,7 @@ class ResponseTransformTests(unittest.TestCase):
     def test_responses_accepts_numeric_string_usage_and_input_tool_arguments(self) -> None:
         body = protocol.transform_response(
             {
+                "status": "completed",
                 "output": [
                     {
                         "type": "function_call",
@@ -382,6 +589,60 @@ class ResponseTransformTests(unittest.TestCase):
 
 
 class StreamingTransformTests(unittest.TestCase):
+    def test_responses_non_tool_output_item_added_requires_an_output_index(self) -> None:
+        for item in (
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+            {
+                "type": "reasoning",
+                "status": "in_progress",
+                "summary": [],
+                "content": [],
+            },
+        ):
+            with self.subTest(item_type=item["type"]):
+                bridge = protocol.AnthropicStreamBridge("openai_responses")
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    bridge.feed(
+                        "response.output_item.added",
+                        json.dumps(
+                            {
+                                "type": "response.output_item.added",
+                                "item": item,
+                            }
+                        ),
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_SSE_ORDER_VIOLATION",
+                )
+
+    def test_chat_stream_rejects_a_nonzero_choice_index(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            bridge.feed(
+                "message",
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "index": 1,
+                                "delta": {"content": "alternate"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ),
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_MULTI_CHOICE_UNSUPPORTED",
+        )
+
     def test_translated_sse_clean_eof_without_terminal_fails_closed(self) -> None:
         with self.assertRaisesRegex(protocol.ProtocolTransformError, "terminal event"):
             list(
@@ -400,8 +661,17 @@ class StreamingTransformTests(unittest.TestCase):
             parser.feed(b"data: 1\n\ndata: 2\n\n"),
             [("message", "1"), ("message", "2")],
         )
-        with self.assertRaises(protocol.ProtocolTransformError):
+        self.assertEqual(
+            protocol.SSEParser(max_buffer=8).feed(b"data: 12\n\n"),
+            [("message", "12")],
+        )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
             protocol.SSEParser(max_buffer=8).feed(b"data: 123456789\n\n")
+        self.assertEqual(raised.exception.code, "HUB_SSE_EVENT_TOO_LARGE")
+
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.SSEParser(max_buffer=8).feed(b"123456789")
+        self.assertEqual(raised.exception.code, "HUB_SSE_EVENT_TOO_LARGE")
 
     def test_responses_failure_is_terminal_without_normal_message_stop(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")
@@ -484,7 +754,7 @@ class StreamingTransformTests(unittest.TestCase):
             [0],
         )
 
-    def test_responses_tool_argument_aliases_do_not_duplicate_snapshot(self) -> None:
+    def test_responses_tool_argument_snapshot_only_emits_missing_suffix(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")
         chunks = bridge.feed(
             "response.output_item.added",
@@ -535,27 +805,34 @@ class StreamingTransformTests(unittest.TestCase):
                 for event in events
                 if event["type"] == "content_block_delta"
             ],
-            ['{"q":'],
+            ['{"q":', '"x"}'],
         )
 
-    def test_response_terminal_ignores_late_content(self) -> None:
+    def test_response_terminal_rejects_late_content(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")
         bridge.feed(
             "response.completed",
-            json.dumps({"type": "response.completed", "response": {}}),
-        )
-        chunks = bridge.feed(
-            "response.output_text.done",
             json.dumps(
                 {
-                    "type": "response.output_text.done",
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": "late",
+                    "type": "response.completed",
+                    "response": {"status": "completed"},
                 }
             ),
         )
-        self.assertEqual(chunks, [])
+        with self.assertRaisesRegex(
+            protocol.ProtocolTransformError, "after terminal"
+        ):
+            bridge.feed(
+                "response.output_text.done",
+                json.dumps(
+                    {
+                        "type": "response.output_text.done",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "late",
+                    }
+                ),
+            )
 
     def test_tool_blocks_require_protocol_roles(self) -> None:
         bad_payloads = [
@@ -661,6 +938,44 @@ class StreamingTransformTests(unittest.TestCase):
                     ),
                 )
 
+    def test_chat_text_starts_after_reasoning_block_stops(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "think",
+                                "content": "answer",
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                (event["type"], event.get("index"))
+                for event in events
+                if event["type"] != "message_start"
+            ],
+            [
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+            ],
+        )
+
     def test_chat_sse_is_emitted_as_terminal_anthropic_stream(self) -> None:
         upstream = [
             b'data: {"id":"chat_1","model":"model-test","choices":'
@@ -695,7 +1010,10 @@ class StreamingTransformTests(unittest.TestCase):
                                 {
                                     "index": 0,
                                     "id": "call_1",
-                                    "function": {"name": "lookup"},
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "{}",
+                                    },
                                 }
                             ]
                         },
@@ -714,7 +1032,7 @@ class StreamingTransformTests(unittest.TestCase):
         deltas = [event["index"] for event in events if event["type"] == "content_block_delta"]
         stops = [event["index"] for event in events if event["type"] == "content_block_stop"]
         self.assertEqual(starts, [0, 1, 2])
-        self.assertEqual(deltas, [0, 2])
+        self.assertEqual(deltas, [0, 1, 2])
         self.assertEqual(stops, [0, 1])
 
     def test_responses_done_only_text_is_streamed_once(self) -> None:
@@ -770,6 +1088,184 @@ class StreamingTransformTests(unittest.TestCase):
             if b'"type":"content_block_delta"' in chunk
         ]
         self.assertEqual([delta["delta"]["text"] for delta in deltas], ["partial"])
+
+    def test_responses_zero_output_index_is_a_tool_identifier(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = bridge.feed(
+            "response.output_item.added",
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "function_call", "name": "lookup"},
+                }
+            ),
+        )
+        chunks.extend(
+            bridge.feed(
+                "response.function_call_arguments.done",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": 0,
+                        "arguments": '{"q":"zero"}',
+                    }
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        tool = next(
+            event["content_block"]
+            for event in events
+            if event["type"] == "content_block_start"
+        )
+        self.assertEqual(tool["id"], "0")
+        self.assertEqual(
+            [
+                event["delta"]["partial_json"]
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            ['{"q":"zero"}'],
+        )
+        self.assertIn(
+            "HUB_DEGRADE_SYNTHETIC_TOOL_ID",
+            bridge.warning_codes,
+        )
+
+        strict = protocol.AnthropicStreamBridge(
+            "openai_responses",
+            compatibility_mode="strict",
+        )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            strict.feed(
+                "response.output_item.added",
+                json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type": "function_call", "name": "lookup"},
+                    }
+                ),
+            )
+        self.assertEqual(raised.exception.code, "HUB_SSE_TOOL_CALL_INVALID")
+
+    def test_responses_anonymous_tool_snapshots_stay_distinct(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = []
+        for name, arguments in (
+            ("first", '{"value":1}'),
+            ("second", '{"value":2}'),
+        ):
+            chunks.extend(
+                bridge.feed(
+                    "response.output_item.added",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }
+                    ),
+                )
+            )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            bridge.feed(
+                "response.function_call_arguments.delta",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "delta": "unidentifiable",
+                    }
+                ),
+            )
+        self.assertEqual(raised.exception.code, "HUB_SSE_ORDER_VIOLATION")
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                (event["index"], event["content_block"]["id"])
+                for event in events
+                if event["type"] == "content_block_start"
+            ],
+            [
+                (0, "response_function_call_0"),
+                (1, "response_function_call_1"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (event["index"], event["delta"]["partial_json"])
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            [(0, '{"value":1}'), (1, '{"value":2}')],
+        )
+
+    def test_responses_single_anonymous_tool_accepts_argument_events(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = bridge.feed(
+            "response.output_item.added",
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "name": "lookup",
+                    },
+                }
+            ),
+        )
+        for delta in ('{"q":', '"x"}'):
+            chunks.extend(
+                bridge.feed(
+                    "response.function_call_arguments.delta",
+                    json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "delta": delta,
+                        }
+                    ),
+                )
+            )
+        chunks.extend(
+            bridge.feed(
+                "response.function_call_arguments.done",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "arguments": '{"q":"x"}',
+                    }
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                event["delta"]["partial_json"]
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            ['{"q":', '"x"}'],
+        )
+        self.assertEqual(
+            [event["index"] for event in events if event["type"] == "content_block_stop"],
+            [0],
+        )
 
     def test_responses_tool_arguments_done_accepts_call_id_and_arguments(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")

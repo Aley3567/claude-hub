@@ -13,7 +13,7 @@ CATALOG_VERSION = 1
 LEGACY_HUB_ID = "claude-hub"
 MAX_DISPLAY_NAME_WIDTH = 48
 
-_HUB_ID_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
+_HUB_ID_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _ENTRY_PATH_FIELDS = ("config", "log", "usage")
 _ENTRY_STATES = {"ready", "setup"}
 
@@ -243,6 +243,7 @@ def _validate_relative_path(value: str) -> None:
     if (
         posix.is_absolute()
         or windows.is_absolute()
+        or bool(windows.drive)
         or ".." in posix.parts
         or ".." in windows.parts
     ):

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,62 @@ def iso(stamp: float) -> str:
 
 
 class StatuslineModelTests(unittest.TestCase):
+    def test_tail_lines_reads_only_the_bounded_utf8_suffix(self) -> None:
+        last_line = json.dumps(
+            {"type": "assistant", "message": {"model": "last-model"}},
+            ensure_ascii=False,
+        ).encode("utf-8") + b"\n"
+        content = ("前" * 100).encode("utf-8") + b"\n" + last_line
+        max_bytes = len(last_line) + 5
+
+        class TrackingReader(io.BytesIO):
+            read_start: int | None = None
+            read_size: int | None = None
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_start = self.tell()
+                self.read_size = size
+                return super().read(size)
+
+        reader = TrackingReader(content)
+        with mock.patch.object(Path, "open", return_value=reader) as open_file:
+            lines = statusline._tail_lines(
+                Path("unused"),
+                max_bytes=max_bytes,
+                max_lines=400,
+            )
+
+        open_file.assert_called_once_with("rb")
+        self.assertEqual(reader.read_start, len(content) - max_bytes - 1)
+        self.assertEqual(reader.read_size, max_bytes + 1)
+        self.assertEqual(lines, [last_line.decode("utf-8").strip()])
+
+    def test_latest_model_comes_from_the_bounded_transcript_tail(self) -> None:
+        now = 2_000_000_000.0
+        with tempfile.TemporaryDirectory() as raw:
+            transcript = Path(raw) / "long-session.jsonl"
+            prefix = ("旧" * statusline.TRANSCRIPT_TAIL_BYTES).encode("utf-8")
+            last_row = {
+                "type": "assistant",
+                "timestamp": iso(now - 1),
+                "message": {"model": "tail-model"},
+            }
+            transcript.write_bytes(
+                prefix + b"\n" + json.dumps(last_row).encode("utf-8") + b"\n"
+            )
+
+            with mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=AssertionError("transcript must not be read in full"),
+            ):
+                model = statusline.latest_response_model(
+                    str(transcript),
+                    now=now,
+                )
+
+        self.assertEqual(model, "tail-model")
+
     def test_turn_metadata_does_not_invalidate_latest_assistant_model(self) -> None:
         now = 2_000_000_000.0
         with tempfile.TemporaryDirectory() as raw:
@@ -152,6 +210,26 @@ class StatuslineModelTests(unittest.TestCase):
             }
 
             self.assertEqual(statusline.resolve_model(payload, env), "DB Model")
+
+    def test_db_connect_failure_returns_empty_without_unbound_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            db = Path(raw) / "cc-switch.db"
+            db.touch()
+
+            with (
+                mock.patch.object(
+                    statusline.sqlite3,
+                    "connect",
+                    side_effect=sqlite3.OperationalError("cannot connect"),
+                ),
+                mock.patch.object(
+                    statusline,
+                    "UnboundLocalError",
+                    AssertionError,
+                    create=True,
+                ),
+            ):
+                self.assertEqual(statusline._current_provider_env(db), {})
 
 
 if __name__ == "__main__":

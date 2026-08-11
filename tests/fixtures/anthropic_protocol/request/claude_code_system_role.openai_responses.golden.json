@@ -1,0 +1,20 @@
+{
+  "model": "fixture-model",
+  "input": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "machine context"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ],
+  "store": false,
+  "instructions": "top-level"
+}

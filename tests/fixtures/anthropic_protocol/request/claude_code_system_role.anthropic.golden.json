@@ -1,0 +1,19 @@
+{
+  "model": "fixture-model",
+  "system": [
+    {
+      "type": "text",
+      "text": "top-level"
+    },
+    {
+      "type": "text",
+      "text": "machine context"
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello"
+    }
+  ]
+}
