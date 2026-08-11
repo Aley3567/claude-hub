@@ -246,6 +246,22 @@ class ClaudeHubTests(unittest.TestCase):
         self.env_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_validate_config_preserves_hub_and_channel_transport_policy(self):
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["transport"] = {"mode": "auto", "proxies": ["system"]}
+        raw["channels"]["fast"]["transport"] = {
+            "mode": "proxy",
+            "proxies": ["http://127.0.0.1:7897"],
+        }
+
+        cfg = hub.validate_config(raw)
+
+        self.assertEqual(cfg["transport"], raw["transport"])
+        self.assertEqual(
+            cfg["channels"]["fast"]["transport"],
+            raw["channels"]["fast"]["transport"],
+        )
+
     def test_log_rotation_keeps_current_and_rotated_files_private(self):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.log_file.write_text("oversized", encoding="utf-8")
@@ -996,6 +1012,55 @@ class ClaudeHubTests(unittest.TestCase):
             hub.channel_proxy("fast", cfg, provider), "http://127.0.0.1:8899"
         )
 
+    def test_legacy_provider_proxy_becomes_proxy_only_transport_policy(self):
+        cfg = hub.get_config()
+        provider = hub.resolve_provider("fast", cfg)
+        provider["proxy"] = "http://127.0.0.1:7897"
+
+        policy = hub.channel_transport_policy(
+            "fast",
+            cfg,
+            provider,
+            "https://upstream.invalid/v1/messages",
+        )
+
+        self.assertEqual(policy.mode, "proxy")
+        self.assertEqual(
+            [candidate.proxy for candidate in policy.candidates],
+            ["http://127.0.0.1:7897"],
+        )
+
+    def test_provider_transport_policy_is_inherited_from_database_settings(self):
+        connection = sqlite3.connect(self.db_file)
+        try:
+            settings = {
+                "transport": {"mode": "direct", "proxies": []},
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://upstream.invalid/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+                },
+            }
+            connection.execute(
+                "UPDATE providers SET settings_config=? WHERE name=?",
+                (json.dumps(settings), "Fixture HTTPS"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        hub.reset_caches()
+
+        cfg = hub.get_config()
+        provider = hub.resolve_provider("fast", cfg)
+        policy = hub.channel_transport_policy(
+            "fast",
+            cfg,
+            provider,
+            "https://upstream.invalid/v1/messages",
+        )
+
+        self.assertEqual(policy.mode, "direct")
+        self.assertEqual([candidate.identity for candidate in policy.candidates], ["direct"])
+
     def test_upstream_ssl_context_adds_certifi_ca_bundle(self):
         context = mock.Mock()
         with mock.patch.object(
@@ -1010,6 +1075,102 @@ class ClaudeHubTests(unittest.TestCase):
         context.load_verify_locations.assert_called_once_with(
             cafile="/fixture/cacert.pem"
         )
+
+    def test_upstream_socket_factory_enables_tcp_keepalive(self):
+        created = mock.Mock()
+        sock = mock.Mock()
+        created.return_value = sock
+        address_info = (
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("127.0.0.1", 443),
+        )
+
+        with mock.patch.object(hub.socket, "socket", created):
+            result = hub.upstream_socket_factory(address_info)
+
+        self.assertIs(result, sock)
+        created.assert_called_once_with(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+        )
+        sock.setsockopt.assert_any_call(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    def test_upstream_connector_uses_keepalive_socket_factory(self):
+        connector = mock.Mock()
+        tls_context = mock.Mock()
+        with mock.patch.object(
+            hub, "_upstream_ssl_context", return_value=tls_context
+        ), mock.patch.object(
+            hub.aiohttp, "TCPConnector", return_value=connector
+        ) as tcp_connector:
+            result = hub._upstream_connector()
+
+        self.assertIs(result, connector)
+        tcp_connector.assert_called_once_with(
+            ssl=tls_context,
+            socket_factory=hub.upstream_socket_factory,
+        )
+
+    def test_upstream_socket_factory_tunes_dead_peer_detection(self):
+        sock = mock.Mock()
+        address_info = (
+            socket.AF_INET6,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("::1", 443, 0, 0),
+        )
+
+        with mock.patch.object(hub.socket, "socket", return_value=sock):
+            hub.upstream_socket_factory(address_info)
+
+        idle_option = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+            socket, "TCP_KEEPALIVE", None
+        )
+        if idle_option is not None:
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP,
+                idle_option,
+                30,
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP,
+                socket.TCP_KEEPINTVL,
+                15,
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt.assert_any_call(
+                socket.IPPROTO_TCP,
+                socket.TCP_KEEPCNT,
+                4,
+            )
+
+    def test_upstream_socket_factory_tolerates_unsupported_keepalive_tuning(self):
+        sock = mock.Mock()
+
+        def set_socket_option(level, _option, _value):
+            if level == socket.IPPROTO_TCP:
+                raise OSError("unsupported by fixture kernel")
+
+        sock.setsockopt.side_effect = set_socket_option
+        address_info = (
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            ("127.0.0.1", 443),
+        )
+
+        with mock.patch.object(hub.socket, "socket", return_value=sock):
+            result = hub.upstream_socket_factory(address_info)
+
+        self.assertIs(result, sock)
+        sock.setsockopt.assert_any_call(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     def test_malformed_upstream_url_becomes_controlled_route_error(self):
         with self.assertRaisesRegex(hub.RouteError, "invalid upstream URL"):
@@ -1247,6 +1408,28 @@ class ClaudeHubTests(unittest.TestCase):
             {"web_search_requests": 1},
         )
 
+    def test_stream_telemetry_measures_first_chunk_and_largest_gap(self):
+        timestamps = iter((10.2, 10.5, 11.0, 12.25))
+        telemetry = hub.StreamTelemetry(
+            started_at=10.0,
+            clock=lambda: next(timestamps),
+        )
+
+        telemetry.observe(b"a")
+        telemetry.observe(b"bc")
+        telemetry.observe(b"def")
+
+        self.assertEqual(
+            telemetry.snapshot(),
+            {
+                "headers_ms": 200,
+                "first_chunk_ms": 500,
+                "max_gap_ms": 1250,
+                "chunks": 3,
+                "upstream_bytes": 6,
+            },
+        )
+
     def test_usage_json_buffer_has_the_same_64_mib_cap_as_transform_bodies(self):
         buffer = bytearray(b"a" * (hub.MAX_UPSTREAM_BODY_BYTES - 1))
         self.assertIsNone(hub._append_bounded_json_buffer(buffer, b"bc"))
@@ -1261,9 +1444,10 @@ class ClaudeHubTests(unittest.TestCase):
             {"Content-Type": "text/event-stream"},
             [b"data: fixture\n\n"],
         )
+        session = _FakeSession(upstream)
         request = self._request(
             {"model": "fast,model", "messages": [], "stream": True},
-            session=_FakeSession(upstream),
+            session=session,
         )
         downstream = _FakeDownstream(200)
 
@@ -1286,7 +1470,7 @@ class ClaudeHubTests(unittest.TestCase):
         }
         with mock.patch.object(hub, "AnthropicStreamBridge", TypeFailingBridge), mock.patch.object(
             hub.web, "StreamResponse", return_value=downstream
-        ):
+        ), mock.patch.object(hub, "log") as write_log:
             with self.assertRaises(hub.UpstreamStreamAborted):
                 asyncio.run(
                     hub._handle_transformed_messages(
@@ -1301,6 +1485,71 @@ class ClaudeHubTests(unittest.TestCase):
                     )
                 )
         self.assertTrue(request.transport.aborted)
+        self.assertEqual(len(session.calls), 1)
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("chunks=1", rendered_log)
+        self.assertIn("upstream_bytes=15", rendered_log)
+        self.assertIn("downstream_bytes=0", rendered_log)
+        self.assertIn("terminal=error", rendered_log)
+        self.assertIn("error=TypeError", rendered_log)
+
+    def test_transformed_stream_clean_eof_emits_anthropic_terminal_events(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        # 新协议内核契约：无终止事件的裸 EOF 会 fail closed（见
+        # test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed）。
+        # 本测试覆盖正常收尾：终止 chunk + [DONE] 后 EOF 发出完整终止事件。
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n',
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{},'
+                b'"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ), mock.patch.object(hub, "log") as write_log:
+            response = asyncio.run(hub.handle_messages(request))
+
+        rendered = b"".join(downstream.writes)
+        self.assertIs(response, downstream)
+        self.assertIn(b'"text":"partial"', rendered)
+        self.assertIn(b"event: message_delta\n", rendered)
+        self.assertIn(b"event: message_stop\n", rendered)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("chunks=3", rendered_log)
+        self.assertIn("terminal=complete", rendered_log)
 
     def test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed(self):
         self._set_provider_endpoint(
@@ -3256,6 +3505,112 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertFalse(downstream.eof)
         self.assertTrue(request.transport.aborted)
         self.assertEqual(upstream.content.events, ["yield", "yield", "raise"])
+
+    def test_sse_abort_log_includes_content_free_stream_metrics(self):
+        secret = b"secret-response-fragment"
+        chunks = [b"event: message_start\n", secret]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+            fail_after=True,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=_FakeDownstream(200),
+        ), mock.patch.object(hub, "log") as write_log:
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("chunks=2", rendered_log)
+        self.assertIn(
+            f"upstream_bytes={sum(map(len, chunks))}",
+            rendered_log,
+        )
+        self.assertIn("terminal=error", rendered_log)
+        self.assertIn("error=ClientPayloadError", rendered_log)
+        self.assertNotIn(secret.decode(), rendered_log)
+
+    def test_sse_success_log_includes_stream_metrics_and_terminal_state(self):
+        chunks = [
+            b"event: message_start\ndata: {}\n\n",
+            b"event: message_stop\ndata: {}\n\n",
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ), mock.patch.object(hub, "log") as write_log:
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("chunks=2", rendered_log)
+        self.assertIn("terminal=complete", rendered_log)
+
+    def test_sse_missing_terminal_log_preserves_stream_metrics(self):
+        chunks = [b"event: message_start\ndata: {}\n\n"]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=_FakeDownstream(200),
+        ), mock.patch.object(hub, "log") as write_log:
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("upstream_bytes=31", rendered_log)
+        self.assertIn("downstream_bytes=31", rendered_log)
+        self.assertIn("terminal=missing", rendered_log)
 
     def test_sse_clean_eof_without_terminal_event_is_aborted(self):
         chunks = [

@@ -21,6 +21,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingTCPServer
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -744,7 +745,7 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     self.assertEqual(launcher.main(["doctor"]), 0)
                 rendered = output.getvalue()
                 self.assertLess(rendered.index("Alpha"), rendered.index("团队渠道"))
-                self.assertIn("本机只读，不连接上游", rendered)
+                self.assertIn("只读配置与传输检查", rendered)
                 self.assertIn("发现 2 个 Claude 渠道", rendered)
                 self.assertIn("1 个 provider 固定了子代理模型", rendered)
                 self.assertIn("claude1 doctor --fix", rendered)
@@ -802,6 +803,59 @@ class LauncherTuiLogicTests(unittest.TestCase):
             self.assertIn("Deep Provider", rendered)
             self.assertIn("settings_config 无效", rendered)
             self.assertIn("1 个 provider 固定了子代理模型", rendered)
+
+    def test_doctor_reports_current_provider_direct_failure_and_proxy_success(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, app_type TEXT, "
+                    "sort_index INTEGER, is_current INTEGER)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', 1, 1)",
+                    (
+                        "current",
+                        "Current Provider",
+                        json.dumps(
+                            {
+                                "env": {
+                                    "ANTHROPIC_BASE_URL": "https://upstream.invalid/v1",
+                                    "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                                }
+                            }
+                        ),
+                    ),
+                )
+            db_path.chmod(0o600)
+            fake_claude = home / "bin" / "claude"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(fake_claude, "#!/bin/sh\nexit 0\n")
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+
+            with loaded_launcher(env) as launcher:
+                probes = (
+                    SimpleNamespace(identity="direct", ok=False, detail="dns timeout"),
+                    SimpleNamespace(
+                        identity="proxy:http://127.0.0.1:7897",
+                        ok=True,
+                        detail="HTTP 405",
+                    ),
+                )
+                output = io.StringIO()
+                with mock.patch.object(
+                    launcher, "diagnose_transport_policy", return_value=probes
+                ), redirect_stdout(output):
+                    status = launcher.cli_doctor()
+
+        self.assertEqual(status, 0)
+        rendered = output.getvalue()
+        self.assertIn("direct: dns timeout", rendered)
+        self.assertIn("proxy:http://127.0.0.1:7897: HTTP 405", rendered)
 
     def test_doctor_fix_backs_up_and_cleans_every_provider_type(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1563,6 +1617,7 @@ class LauncherSafetyTests(unittest.TestCase):
                             0,
                             json.dumps(
                                 {
+                                    "transport": {"mode": "direct", "proxies": []},
                                     "env": {
                                         "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
                                         "ANTHROPIC_AUTH_TOKEN": "fixture-primary-token",
@@ -1906,6 +1961,40 @@ class LauncherSafetyTests(unittest.TestCase):
                         launcher.launch_provider(provider, [])
 
                 launch.assert_not_called()
+
+    def test_anthropic_auto_transport_launches_through_isolated_hub(self) -> None:
+        provider = {
+            "id": "auto-provider",
+            "name": "Auto Provider",
+            "settings_config": json.dumps(
+                {
+                    "transport": {"mode": "auto", "proxies": ["system"]},
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://upstream.invalid/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                    },
+                }
+            ),
+            "meta": json.dumps({"apiFormat": "anthropic"}),
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                with mock.patch.object(
+                    launcher, "launch_with_protocol_bridge", return_value=0
+                ) as bridge, mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ) as direct:
+                    result = launcher.launch_provider(provider, [])
+
+        self.assertEqual(result, 0)
+        bridge.assert_called_once()
+        self.assertEqual(bridge.call_args.args[2], "anthropic")
+        self.assertEqual(
+            bridge.call_args.kwargs["transport"],
+            {"mode": "auto", "proxies": ["system"]},
+        )
+        direct.assert_not_called()
 
     def test_launch_rejects_a_malformed_provider_url_with_the_provider_name(self) -> None:
         provider = {
@@ -2485,10 +2574,13 @@ class LauncherSafetyTests(unittest.TestCase):
             "name": "Gateway Provider",
             "settings_config": json.dumps(
                 {
+                    # 阶段 C 语义：无显式 transport 的 provider 默认 auto、走隔离
+                    # Hub；本测试针对直连分支的前置检查，须显式声明 direct。
+                    "transport": {"mode": "direct", "proxies": []},
                     "env": {
                         "ANTHROPIC_BASE_URL": "http://127.0.0.1:18317/v1",
                         "ANTHROPIC_AUTH_TOKEN": "fixture-token",
-                    }
+                    },
                 }
             ),
             "meta": "{}",
