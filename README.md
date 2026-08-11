@@ -227,6 +227,14 @@ CC Switch 渠道后，该渠道声明的模型默认全部勾选，可用空格�
    槽位的默认 effort。`default_channel` 仍只负责裸模型请求的网关回退路由，
    不等同于启动默认值。
 
+   顶层 `routes` 可声明跨 provider 的显式故障转移组。把 `/model` 的模型名写成
+   `route:<组名>` 时，Hub 按组内 target 顺序尝试，每个 target 沿用各自的账号池
+   与 transport 策略。只有“上游尚未接受请求”的安全失败才会进入下一 target：
+   当前 target 的所有账号与 transport 都以 401/403 拒绝，或收到 429；5xx、
+   发送后断线、已开始向下游响应都不会转移。每个 target 必须引用已声明的
+   `渠道,模型`（模型 ID 不在 provider 之间盲传），可选用 `requires` 列出最低
+   协议能力，启动时逐 target 校验。响应头 `x-hub-route` 标明命中的组名。
+
    首次打开 `claude1` 时，启动器会把现有 `~/.cc-switch/claude-hub.json`
    自动登记为名为 `Claude-Hub` 的工作区，并创建目录
    `~/.cc-switch/claude-hubs.json`。旧配置文件只被目录引用，不会被移动或改名。
