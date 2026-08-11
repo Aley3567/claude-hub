@@ -980,6 +980,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertEqual(
             metadata_paths,
             {
+                "$.model",
                 "$.output[0].id",
                 "$.output[1].id",
                 "$.output[2].id",
@@ -989,6 +990,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         id_only_call = protocol.prepare_response(
             {
                 "status": "completed",
+                "model": "responses-model",
                 "output": [
                     {
                         "type": "function_call",
@@ -1736,7 +1738,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertEqual(
             prepared.payload["usage"],
             {
-                "input_tokens": 100,
+                "input_tokens": 60,
                 "output_tokens": 20,
                 "cache_read_input_tokens": 40,
                 "cache_creation_input_tokens": 12,
@@ -2167,6 +2169,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                 == "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED"
             },
             {
+                "$.model",
                 "$.usage.prompt_tokens_details.audio_tokens",
                 "$.usage.completion_tokens_details.reasoning_tokens",
                 "$.usage.completion_tokens_details.accepted_prediction_tokens",
@@ -2181,7 +2184,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                 if decision.code
                 == "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED"
             ],
-            ["$.usage.output_tokens_details.reasoning_tokens"],
+            ["$.usage.output_tokens_details.reasoning_tokens", "$.model"],
         )
 
     def test_cache_read_detail_rejects_an_invalid_cached_counter(self) -> None:
@@ -2388,12 +2391,202 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertEqual(
             prepared.payload["usage"],
             {
-                "input_tokens": 10,
+                "input_tokens": 6,
                 "output_tokens": 1,
                 "cache_read_input_tokens": 4,
                 "cache_creation_input_tokens": 2,
             },
         )
+
+    def test_base_input_usage_excludes_cache_read_tokens(self) -> None:
+        bodies = (
+            (
+                "openai_chat",
+                {
+                    "choices": [
+                        {"message": {"content": "answer"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 1,
+                        "prompt_tokens_details": {"cached_tokens": 4},
+                    },
+                },
+            ),
+            (
+                "openai_responses",
+                {
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 4},
+                    },
+                },
+            ),
+        )
+        for api_format, body in bodies:
+            with self.subTest(api_format=api_format):
+                usage = protocol.prepare_response(body, api_format).payload["usage"]
+                self.assertEqual(usage["input_tokens"], 6)
+                self.assertEqual(usage["cache_read_input_tokens"], 4)
+
+    def test_cache_read_larger_than_base_input_usage_is_rejected(self) -> None:
+        bodies = (
+            (
+                "openai_chat",
+                {
+                    "choices": [
+                        {"message": {"content": "answer"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "prompt_tokens_details": {"cached_tokens": 4},
+                    },
+                },
+            ),
+            (
+                "openai_responses",
+                {
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 1,
+                        "input_tokens_details": {"cached_tokens": 4},
+                    },
+                },
+            ),
+        )
+        for api_format, body in bodies:
+            with self.subTest(api_format=api_format):
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(body, api_format)
+                self.assertEqual(
+                    raised.exception.code, "HUB_UPSTREAM_USAGE_INVALID"
+                )
+
+    def test_duplicate_tool_call_ids_are_rejected_for_both_formats(self) -> None:
+        bodies = (
+            (
+                "openai_chat",
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "a", "arguments": "{}"},
+                                    },
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "b", "arguments": "{}"},
+                                    },
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+            ),
+            (
+                "openai_responses",
+                {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "a",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "b",
+                            "arguments": "{}",
+                        },
+                    ],
+                },
+            ),
+        )
+        for api_format, body in bodies:
+            with self.subTest(api_format=api_format):
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(body, api_format)
+                self.assertEqual(
+                    raised.exception.code, "HUB_UPSTREAM_TOOL_CALL_INVALID"
+                )
+
+    def test_cache_creation_detail_without_total_is_rejected(self) -> None:
+        bodies = (
+            (
+                "openai_chat",
+                {
+                    "choices": [
+                        {"message": {"content": "answer"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 2},
+                    },
+                },
+            ),
+            (
+                "openai_responses",
+                {
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 1,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 2},
+                    },
+                },
+            ),
+        )
+        for api_format, body in bodies:
+            with self.subTest(api_format=api_format):
+                with self.assertRaises(protocol.ProtocolTransformError) as raised:
+                    protocol.prepare_response(body, api_format)
+                self.assertEqual(
+                    raised.exception.code, "HUB_UPSTREAM_USAGE_INVALID"
+                )
+
+    def test_missing_upstream_model_is_an_observable_degradation(self) -> None:
+        for api_format, body in (
+            (
+                "openai_chat",
+                {
+                    "choices": [
+                        {"message": {"content": "answer"}, "finish_reason": "stop"}
+                    ]
+                },
+            ),
+            ("openai_responses", {"status": "completed", "output": []}),
+        ):
+            with self.subTest(api_format=api_format):
+                prepared = protocol.prepare_response(body, api_format)
+                self.assertEqual(prepared.payload["model"], "")
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                    prepared.plan.warning_codes,
+                )
+                self.assertIn(
+                    "$.model",
+                    {
+                        decision.path
+                        for decision in prepared.plan.decisions
+                        if decision.code
+                        == "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED"
+                    },
+                )
 
     def test_real_upstream_citations_are_not_fabricated_into_anthropic_locations(self) -> None:
         chat = protocol.prepare_response(

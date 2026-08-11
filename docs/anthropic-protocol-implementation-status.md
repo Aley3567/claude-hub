@@ -68,7 +68,7 @@
 | `stop_sequences` | `exact` | `exact` | `observable degradation` | `reject` |
 | JSON Schema `format: uri` normalization | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | `container` / `inference_geo` | `exact` | `reject` | `reject` | `reject` |
-| 基础 usage（上游计数存在） | `exact` | `exact` | `exact` | `reject` |
+| 基础 usage（上游计数存在；Chat/Responses 的 input 计数扣除 cache-read 后映射） | `exact` | `exact` | `exact` | `reject` |
 | 基础 usage（上游计数缺失） | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | 已登记、合法且一致的 cache usage counter / split detail | `exact` | `exact` | `exact` | `reject` |
 | 已登记且合法的 server-tool usage counter / detail | `exact` | `exact` | `exact` | `reject` |
@@ -87,7 +87,7 @@
 | 请求字段 / union | Chat | Responses | 精确边界或拒绝条件 |
 | --- | --- | --- | --- |
 | `model`、`max_tokens` | `exact` | `exact` | 非空 model、正整数 token；malformed 分别拒绝。 |
-| 普通 user/assistant role、text、image | `exact` | `exact` | role、content、source shape 必须通过 IR allowlist。 |
+| 普通 user/assistant role、text、image | `exact` | `exact` | role、content、source shape 必须通过 IR allowlist；空 content 数组以 `HUB_INVALID_CONTENT_BLOCK` 拒绝。 |
 | `system` text、embedded system role | `exact` | `exact` | embedded role 会规范化；空/null/空 block 或额外 message 字段拒绝。Native 的 role promotion 是 observable degradation。 |
 | `temperature`、`top_p`、`stream` | `exact` | `exact` | 类型/范围先在 IR 校验；未知控制字段拒绝。 |
 | `stop_sequences` | `exact` | `observable degradation` | Responses 默认记录 `HUB_DEGRADE_STOP_SEQUENCES_DROPPED`，strict 拒绝。 |
@@ -115,16 +115,16 @@
 | completed client tool call | `exact` | `exact` | id/name/JSON object arguments 必须完整；空 JSON 文本、orphan、server-tool discriminator 或 index/identity 冲突拒绝。 |
 | terminal stop/status | `exact`（登记 reason） | `exact`（登记 status/reason） | 未知 reason、缺 terminal reason、成功态携带 error，以及 truncation/refusal 与 tool output 冲突均拒绝。 |
 | citation/annotation metadata | `observable degradation` | `observable degradation` | 正文保留，location 不猜测；strict 流模式拒绝。 |
-| base usage | 有真实 counter 时 `exact`；缺失 `observable degradation` | 同左 | malformed、负数、bool 或未知 carrier 拒绝。 |
+| base usage | 有真实 counter 时 `exact`；缺失 `observable degradation` | 同左 | malformed、负数、bool 或未知 carrier 拒绝；OpenAI base input 计数先扣除 cache-read，差值为负拒绝。 |
 | `total_tokens` | 两项 base 都在时校验一致；缺 base 不反推 | 同左 | 完整 snapshot 中总数冲突为 `HUB_UPSTREAM_USAGE_INVALID`。 |
-| cache/server usage | 已登记、合法且一致时 `exact` | 同左 | nested/direct alias、cache total/split 冲突、未知字段或 malformed shape 拒绝。 |
+| cache/server usage | 已登记、合法且一致时 `exact` | 同左 | nested/direct alias、cache total/split 冲突、detail 无 total、未知字段或 malformed shape 拒绝。 |
 | reasoning/audio/prediction detail | `observable degradation` | `observable degradation` | 逐路径记录 response metadata warning；strict 流模式拒绝。 |
 
 ### SSE disposition registry
 
 | SSE 能力 | disposition | 明确边界 |
 | --- | --- | --- |
-| 任意 transport chunk boundary、UTF-8 code point 分割、CRLF/LF/CR | `exact` | invalid UTF-8、partial JSON、incomplete event、单事件超限分别以稳定 `HUB_SSE_*` 拒绝。 |
+| 任意 transport chunk boundary、UTF-8 code point 分割、CRLF/LF/CR 混合行尾、流首 BOM | `exact` | invalid UTF-8、partial JSON、incomplete event、单事件超限分别以稳定 `HUB_SSE_*` 拒绝；解析按扫描偏移保持 O(n)。 |
 | Chat/Responses terminal lifecycle | `exact` | 缺 terminal、terminal/status 冲突、重复/迟到事件、terminal 后内容均 fail closed。 |
 | response `id` / `model` 跨 chunk identity | `exact` | 首次观察锁定；变化或 message_start 后迟到冲突为 `HUB_SSE_DUPLICATE_CONFLICT`。 |
 | text/refusal/reasoning delta + done snapshot | `exact`；unsigned reasoning degraded | 任意合法坐标配对、suffix repair 与幂等；错序、负坐标、snapshot 冲突拒绝。 |
@@ -134,13 +134,13 @@
 | citation/annotation event | `observable degradation` | 必须关联正确 item/output/content、开放的 output_text part、合法 metadata carrier/index；strict 拒绝。 |
 | sequence/logprobs/obfuscation、known wrapper metadata | `observable degradation` | 稳定 metadata warning；unknown wrapper/event 字段拒绝。 |
 | upstream error detail | sanitized error + `observable degradation` | detail shape 校验，不回传 vendor secret；成功 terminal 携带 error 拒绝。 |
-| usage stream snapshots | 与非流 registry 相同 | counter regression、unknown/malformed/conflict 拒绝；结束时缺 base 标记 provenance unavailable。 |
+| usage stream snapshots | 与非流 registry 相同；未观测字段省略不伪造 | counter regression、unknown/malformed/conflict 拒绝；结束时缺 base 标记 provenance unavailable；terminal 才到达的 input usage 由 message_delta 如实携带并记录 `HUB_DEGRADE_LATE_INPUT_USAGE`。 |
 
 ### 请求与内容块的具体语义
 
 - **Canonical IR 与 fail-closed。** Chat/Responses 先解析为 `RequestIR`，再由独立 adapter 编码。消息、tool、已知 content block 的额外字段不能绕过 IR；未知类型以 `HUB_UNSUPPORTED_CONTENT_BLOCK`、`HUB_UNSUPPORTED_CONTENT_FIELD`、`HUB_UNSUPPORTED_TOOL_*` 或 `HUB_UNSUPPORTED_REQUEST_FIELD` 拒绝。
 - **System normalization。** 合法的 embedded system text block 会按原顺序追加到已有顶层 `system`，保留 block metadata；输入对象不原地修改。native `strict` 模式拒绝此客户端扩展，避免把隐含重写伪装成严格官方 payload。Chat/Responses 本身有 system role carrier，因此该 role 是 exact；但 block metadata 没有等价 carrier，必有可观察降级。
-- **`tool_result`。** tool causality（唯一、此前的 `tool_use`、role 正确）在跨协议前验证。嵌套 text/image/document/search_result 与 `is_error=true` 采用明确 JSON envelope：`{"type":"anthropic_tool_result","is_error":...,"content":...}`。该 envelope 保留原始值但不是目标协议的原生 error 字段，故为 observable degradation；不受支持的嵌套 part 直接拒绝。
+- **`tool_result`。** tool causality（唯一、此前的 `tool_use`、role 正确）在跨协议前验证；违反时是 request-phase `ProtocolRequestError`（`HUB_INVALID_TOOL_CAUSALITY`,HTTP 400，带 path)，不会冒泡成非结构化 500。嵌套 text/image/document/search_result 与 `is_error=true` 采用明确 JSON envelope：`{"type":"anthropic_tool_result","is_error":...,"content":...}`。该 envelope 保留原始值但不是目标协议的原生 error 字段，故为 observable degradation；不受支持的嵌套 part 直接拒绝。
 - **Document、search 与 citation。** 对 Chat/Responses，文本 document/search context 使用带标题/source 的 provenance text envelope；无法抽取的 document 用明确 placeholder。`document.source.type=content` 与 `search_result.content` 的 nested text block 递归执行 allowlist：citation metadata 记录 `HUB_DEGRADE_CITATION_METADATA_DROPPED`，`cache_control` 记录 `HUB_DEGRADE_CONTENT_METADATA_DROPPED`，strict 均拒绝，未知 nested field fail closed。响应 citation/annotation 不猜测 Anthropic location，也不把上游 URL 伪造进输出；SSE 还要求 metadata event 精确关联开放的 item/output/content part。
 - **Thinking、signature 与 redaction。** thinking text 使用 Chat reasoning carrier 或 Responses reasoning carrier，并记录降级。默认 `visible_lossy` 模式会删除跨协议请求中的 Anthropic signature 并给出 `HUB_DEGRADE_THINKING_SIGNATURE_DROPPED`；`strict` 模式明确拒绝。非流 Chat 上游若给出无法验证的 signature 会拒绝；流中只有真实 `reasoning_signature`/`signature_delta` 才成为 Anthropic `signature_delta`，从不生成假值。无 signature 的 thinking 记录 `HUB_DEGRADE_UNSIGNED_THINKING`。Chat 无安全 redacted carrier 而拒绝；Responses 的 namespaced prefix + Base64 是可逆 carrier，不是 MAC、签名或来源认证，只允许这一登记格式回放，任意其他 opaque `redacted_thinking` 仍拒绝。
 - **Refusal。** Chat `refusal`、`content_filter` 与 Responses refusal event/output 统一映射为 Anthropic text + `stop_reason: "refusal"`；未知上游 finish/stop reason 拒绝，绝不降格为 `end_turn`。
@@ -148,7 +148,9 @@
 
 ### Usage、cache 与 count-token provenance
 
-- cache read/write、`cache_creation` 和 `server_tool_use` 只在上游实际提供、字段已登记、counter 合法且多 carrier 一致时保留。read/write alias、cache total/split detail 冲突，未知 usage/detail 字段或 malformed shape 均为 `HUB_UPSTREAM_USAGE_INVALID`。`cached_tokens` 精确保留；reasoning/audio/prediction detail 逐字段记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`。
+- cache read/write、`cache_creation` 和 `server_tool_use` 只在上游实际提供、字段已登记、counter 合法且多 carrier 一致时保留。read/write alias、cache total/split detail 冲突，未知 usage/detail 字段或 malformed shape 均为 `HUB_UPSTREAM_USAGE_INVALID`。`cached_tokens` 精确保留；reasoning/audio/prediction detail 逐字段记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`。`cache_creation` split detail 存在而 total counter 缺失同样拒绝，不输出无 total 的半截 cache 结构。
+- OpenAI 的 base input 计数（`prompt_tokens`/`input_tokens`）包含 cached tokens，而 Anthropic `input_tokens` 语义不含 cache read；二者同时观测到时输出 `input_tokens = base - cache_read`，差值为负按 `HUB_UPSTREAM_USAGE_INVALID` 拒绝。base counter 缺失时不做减法，走缺失 provenance 分支。
+- 流式 usage 只发出上游实际观测到的字段：`message_start` 不再恒发 `input_tokens: 0`/`output_tokens: 0`，`message_delta` 不再恒发 `output_tokens: 0`，客户端因此能区分真实 0 与未观测。terminal 才到达的晚期 input usage 由 `message_delta` 如实携带，并保留 `HUB_DEGRADE_LATE_INPUT_USAGE` 可观测性；`message_start` 已携带的 input usage 不重复。上游 wrapper 缺 `model` 时输出空串并逐响应记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`(`$.model`)，不猜测模型名。
 - `total_tokens` 始终校验为非负 counter；同一 snapshot 的 input/output 两项都存在时必须等于二者之和。缺任一 base 时不反推、不分摊、不伪造，缺项记录 `HUB_USAGE_PROVENANCE_UNAVAILABLE`。对客户端 schema 必须存在的基础计数可使用带 warning 的 `0` 占位，但 usage JSONL 会移除这些占位，只落实际观察到的上游 counter，并将完全不可用的记录标为 `source=unavailable`。
 - `cache_control` 的跨协议请求语义不能无损表达，因此被移除并带 `HUB_DEGRADE_CACHE_CONTROL_DROPPED`；这与“缓存 usage counter 已从上游返回”的 exact 保留是不同能力。
 - Hub 的 native `/v1/messages/count_tokens` 成功透传结果标记为 upstream/exact。对于 Chat/Responses、native full-URL provider，或 native endpoint 返回 404/405/501 的 fallback，Hub 不联想上游 tokenizer：只返回上述带 provenance 的本地估算。
@@ -157,10 +159,10 @@
 ### SSE 状态机与 golden / invariant 覆盖
 
 - `SSEParser` 与 `AnthropicStreamBridge` 是跨协议流的显式状态机；native raw SSE 使用 `_SSETerminalTracker`/`_SSEUsageTracker` 验证 terminal 与 usage，而非把不完整流补成成功。
-- Responses 的 `content_part.added/done`、`reasoning_summary_part.added/done`、text/summary delta 与 done snapshot 会按 item/index 生命周期显式配对；合法 snapshot 只补缺失 suffix，冲突、错序或未知 part fail closed。无 structural wrapper 的兼容上游 delta/done 仍走独立坐标验证路径。citation/annotation event 同样校验 item/output/content 坐标、part open 状态、metadata carrier shape/index，strict 模式拒绝有损 metadata。
+- Responses 的 `content_part.added/done`、`reasoning_summary_part.added/done`、text/summary delta 与 done snapshot 会按 item/index 生命周期显式配对；合法 snapshot 只补缺失 suffix，冲突、错序或未知 part fail closed。terminal item 快照调和成功即视为对应 part done（省略 `*.done` 事件的兼容路径），并记录 done snapshot 供幂等比对。Chat content→reasoning→content 交错时，开启 thinking 前会先关闭已打开的 text block，保证 Anthropic block 序列合法。无 structural wrapper 的兼容上游 delta/done 仍走独立坐标验证路径。citation/annotation event 同样校验 item/output/content 坐标、part open 状态、metadata carrier shape/index，strict 模式拒绝有损 metadata。
 - Terminal `response.output` 会重建此前未出现的完整 message、reasoning 或 function call snapshot；与 `output_item.done` 重复时幂等，identity enrichment 只补充缺失 id。相同 output index 的 type/id/content 或 encrypted snapshot 冲突会拒绝。只有 output index/anonymous identity 的 function call 使用公开 synthetic id 并记录 `HUB_DEGRADE_SYNTHETIC_TOOL_ID`，strict 拒绝；namespaced 内部 alias 不进入 Anthropic wire output。
 - Chat/Responses wrapper 的 response id/model 首见锁定，跨 chunk 改变拒绝；sequence、logprobs、obfuscation、known wrapper metadata 与 sanitized error detail 走稳定 observable degradation，unknown/malformed wrapper fail closed。
-- 每个 tool arguments 聚合上限 2 MiB，text/summary 每 part 2 MiB、每 bridge 合计 16 MiB，内容块总数 4096；上限按 UTF-8 bytes 计数，超限返回稳定 `HUB_SSE_*_TOO_LARGE` / `HUB_SSE_TOO_MANY_BLOCKS`。tool arguments 即使为空也必须最终形成显式 JSON object，不能把 `""` 伪造成 `{}`；SSE 单事件边界使用 `HUB_SSE_EVENT_TOO_LARGE`。
+- 每个 tool arguments 聚合上限 2 MiB，text/summary 每 part 2 MiB、每 bridge 合计 16 MiB，内容块总数 4096；上限按 UTF-8 bytes 计数，超限返回稳定 `HUB_SSE_*_TOO_LARGE` / `HUB_SSE_TOO_MANY_BLOCKS`。Responses 的 output item/output item id/redacted snapshot 注册表同样以 4096 条为上限，output item id 另限 1024 字符。tool arguments 即使为空也必须最终形成显式 JSON object，不能把 `""` 伪造成 `{}`；SSE 单事件边界使用 `HUB_SSE_EVENT_TOO_LARGE`。
 - Golden fixtures 位于 `tests/fixtures/anthropic_protocol/sse/`：`chat_utf8_crlf`、`responses_refusal`、`responses_tool_partial`，并与 request 的 `claude_code_system_role` golden fixture 一同覆盖稳定序列化。
 - `tests/test_protocol_sse_invariants.py` 覆盖任意及 fuzzed transport chunk 边界、UTF-8 分割、CRLF、partial JSON/tool arguments、响应 snapshot suffix 修复、invalid UTF-8/JSON、资源上限、重复/冲突 terminal、乱序/迟到事件、usage regression、无 terminal EOF、refusal、citation 与 cache/server usage。
 - `tests/test_claude_hub.py` 额外覆盖生产 Hub 的原生/转译 SSE：有效 `message_stop` 或 `error` terminal、CR-only、BOM、压缩流、terminal 后事件、缺 terminal 的真实 loopback 连接中止。已开始 SSE 无法回滚时只 abort transport，绝不追加伪造的 `message_stop`。
@@ -185,10 +187,10 @@
 - 生产 Hub、native forwarding、count-token provenance 与流中止：`tests/test_claude_hub.py`。
 - launcher session/账号池/bridge secret 边界与微信 Coding Plan 隔离 smoke：`tests/test_launcher.py`；它仍未提供 strict-native direct bridge 的 integration smoke。  <!-- secret-guard: allow private-provider-name 65941246a1 -->
 
-## 最终验证（2026-08-11）
+## 最终验证（2026-08-11,review 修复轮）
 
-- 完整 Python 测试：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'`，473/473 通过。
-- 协议定向测试：`tests.test_claude1_protocol`、`tests.test_protocol_contract`、`tests.test_protocol_sse_invariants`，合计 159/159 通过。
+- 完整 Python 测试：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'`，508/508 通过。
+- 协议定向测试：`tests.test_claude1_protocol`、`tests.test_protocol_contract`、`tests.test_protocol_sse_invariants`，合计 176/176 通过。
 - 生产路径定向测试：`tests.test_claude_hub`、`tests.test_launcher`、`tests.test_hub_catalog`、`tests.test_statusline_model`、`tests.test_account_pool`，合计 295/295 通过；完整 discover 还覆盖其余 Python 回归。
 - 微信 Coding Plan 隔离 smoke：1/1 通过。该用例使用临时 HOME、0600 SQLite provider、fixture token、fake Claude 和 `127.0.0.1` fixture upstream；没有读取、输出或发送真实 provider token。  <!-- secret-guard: allow private-provider-name 65941246a1 -->
 - Shell integration：`zsh tests/test_shell_integration.zsh`，11/11 通过。

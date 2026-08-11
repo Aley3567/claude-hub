@@ -592,6 +592,9 @@ class ClaudeHubTests(unittest.TestCase):
 
             def __init__(self):
                 self.path = path
+                self.query_string = (
+                    query[len("?") :] if query.startswith("?") else query
+                )
                 self.headers = request_headers
                 self.app = {"session": session}
                 self.transport = _FakeTransport()
@@ -849,6 +852,54 @@ class ClaudeHubTests(unittest.TestCase):
 
         with self.assertRaisesRegex(hub.RouteError, "unknown model"):
             hub.route("claude-fable-5", cfg, providers)
+
+    def test_config_validation_rejects_non_boolean_route_unknown_to_default(self):
+        self._write_config(
+            default_channel="fast",
+            channels={
+                "fast": {
+                    "provider": "Fixture HTTPS",
+                    "models": ["claude-sonnet-4"],
+                    "route_unknown_to_default": "yes",
+                }
+            },
+        )
+        hub.reset_caches()
+
+        with self.assertRaisesRegex(
+            hub.ConfigError, "route_unknown_to_default must be a boolean"
+        ):
+            hub.get_config()
+
+    def test_route_unknown_to_default_passes_unlisted_models_through(self):
+        self._write_config(
+            default_channel="fast",
+            channels={
+                "fast": {
+                    "provider": "Fixture HTTPS",
+                    "models": ["claude-sonnet-4"],
+                    "route_unknown_to_default": True,
+                }
+            },
+        )
+        hub.reset_caches()
+        cfg = hub.get_config()
+
+        self.assertIs(cfg["channels"]["fast"]["route_unknown_to_default"], True)
+        self.assertEqual(
+            hub.route("some-future-model", cfg),
+            ("fast", "some-future-model"),
+        )
+        self.assertEqual(
+            hub.route("claude-sonnet-4", cfg),
+            ("fast", "claude-sonnet-4"),
+        )
+
+    def test_route_unknown_to_default_defaults_off_in_normalized_config(self):
+        cfg = hub.get_config()
+
+        for channel in cfg["channels"].values():
+            self.assertIs(channel["route_unknown_to_default"], False)
 
     def test_local_auth_accepts_bearer_raw_and_api_key(self):
         cfg = hub.get_config()
@@ -1341,6 +1392,193 @@ class ClaudeHubTests(unittest.TestCase):
 
         self.assertTrue(
             any("HUB_DEGRADE_UNSIGNED_THINKING" in entry for entry in observed)
+        )
+
+    def _sse_frames(self, rendered):
+        frames = []
+        for frame in rendered.split(b"\n\n"):
+            if not frame:
+                continue
+            event_line, data_line = frame.split(b"\n", 1)
+            frames.append(
+                (
+                    event_line[len(b"event: ") :].decode(),
+                    json.loads(data_line[len(b"data: ") :]),
+                )
+            )
+        return frames
+
+    def _transformed_json_upstream(self, upstream_payload):
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(upstream_payload).encode()],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+        }
+        return asyncio.run(
+            hub._handle_transformed_messages(
+                request,
+                cfg=hub.get_config(),
+                provider=provider,
+                payload={
+                    "model": "custom-model",
+                    "messages": [{"role": "user", "content": "fixture"}],
+                    "stream": True,
+                },
+                alias="fast",
+                model_in="fast,custom-model",
+                model_out="custom-model",
+                started=0,
+            )
+        )
+
+    def test_transformed_json_upstream_is_synthesized_into_sse_when_streaming(self):
+        response = self._transformed_json_upstream(
+            {
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            }
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["content-type"], "text/event-stream")
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+        self.assertEqual(response.headers["x-hub-channel"], "fast")
+        self.assertEqual(response.headers["x-hub-model"], "custom-model")
+        self.assertEqual(response.headers["x-hub-upstream-format"], "openai_chat")
+        events = self._sse_frames(response.body)
+        self.assertEqual(
+            [name for name, _data in events],
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+        )
+        message = events[0][1]["message"]
+        self.assertEqual(message["type"], "message")
+        self.assertEqual(message["role"], "assistant")
+        self.assertEqual(message["content"], [])
+        self.assertEqual(
+            message["usage"], {"input_tokens": 3, "output_tokens": 2}
+        )
+        self.assertEqual(
+            events[1][1]["content_block"], {"type": "text", "text": ""}
+        )
+        self.assertEqual(
+            events[2][1]["delta"], {"type": "text_delta", "text": "hello"}
+        )
+        self.assertEqual(events[2][1]["index"], 0)
+        self.assertEqual(
+            events[4][1]["delta"],
+            {"stop_reason": "end_turn", "stop_sequence": None},
+        )
+        self.assertEqual(events[4][1]["usage"], {"output_tokens": 2})
+
+    def test_synthesized_sse_does_not_fabricate_unobserved_usage(self):
+        response = self._transformed_json_upstream(
+            {
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["content-type"], "text/event-stream")
+        self.assertIn(
+            "HUB_USAGE_PROVENANCE_UNAVAILABLE",
+            response.headers["x-hub-protocol-warnings"],
+        )
+        self.assertNotIn(b'"usage"', response.body)
+
+    def test_synthesized_sse_streams_tool_use_input_as_json_delta(self):
+        response = self._transformed_json_upstream(
+            {
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"a": 1}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 4},
+            }
+        )
+
+        self.assertEqual(response.status, 200)
+        events = self._sse_frames(response.body)
+        self.assertEqual(
+            [name for name, _data in events],
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+        )
+        self.assertEqual(
+            events[1][1]["content_block"],
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "get_weather",
+                "input": {},
+            },
+        )
+        self.assertEqual(events[1][1]["index"], 0)
+        self.assertEqual(
+            events[2][1]["delta"],
+            {"type": "input_json_delta", "partial_json": '{"a":1}'},
+        )
+        self.assertEqual(
+            events[4][1]["delta"]["stop_reason"], "tool_use"
         )
 
     def test_request_too_large_returns_anthropic_json_error(self):
@@ -2043,6 +2281,7 @@ class ClaudeHubTests(unittest.TestCase):
         class FakeRequest:
             path = "/v1/messages/count_tokens"
             path_qs = "/v1/messages/count_tokens?beta=true"
+            query_string = "beta=true"
 
             def __init__(self, session, token):
                 self.headers = {"authorization": f"Bearer {token}"}
@@ -2443,6 +2682,151 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(response.headers["x-hub-token-count-exact"], "0")
         self.assertEqual(response.headers["x-hub-token-count-error-bound"], "unbounded")
+        self.assertEqual(session.calls, [])
+
+    def test_transformed_count_tokens_validates_payload_before_estimating(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "future_native_block", "opaque": True}],
+                    }
+                ],
+            },
+            session=session,
+            path="/v1/messages/count_tokens",
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(
+            response.headers["x-hub-protocol-code"],
+            "HUB_UNSUPPORTED_CONTENT_BLOCK",
+        )
+        body = json.loads(response.text)
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("$.messages[0].content[0]", body["error"]["message"])
+        self.assertEqual(session.calls, [])
+
+    def test_transformed_count_tokens_estimate_marks_channel_headers(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+            path="/v1/messages/count_tokens",
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["x-hub-channel"], "fast")
+        self.assertEqual(response.headers["x-hub-model"], "custom-model")
+        self.assertEqual(response.headers["x-hub-token-count-source"], "estimate")
+        self.assertEqual(response.headers["x-hub-token-count-exact"], "0")
+        self.assertGreater(json.loads(response.text)["input_tokens"], 0)
+        self.assertEqual(session.calls, [])
+
+    def test_native_count_tokens_estimate_fallback_marks_channel_headers(self):
+        upstream = _FakeUpstream(
+            404,
+            {"Content-Type": "application/json"},
+            [b'{"type":"error","error":{"type":"not_found_error","message":"nope"}}'],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+            path="/v1/messages/count_tokens",
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["x-hub-channel"], "fast")
+        self.assertEqual(response.headers["x-hub-model"], "custom-model")
+        self.assertEqual(response.headers["x-hub-token-count-source"], "estimate")
+        self.assertEqual(response.headers["x-hub-token-count-exact"], "0")
+
+    def test_transformed_upstream_error_carries_request_protocol_warnings(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            429,
+            {"Content-Type": "application/json"},
+            [
+                b'{"error":{"message":"slow down",'
+                b'"type":"rate_limit_error","code":"rate_limit"}}'
+            ],
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "fixture system",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 429)
+        self.assertEqual(
+            response.headers["x-hub-protocol-warnings"],
+            "HUB_DEGRADE_SYSTEM_METADATA_DROPPED",
+        )
+        self.assertEqual(response.headers["x-hub-channel"], "fast")
+        self.assertEqual(response.headers["x-hub-model"], "custom-model")
+        body = json.loads(response.text)
+        self.assertEqual(body["error"]["type"], "rate_limit_error")
+
+    def test_full_url_provider_rejects_request_query_strings(self):
+        endpoint = "http://127.0.0.1:19090/v1/messages"
+        self._set_provider_endpoint("Fixture HTTPS", endpoint, "anthropic")
+        session = _NeverSession()
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+            query="?beta=true",
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 400)
+        body = json.loads(response.text)
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("query string", body["error"]["message"])
         self.assertEqual(session.calls, [])
 
     def test_transformed_full_url_provider_uses_the_complete_endpoint(self):

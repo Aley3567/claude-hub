@@ -2281,6 +2281,253 @@ class LauncherSafetyTests(unittest.TestCase):
                     str(inherited_fd),
                 )
 
+    def _bridge_fixture(self, raw_home: str):
+        env = isolated_env(Path(raw_home))
+        script = Path(env["CLAUDE1_HUB_SCRIPT"])
+        script.parent.mkdir(parents=True)
+        write_executable(script, "#!/bin/sh\nexit 0\n")
+        return env
+
+    def test_protocol_bridge_routes_unknown_models_to_the_default_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                written = []
+                real_write = launcher._atomic_private_write
+
+                def capture(path, content):
+                    if path.name == "hub.json":
+                        written.append(json.loads(content))
+                    return real_write(path, content)
+
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                with mock.patch.object(
+                    launcher, "_atomic_private_write", side_effect=capture
+                ), mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=process
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=True
+                ), mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    result = launcher.launch_with_protocol_bridge(
+                        {"id": "chat-provider", "name": "Chat Provider"},
+                        {"env": {"ANTHROPIC_AUTH_TOKEN": "fixture-token"}},
+                        "openai_chat",
+                        [],
+                    )
+
+                self.assertEqual(result, 0)
+                # 无 ANTHROPIC_MODEL 的 provider 也允许 Claude Code
+                # 内置默认模型名透传到 default channel。
+                self.assertEqual(written[0]["default_channel"], "direct")
+                self.assertIs(
+                    written[0]["channels"]["direct"]["route_unknown_to_default"], True
+                )
+
+    def test_protocol_bridge_error_includes_a_bounded_log_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                process = mock.Mock()
+                process.poll.return_value = 1
+                process.wait.return_value = 1
+
+                def fake_popen(*_args, **kwargs):
+                    kwargs["stdout"].write(
+                        b"x" * 5000 + b"fatal upstream auth error\n"
+                    )
+                    kwargs["stdout"].flush()
+                    return process
+
+                with mock.patch.object(
+                    launcher.subprocess, "Popen", side_effect=fake_popen
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=False
+                ):
+                    with self.assertRaises(RuntimeError) as caught:
+                        launcher.launch_with_protocol_bridge(
+                            {"id": "chat-provider", "name": "Chat Provider"},
+                            {"env": {}},
+                            "openai_chat",
+                            [],
+                        )
+
+                message = str(caught.exception)
+                self.assertIn("协议桥提前退出（状态 1）", message)
+                self.assertIn("fatal upstream auth error", message)
+                # 日志尾部有界 4 KiB：更靠前的填充内容不得进入错误消息。
+                self.assertNotIn("x" * 5000, message)
+
+    def test_protocol_bridge_ensures_the_local_gateway_for_the_original_url(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                original_url = "http://127.0.0.1:18317/v1"
+                with mock.patch.object(
+                    launcher, "ensure_local_gateway"
+                ) as gateway, mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=process
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=True
+                ), mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    result = launcher.launch_with_protocol_bridge(
+                        {"id": "chat-provider", "name": "Chat Provider"},
+                        {"env": {"ANTHROPIC_BASE_URL": original_url}},
+                        "openai_chat",
+                        [],
+                    )
+
+                self.assertEqual(result, 0)
+                # 必须对原始（未改写为桥地址的）provider URL 调一次。
+                gateway.assert_called_once_with(original_url)
+
+    def test_protocol_bridge_gateway_failure_aborts_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                with mock.patch.object(
+                    launcher,
+                    "ensure_local_gateway",
+                    side_effect=RuntimeError("本地网关启动失败"),
+                ), mock.patch.object(
+                    launcher.subprocess, "Popen"
+                ) as popen:
+                    with self.assertRaisesRegex(RuntimeError, "本地网关启动失败"):
+                        launcher.launch_with_protocol_bridge(
+                            {"id": "chat-provider", "name": "Chat Provider"},
+                            {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18317/v1"}},
+                            "openai_chat",
+                            [],
+                        )
+
+                popen.assert_not_called()
+
+    def test_protocol_bridge_records_usage_only_after_a_healthy_start(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                provider = {"id": "chat-provider", "name": "Chat Provider"}
+
+                # 启动失败：bridge 提前退出时不计数。
+                failed = mock.Mock()
+                failed.poll.return_value = 1
+                failed.wait.return_value = 1
+                with mock.patch.object(
+                    launcher, "record_use"
+                ) as record_use, mock.patch.object(
+                    launcher, "record_backend"
+                ) as record_backend, mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=failed
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=False
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "协议桥提前退出"):
+                        launcher.launch_with_protocol_bridge(
+                            provider,
+                            {"env": {}},
+                            "openai_chat",
+                            [],
+                        )
+                record_use.assert_not_called()
+                record_backend.assert_not_called()
+
+                # 健康检查通过、即将真正启动时按 provider 计数一次。
+                healthy = mock.Mock()
+                healthy.poll.return_value = None
+                healthy.wait.return_value = 0
+                with mock.patch.object(
+                    launcher, "record_use"
+                ) as record_use, mock.patch.object(
+                    launcher, "record_backend"
+                ) as record_backend, mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=healthy
+                ), mock.patch.object(
+                    launcher, "hub_healthy", return_value=True
+                ), mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    self.assertEqual(
+                        launcher.launch_with_protocol_bridge(
+                            provider,
+                            {"env": {}},
+                            "openai_chat",
+                            [],
+                            backend_kind="current",
+                        ),
+                        0,
+                    )
+                record_use.assert_called_once_with("chat-provider")
+                record_backend.assert_called_once_with("current", "Chat Provider")
+
+    def test_protocol_bridge_requires_a_posix_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                with mock.patch.object(
+                    launcher.os, "name", "nt"
+                ), mock.patch.object(
+                    launcher.subprocess, "Popen"
+                ) as popen:
+                    with self.assertRaisesRegex(RuntimeError, "POSIX"):
+                        launcher.launch_with_protocol_bridge(
+                            {"id": "chat-provider", "name": "Chat Provider"},
+                            {"env": {}},
+                            "openai_chat",
+                            [],
+                        )
+                popen.assert_not_called()
+
+    def test_launch_records_usage_only_after_preflight_checks_pass(self) -> None:
+        provider = {
+            "id": "gateway-provider",
+            "name": "Gateway Provider",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://127.0.0.1:18317/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                # 直连分支前置检查失败：ensure_local_gateway 抛错时不计数。
+                with mock.patch.object(
+                    launcher,
+                    "ensure_local_gateway",
+                    side_effect=RuntimeError("本地网关启动失败"),
+                ), mock.patch.object(
+                    launcher, "record_use"
+                ) as record_use, mock.patch.object(
+                    launcher, "record_backend"
+                ) as record_backend, mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ) as launch:
+                    with self.assertRaisesRegex(RuntimeError, "本地网关启动失败"):
+                        launcher.launch_provider(provider, [])
+                record_use.assert_not_called()
+                record_backend.assert_not_called()
+                launch.assert_not_called()
+
+                # 前置检查通过、即将启动时计数一次。
+                with mock.patch.object(
+                    launcher, "ensure_local_gateway"
+                ), mock.patch.object(
+                    launcher, "record_use"
+                ) as record_use, mock.patch.object(
+                    launcher, "record_backend"
+                ) as record_backend, mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    self.assertEqual(launcher.launch_provider(provider, []), 0)
+                record_use.assert_called_once_with("gateway-provider")
+                record_backend.assert_called_once_with("provider", "Gateway Provider")
+
     def test_gateway_health_requires_a_successful_http_response(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
