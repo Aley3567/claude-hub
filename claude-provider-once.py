@@ -50,6 +50,12 @@ from claude1_account_pool import (
     credential_fingerprint,
     normalize_account_endpoint,
 )
+from claude1_transport import (
+    TransportConfigError,
+    diagnose_transport_policy,
+    normalize_transport_config,
+    resolve_transport_policy,
+)
 
 
 VERSION = "0.1.0"
@@ -559,6 +565,45 @@ def selected_provider_api_format(provider: dict) -> str:
         settings=settings,
         provider_type=provider.get("provider_type"),
     )
+
+
+def provider_transport_config(provider: dict, settings: dict | None = None) -> dict:
+    """Return normalized transport intent for one CC Switch provider."""
+    if settings is None:
+        try:
+            settings = json.loads(provider.get("settings_config") or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"provider {provider.get('name', '<unknown>')} 的 settings_config 无效"
+            ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 settings_config 必须是 JSON 对象"
+        )
+    env = settings.get("env") or {}
+    if not isinstance(env, dict):
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 env 必须是 JSON 对象"
+        )
+    raw = settings.get("transport")
+    if raw is None:
+        folded = {str(key).upper(): value for key, value in env.items()}
+        explicit = (
+            folded.get("HTTPS_PROXY")
+            or folded.get("HTTP_PROXY")
+            or folded.get("ALL_PROXY")
+        )
+        raw = (
+            {"mode": "proxy", "proxies": [explicit]}
+            if isinstance(explicit, str) and explicit.strip()
+            else {"mode": "auto", "proxies": ["system"]}
+        )
+    try:
+        return normalize_transport_config(raw)
+    except TransportConfigError as exc:
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 transport 无效: {exc}"
+        ) from exc
 
 
 def list_providers() -> list[dict]:
@@ -5222,8 +5267,9 @@ def launch_with_protocol_bridge(
     claude_args: list[str],
     *,
     backend_kind: str = "provider",
+    transport: dict | None = None,
 ) -> int:
-    """Run one isolated Hub for a non-Anthropic provider, then remove it.
+    """Run one isolated Hub for protocol or transport routing, then remove it.
 
     This preserves claude1's session-isolation contract: the CC Switch current
     provider and its shared proxy are never changed, so concurrent sessions can
@@ -5252,11 +5298,14 @@ def launch_with_protocol_bridge(
         listener = _reserve_loopback_port()
         port = int(listener.getsockname()[1])
         local_token = secrets.token_urlsafe(32)
+        if transport is None:
+            transport = provider_transport_config(provider, settings)
         config = {
             "version": 1,
             "port": port,
             "local_token_env": "CLAUDE_HUB_LOCAL_TOKEN",
             "default_channel": "direct",
+            "transport": transport,
             "channels": {
                 "direct": {
                     "provider": f"id:{provider['id']}",
@@ -5313,6 +5362,12 @@ def launch_with_protocol_bridge(
                 env.pop("ANTHROPIC_API_KEY", None)
                 env["NO_PROXY"] = "127.0.0.1,localhost"
                 env["no_proxy"] = "127.0.0.1,localhost"
+                reason = (
+                    f"协议适配: Anthropic Messages ↔ {api_format}"
+                    if api_format != "anthropic"
+                    else f"传输路由: {transport['mode']}"
+                )
+                print(f"[claude1] {reason} (隔离端口 {port})")
                 print(
                     f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
                     f"(隔离端口 {port})"
@@ -6294,7 +6349,7 @@ def cli_doctor(*, fix: bool = False) -> int:
             report("FAIL", f"{name}: settings_config 无效，已跳过")
         print()
     else:
-        print("claude1 doctor（本机只读，不连接上游）\n")
+        print("claude1 doctor（只读配置与传输检查）\n")
     if sys.version_info >= (3, 11):
         report("OK", f"Python {sys.version_info.major}.{sys.version_info.minor}")
     else:
@@ -6338,6 +6393,43 @@ def cli_doctor(*, fix: bool = False) -> int:
                 "请安装它或设置 CLAUDE1_GATEWAY_BIN",
             )
 
+    if not fix:
+        current_row = next(
+            (
+                row
+                for row in rows
+                if "is_current" in row.keys() and bool(row["is_current"])
+            ),
+            None,
+        )
+        if current_row is not None:
+            current = _provider_from_row(current_row)
+            try:
+                settings = _provider_settings(current)
+                env = _provider_environment(current, settings)
+                endpoint = normalize_account_endpoint(
+                    env.get("ANTHROPIC_BASE_URL")
+                )
+                if endpoint:
+                    transport = provider_transport_config(current, settings)
+                    policy = resolve_transport_policy(endpoint, transport)
+                    probes = diagnose_transport_policy(
+                        endpoint,
+                        policy,
+                        timeout=4.0,
+                    )
+                    any_ok = any(probe.ok for probe in probes)
+                    for probe in probes:
+                        level = "OK" if probe.ok else ("INFO" if any_ok else "FAIL")
+                        report(level, f"{probe.identity}: {probe.detail}")
+                    if any_ok:
+                        report("OK", f"当前 provider {current['name']} 至少一条传输可用")
+            except (RuntimeError, TransportConfigError, OSError, ValueError) as exc:
+                report(
+                    "FAIL",
+                    f"当前 provider 传输诊断失败: {type(exc).__name__}: {exc}",
+                )
+
     if CONFIG_PATH.exists():
         try:
             raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -6375,8 +6467,9 @@ def launch_provider(
 ) -> int:
     settings = build_settings(selected)
     api_format = selected_provider_api_format(selected)
+    transport = provider_transport_config(selected, settings)
     account_label = None
-    if api_format == "anthropic":
+    if api_format == "anthropic" and transport["mode"] == "direct":
         settings, account_label = apply_native_account_pool(selected, settings)
     add_anyrouter_observer(settings, selected["name"])
     if backend_kind == "current":
@@ -6385,12 +6478,13 @@ def launch_provider(
         print(f"[claude1] 本次使用 provider: {selected['name']}")
     if account_label is not None:
         print(f"[claude1] 账号池本次选择: {account_label}")
-    if api_format != "anthropic":
+    if api_format != "anthropic" or transport["mode"] != "direct":
         return launch_with_protocol_bridge(
             selected,
             settings,
             api_format,
             claude_args,
+            transport=transport,
             backend_kind=backend_kind,
         )
     ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
