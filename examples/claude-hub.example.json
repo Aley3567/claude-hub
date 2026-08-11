@@ -32,5 +32,17 @@
       ],
       "proxy": "http://127.0.0.1:7890"
     }
+  },
+  "routes": {
+    "coding-sonnet": [
+      {
+        "channel": "primary",
+        "model": "claude-sonnet-4-20250514"
+      },
+      {
+        "channel": "proxy-channel",
+        "model": "claude-sonnet-4-20250514"
+      }
+    ]
   }
 }

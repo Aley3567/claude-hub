@@ -1,6 +1,6 @@
 # claude1 传输路由与故障转移设计
 
-> 状态：阶段 A–C 已于 2026-08-11 实施并部署；阶段 D 尚未实施。
+> 状态：阶段 A–D 已于 2026-08-11 实施并部署。
 > 本文定义通用行为，不假设任何用户的 provider 名称、本地代理软件、
 > 端口、DNS 或 CC Switch 队列。
 
@@ -160,12 +160,18 @@ HTTP / HTTPS CONNECT；SOCKS 在有真实的第二个 adapter 之前不伪装支
 | `429` | 否 | 是 | 只限显式 route group | 遵守 `Retry-After` |
 | `5xx` | 否 | 否 | 默认否 | 上游可能已执行请求 |
 | 已开始向 Claude 响应 | 否 | 否 | 否 | downstream 已 commit |
+| 本地账号池 pre-commit 拒绝 | 不适用 | 不适用 | 只限显式 route group | 未发任何 upstream 字节；cooldown 映射 `429` 并透传剩余冷却为 `Retry-After`，全员 disabled 映射 `503` |
 
 实现不能只根据异常类名猜测提交状态。生产 adapter 必须把请求阶段
 显式报告为 `not_connected` / `connected_not_sent` / `sent_uncommitted` /
 `response_started`。只有前两个阶段允许无条件切换 transport。
 `403` 是单独的显式拒绝例外：同一 provider / account 可在其他 transport
 上各尝试一次，但不对同一 transport 循环重试。
+
+route group 内全部 target 都以上述安全错误耗尽时，最终响应取最后一个
+target 的错误（last-error-wins）：若最后一个 target 是 `401`，即使之前
+的 target 返回过 `429` + `Retry-After`，最终也是 `401` 且不携带
+`Retry-After`。
 
 ## 5. provider 故障转移与模型兼容
 
@@ -179,6 +185,22 @@ provider failover 不从 CC Switch 排序、最近使用或 provider 名称自�
       {"channel": "primary", "model": "provider-a-model"},
       {"channel": "fallback", "model": "provider-b-model"}
     ]
+  }
+}
+```
+
+route 也可以写成对象形式，用 `requires` 声明最低协议能力：
+
+```json
+{
+  "routes": {
+    "coding-sonnet": {
+      "targets": [
+        {"channel": "primary", "model": "provider-a-model"},
+        {"channel": "fallback", "model": "provider-b-model"}
+      ],
+      "requires": ["image", "client_tool"]
+    }
   }
 }
 ```
@@ -303,7 +325,7 @@ Hub 私有日志。
 
 ### 阶段 D：provider route group
 
-状态：待实施。
+状态：已实现。
 
 - 加入显式 route group 和模型/能力校验。
 - 仅对安全错误启用跨 provider 转移。
@@ -311,3 +333,14 @@ Hub 私有日志。
 
 验收：在 provider 名称、数量和模型 ID 完全由 fixture 生成的测试中通过，
 不含任何本机特例。
+
+实现要点：顶层 `routes` 配置在 `validate_config()` 完成启动校验（channel
+存在、model 已声明、目标协议适配器不拒绝 `requires` 声明的能力）；能力
+校验的目标 API 格式按运行时相同的路径解析（channel override 优先，否则
+取 provider 数据库 meta 经 `provider_api_format()` 的结果）。模型名
+`route:<name>` 命中 route group，按 target 顺序尝试，每个 target 内部沿用
+账号池与 `UpstreamExecutor`；只有同一 target 的账号/transport 组合以
+401/403 耗尽、收到 429，或账号池在发送请求前拒绝分配凭证，才进入下一
+target。未配置 `routes` 时 `route:` 前缀没有特殊含义，走旧的模型路由路径。
+全部 target 耗尽时返回最后一个 target 的错误（last-error-wins），并携带
+`x-hub-route` 响应头。测试见 `tests/test_routes.py`。

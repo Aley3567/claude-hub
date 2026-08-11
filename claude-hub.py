@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import copy
 import hmac
 import ipaddress
 import json
@@ -46,6 +47,7 @@ from claude1_protocol import (
     SSEParser,
     prepare_request,
     prepare_response,
+    protocol_capability_matrix,
     provider_api_format,
     sse_event,
     transform_error,
@@ -123,6 +125,12 @@ SSE_DECODE_TOTAL_LIMIT = 256 * 1024 * 1024
 SSE_GZIP_MEMBER_LIMIT = 16
 SSE_NEWLINE_RE = re.compile(br"\r\n|[\r\n]")
 REPRESENTATION_HEADERS = {"content-type", "content-encoding"}
+
+# Model selectors naming an explicit route group use the ``route:<name>``
+# prefix. Only these pre-commit rejections may cross a provider boundary
+# inside a route group (design doc section 4); every other failure is final.
+ROUTE_GROUP_PREFIX = "route:"
+ROUTE_FAILOVER_STATUSES = (401, 403, 429)
 
 HOP_BY_HOP = {
     "host",
@@ -521,7 +529,98 @@ def _normalize_base_url(value: object) -> str:
     return normalize_account_endpoint(value)
 
 
-def validate_config(raw: object) -> dict:
+def _validate_routes(
+    raw: object,
+    channels: dict[str, dict],
+    providers: dict | None = None,
+) -> dict[str, dict]:
+    """Validate explicit provider route groups against declared channels.
+
+    Each route group is an ordered list of ``{"channel", "model"}`` targets;
+    every target must reference an existing channel and a model that channel
+    declares, so model IDs are never guessed across providers. An optional
+    ``requires`` list names protocol capabilities that must not be rejected
+    by the target's effective API format. ``providers`` supplies the CC
+    Switch snapshot used to resolve that format exactly the way runtime
+    dispatch does; without it only channel-declared overrides are checked.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("routes must be an object")
+    matrix = protocol_capability_matrix()
+    routes: dict[str, dict] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError("route names must be non-empty strings")
+        if name != name.strip().lower():
+            raise ConfigError(
+                f"route name '{name}' must be lowercase without outer spaces"
+            )
+        requires_raw: object = []
+        targets_raw: object = entry
+        if isinstance(entry, dict):
+            targets_raw = entry.get("targets")
+            requires_raw = entry.get("requires", [])
+        if not isinstance(targets_raw, list) or not targets_raw:
+            raise ConfigError(f"routes.{name} must be a non-empty list of targets")
+        if not isinstance(requires_raw, list) or any(
+            not isinstance(capability, str) for capability in requires_raw
+        ):
+            raise ConfigError(f"routes.{name}.requires must be a list of strings")
+        requires = []
+        for capability in requires_raw:
+            if capability not in matrix:
+                raise ConfigError(
+                    f"routes.{name}.requires names unknown capability "
+                    f"'{capability}'"
+                )
+            requires.append(capability)
+        targets: list[dict] = []
+        for index, target_raw in enumerate(targets_raw):
+            where = f"routes.{name}[{index}]"
+            if not isinstance(target_raw, dict):
+                raise ConfigError(f"{where} must be an object")
+            alias = target_raw.get("channel")
+            if not isinstance(alias, str) or not alias.strip():
+                raise ConfigError(f"{where}.channel must be a non-empty string")
+            alias = alias.strip().lower()
+            channel = channels.get(alias)
+            if channel is None:
+                raise ConfigError(
+                    f"{where}.channel references unknown channel '{alias}'"
+                )
+            model = target_raw.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise ConfigError(f"{where}.model must be a non-empty string")
+            model = model.strip()
+            if model not in channel["models"]:
+                raise ConfigError(
+                    f"{where}.model '{model}' is not declared in "
+                    f"channels.{alias}.models"
+                )
+            # Resolve the target's effective API format the same way runtime
+            # dispatch does: an explicit channel override wins, otherwise the
+            # provider record carries the format that provider_api_format()
+            # derived from the database meta when the snapshot was read.
+            api_format = channel.get("api_format")
+            if not api_format and providers:
+                provider = _match_channel_provider(channel, providers)
+                if provider is not None:
+                    api_format = provider.get("api_format")
+            api_format = api_format or "anthropic"
+            for capability in requires:
+                if matrix[capability].get(api_format) == "reject":
+                    raise ConfigError(
+                        f"{where} cannot satisfy required capability "
+                        f"'{capability}': the {api_format} adapter rejects it"
+                    )
+            targets.append({"channel": alias, "model": model})
+        routes[name] = {"targets": targets, "requires": requires}
+    return routes
+
+
+def validate_config(raw: object, providers: dict | None = None) -> dict:
     """Validate and return a normalized, detached configuration dictionary."""
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a JSON object")
@@ -621,6 +720,8 @@ def validate_config(raw: object) -> dict:
     if default_channel not in channels:
         raise ConfigError(f"default_channel '{default_channel}' is not present in channels")
 
+    routes = _validate_routes(raw.get("routes"), channels, providers)
+
     launch_slot = None
     model_slots = None
     effort_by_slot = None
@@ -685,6 +786,7 @@ def validate_config(raw: object) -> dict:
         "local_token": local_token,
         "default_channel": default_channel,
         "channels": channels,
+        "routes": routes,
         "proxy": proxy.strip() if isinstance(proxy, str) else None,
         "transport": transport,
         "launch_slot": launch_slot,
@@ -715,7 +817,17 @@ def get_config() -> dict:
         _cfg_cache.update(
             {"path": path, "mtime_ns": st.st_mtime_ns, "size": st.st_size, "raw": raw}
         )
-    return validate_config(_cfg_cache["raw"])
+    raw = _cfg_cache["raw"]
+    providers = None
+    routes_raw = raw.get("routes") if isinstance(raw, dict) else None
+    if isinstance(routes_raw, dict) and any(
+        isinstance(entry, dict) and entry.get("requires")
+        for entry in routes_raw.values()
+    ):
+        # ``requires`` capability checks must resolve each target's effective
+        # API format from the provider database, not just channel overrides.
+        providers = get_providers()
+    return validate_config(raw, providers)
 
 
 def _read_provider_rows(path: Path) -> dict:
@@ -945,6 +1057,38 @@ class RouteError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class RouteTargetExhausted(Exception):
+    """One route target ended with a safe pre-commit rejection.
+
+    Raised only before any downstream byte was prepared, so the request may
+    still be replayed against the next route target (design doc section 4).
+    """
+
+    def __init__(self, status: int, retry_after: str | None = None):
+        super().__init__(f"route target exhausted after upstream {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def route_group_name(model_in: str, cfg: dict) -> str | None:
+    """Return the route group named by a ``route:<name>`` model selector."""
+    model = (model_in or "").strip()
+    if model.startswith("anthropic/"):
+        model = model[len("anthropic/") :]
+    if not model.startswith(ROUTE_GROUP_PREFIX):
+        return None
+    if not cfg.get("routes"):
+        # Without route groups the prefix carries no routing meaning; leave
+        # the model name to the legacy routing path, which may still forward
+        # it unchanged (e.g. route_unknown_to_default channels).
+        return None
+    name = model[len(ROUTE_GROUP_PREFIX) :].strip().lower()
+    known = sorted(cfg.get("routes", {}))
+    if not name or name not in cfg.get("routes", {}):
+        raise RouteError(400, f"unknown route '{name}'; known: {known}")
+    return name
 
 
 def anthropic_error(
@@ -2189,9 +2333,12 @@ async def _handle_transformed_messages(
     model_out: str,
     started: float,
     account_pool: _RequestAccountPool | None = None,
+    route_failover: bool = False,
+    route_name: str | None = None,
 ) -> web.StreamResponse:
     if account_pool is None:
         account_pool = _RequestAccountPool(provider, {})
+    route_headers = {"x-hub-route": route_name} if route_name else {}
     api_format = provider["api_format"]
     try:
         prepared_request = prepare_request(
@@ -2235,6 +2382,14 @@ async def _handle_transformed_messages(
             transport_policy=channel_transport_policy(alias, cfg, provider, url),
             log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
         ) as (upstream, account_attempt):
+            if route_failover and upstream.status in ROUTE_FAILOVER_STATUSES:
+                # Every account and transport of this target rejected the
+                # request before any content was generated; the body is still
+                # safely replayable against the next route target.
+                raise RouteTargetExhausted(
+                    upstream.status,
+                    upstream.headers.get("retry-after"),
+                )
             content_type = (
                 upstream.headers.get("content-type", "")
                 .split(";", 1)[0]
@@ -2263,6 +2418,7 @@ async def _handle_transformed_messages(
                         "x-hub-model": model_out,
                         "x-hub-upstream-format": api_format,
                         "x-hub-account": account_attempt.lease.member,
+                        **route_headers,
                     }
                     if request_warning_codes:
                         error_headers["x-hub-protocol-warnings"] = ",".join(
@@ -2310,6 +2466,7 @@ async def _handle_transformed_messages(
                     "x-hub-model": model_out,
                     "x-hub-upstream-format": api_format,
                     "x-hub-account": account_attempt.lease.member,
+                    **route_headers,
                 }
                 if warning_codes:
                     response_headers["x-hub-protocol-warnings"] = ",".join(
@@ -2351,6 +2508,7 @@ async def _handle_transformed_messages(
                     "x-hub-model": model_out,
                     "x-hub-upstream-format": api_format,
                     "x-hub-account": account_attempt.lease.member,
+                    **route_headers,
                 },
             )
             if request_warning_codes:
@@ -2453,6 +2611,16 @@ async def _handle_transformed_messages(
     except UpstreamStreamAborted:
         raise
     except AccountPoolError as exc:
+        if route_failover and isinstance(exc, PoolExhausted):
+            # The pool denied a credential before anything was sent upstream,
+            # so replaying the body against the next route target is safe.
+            # Local mapping beyond design doc section 4: a pool-wide cooldown
+            # surfaces as 429 with the remaining cooldown as retry-after,
+            # while disabled pools surface as 503 without one.
+            raise RouteTargetExhausted(
+                429 if exc.reason == "cooldown" else 503,
+                str(exc.retry_after) if exc.retry_after is not None else None,
+            ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
             f"ACCOUNT POOL FAIL: {type(exc).__name__}: {exc}"
@@ -2528,9 +2696,60 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     started = time.monotonic()
     try:
         providers = await asyncio.to_thread(get_providers)
-        alias, model_out = route(model_in, cfg, providers)
-        provider = resolve_provider(alias, cfg, providers)
-        account_pool = _RequestAccountPool(provider, providers)
+        route_name = route_group_name(model_in, cfg)
+        if route_name is None:
+            targets = [route(model_in, cfg, providers)]
+        else:
+            targets = [
+                (target["channel"], target["model"])
+                for target in cfg["routes"][route_name]["targets"]
+            ]
+        last_exhausted: RouteTargetExhausted | None = None
+        for index, (alias, model_out) in enumerate(targets):
+            try:
+                return await _forward_to_channel(
+                    request,
+                    cfg=cfg,
+                    providers=providers,
+                    alias=alias,
+                    model_in=model_in,
+                    model_out=model_out,
+                    payload=copy.deepcopy(payload),
+                    started=started,
+                    is_count=is_count,
+                    route_failover=route_name is not None,
+                    route_name=route_name,
+                )
+            except RouteTargetExhausted as exc:
+                last_exhausted = exc
+                remaining = len(targets) - index - 1
+                log(
+                    f"{request.path} '{model_in}' route '{route_name}' target "
+                    f"{alias}/{model_out} exhausted after upstream {exc.status}"
+                    + ("; trying next target" if remaining else "; no targets remain")
+                )
+        # Every route target ended in a safe pre-commit rejection; surface
+        # the last one instead of manufacturing a success. Last error wins:
+        # an earlier target's Retry-After is intentionally dropped when a
+        # later target rejects differently (design doc section 4).
+        if last_exhausted is None:
+            raise RouteError(500, f"route '{route_name}' produced no outcome")
+        status = last_exhausted.status
+        error_type = {
+            401: "authentication_error",
+            403: "permission_error",
+            429: "rate_limit_error",
+        }.get(status, "api_error")
+        response = anthropic_error(
+            status,
+            f"hub: route '{route_name}' exhausted all {len(targets)} targets",
+            error_type,
+        )
+        if route_name is not None:
+            response.headers["x-hub-route"] = route_name
+        if last_exhausted.retry_after:
+            response.headers["retry-after"] = last_exhausted.retry_after
+        return response
     except RouteError as exc:
         log(f"{request.path} '{model_in}' -> ROUTE ERROR {exc.status}: {exc.message}")
         return anthropic_error(
@@ -2538,6 +2757,32 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             exc.message,
             "api_error" if exc.status >= 500 else "invalid_request_error",
         )
+
+
+async def _forward_to_channel(
+    request: web.Request,
+    *,
+    cfg: dict,
+    providers: dict,
+    alias: str,
+    model_in: str,
+    model_out: str,
+    payload: dict,
+    started: float,
+    is_count: bool,
+    route_failover: bool = False,
+    route_name: str | None = None,
+) -> web.StreamResponse:
+    """Forward one validated request to a single channel target.
+
+    With ``route_failover`` armed, safe pre-commit rejections raise
+    ``RouteTargetExhausted`` instead of returning an error response, so the
+    route dispatcher can replay the still-buffered body against the next
+    target. Once any downstream byte is prepared the outcome is final.
+    """
+    provider = resolve_provider(alias, cfg, providers)
+    account_pool = _RequestAccountPool(provider, providers)
+    route_headers = {"x-hub-route": route_name} if route_name else {}
 
     payload["model"] = model_out
     api_format = provider.get("api_format", "anthropic")
@@ -2591,6 +2836,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             headers={
                 "x-hub-channel": alias,
                 "x-hub-model": model_out,
+                **route_headers,
                 **_token_count_estimate_headers(),
             },
         )
@@ -2605,6 +2851,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             model_in=model_in,
             model_out=model_out,
             started=started,
+            route_failover=route_failover,
+            route_name=route_name,
         )
     try:
         data = json.dumps(
@@ -2636,6 +2884,14 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             transport_policy=channel_transport_policy(alias, cfg, provider, url),
             log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
         ) as (upstream, account_attempt):
+            if route_failover and upstream.status in ROUTE_FAILOVER_STATUSES:
+                # Every account and transport of this target rejected the
+                # request before any content was generated; the buffered body
+                # is still safely replayable against the next route target.
+                raise RouteTargetExhausted(
+                    upstream.status,
+                    upstream.headers.get("retry-after"),
+                )
             if is_count and upstream.status in (404, 405, 501):
                 estimate = _estimated_input_tokens(payload)
                 log(
@@ -2647,6 +2903,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     headers={
                         "x-hub-channel": alias,
                         "x-hub-model": model_out,
+                        **route_headers,
                         **_token_count_estimate_headers(),
                     },
                 )
@@ -2700,6 +2957,8 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             response.headers["x-hub-channel"] = alias
             response.headers["x-hub-model"] = model_out
             response.headers["x-hub-account"] = account_attempt.lease.member
+            if route_name is not None:
+                response.headers["x-hub-route"] = route_name
             if is_count and upstream.status == 200:
                 response.headers["x-hub-token-count-source"] = "upstream"
                 response.headers[
@@ -2834,6 +3093,16 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             )
             return response
     except AccountPoolError as exc:
+        if route_failover and isinstance(exc, PoolExhausted):
+            # The pool denied a credential before anything was sent upstream,
+            # so replaying the body against the next route target is safe.
+            # Local mapping beyond design doc section 4: a pool-wide cooldown
+            # surfaces as 429 with the remaining cooldown as retry-after,
+            # while disabled pools surface as 503 without one.
+            raise RouteTargetExhausted(
+                429 if exc.reason == "cooldown" else 503,
+                str(exc.retry_after) if exc.retry_after is not None else None,
+            ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
             f"ACCOUNT POOL FAIL: {type(exc).__name__}: {exc}"
