@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "providers": {
+    "id:primary-provider-id": {
+      "strategy": "weighted",
+      "cooldown_seconds": 60,
+      "max_cooldown_seconds": 3600,
+      "members": [
+        {
+          "provider": "id:primary-provider-id",
+          "weight": 2,
+          "priority": 0,
+          "enabled": true
+        },
+        {
+          "provider": "id:second-account-provider-id",
+          "weight": 3,
+          "priority": 0,
+          "enabled": true
+        },
+        {
+          "provider": "id:standby-account-provider-id",
+          "weight": 1,
+          "priority": 10,
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

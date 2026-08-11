@@ -1,0 +1,6 @@
+data:{"id":"chat_fixture","model":"chat-model","choices":[{"delta":{"reasoning_content":"思考","reasoning_signature":"sig-real"},"finish_reason":null}]}
+
+data:{"choices":[{"delta":{"content":"你好🙂"},"finish_reason":"stop"}]}
+
+data:{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3}}
+

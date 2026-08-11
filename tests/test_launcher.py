@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import hmac
 import io
 import json
@@ -58,6 +59,8 @@ def isolated_env(home: Path, **overrides: str) -> dict[str, str]:
         "CLAUDE1_DB_PATH": str(state / "cc-switch.db"),
         "CLAUDE1_MRU_PATH": str(state / "mru.json"),
         "CLAUDE1_CONFIG_PATH": str(state / "config.json"),
+        "CLAUDE1_ACCOUNT_POOL_CONFIG": str(state / "account-pools.json"),
+        "CLAUDE1_ACCOUNT_POOL_STATE": str(state / "account-state.sqlite3"),
         "CLAUDE1_BACKEND_STATE": str(state / "last-session.json"),
         "CLAUDE1_BACKEND_STICKY": str(state / "sticky"),
         "CLAUDE1_ANYROUTER_OBSERVER": str(home / "bin" / "observer"),
@@ -647,6 +650,14 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     launcher._extract_hub_model(
                         ["--model=a,one", "--model", "b,two"]
                     )
+                with self.assertRaisesRegex(RuntimeError, "--model 后需要"):
+                    launcher._extract_hub_model(
+                        ["--model", "--slot", "haiku"]
+                    )
+                with self.assertRaisesRegex(RuntimeError, "--slot 后需要"):
+                    launcher._extract_hub_slot(
+                        ["--slot", "--model", "fast,sonnet-next"]
+                    )
                 backend, hint, parsed_args = launcher.parse_args(
                     ["--hub", "--model", "Fast,sonnet-next", "-p", "hello"]
                 )
@@ -747,6 +758,51 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", raw)
 
+    def test_doctor_reports_bad_provider_settings_and_continues_scanning(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            pinned = json.dumps(
+                {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "pinned-model"}}
+            )
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    [
+                        ("broken", "Broken Provider", "{", 1),
+                        (
+                            "deep",
+                            "Deep Provider",
+                            "[" * 10_000 + "0" + "]" * 10_000,
+                            2,
+                        ),
+                        ("valid", "Valid Provider", pinned, 3),
+                    ],
+                )
+            db_path.chmod(0o600)
+            fake_claude = home / "bin" / "claude"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(fake_claude, "#!/bin/sh\nexit 0\n")
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+            output = io.StringIO()
+
+            with loaded_launcher(env) as launcher, redirect_stdout(output):
+                status = launcher.main(["doctor"])
+
+            rendered = output.getvalue()
+            self.assertEqual(status, 1)
+            self.assertIn("Broken Provider", rendered)
+            self.assertIn("Deep Provider", rendered)
+            self.assertIn("settings_config 无效", rendered)
+            self.assertIn("1 个 provider 固定了子代理模型", rendered)
+
     def test_doctor_fix_backs_up_and_cleans_every_provider_type(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             home = Path(raw_home)
@@ -810,6 +866,55 @@ class LauncherTuiLogicTests(unittest.TestCase):
             self.assertIn("Claude Fixture", rendered)
             self.assertIn("Desktop Fixture", rendered)
             self.assertIn(str(backups[0]), rendered)
+
+    def test_doctor_fix_skips_bad_settings_and_repairs_later_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True)
+            dirty = json.dumps(
+                {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "pinned-model"}}
+            )
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    [
+                        ("first", "First Valid", dirty, 1),
+                        ("broken", "Broken Provider", "{", 2),
+                        ("last", "Last Valid", dirty, 3),
+                    ],
+                )
+            db_path.chmod(0o600)
+            fake_claude = home / "bin" / "claude"
+            fake_claude.parent.mkdir(parents=True)
+            write_executable(fake_claude, "#!/bin/sh\nexit 0\n")
+            env["CLAUDE1_CLAUDE_BIN"] = str(fake_claude)
+            output = io.StringIO()
+
+            with loaded_launcher(env) as launcher, redirect_stdout(output):
+                status = launcher.main(["doctor", "--fix"])
+
+            with sqlite3.connect(db_path) as connection:
+                rows = dict(
+                    connection.execute(
+                        "SELECT id, settings_config FROM providers ORDER BY sort_index"
+                    )
+                )
+            self.assertEqual(status, 1)
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", rows["first"])
+            self.assertEqual(rows["broken"], "{")
+            self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", rows["last"])
+            self.assertIn("Broken Provider", output.getvalue())
+            self.assertEqual(
+                len(list(db_path.parent.glob("cc-switch.db.bak-doctor-fix-*"))),
+                1,
+            )
 
     def test_current_provider_uses_unique_db_marker_and_main_launches_that_row(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -962,6 +1067,25 @@ class LauncherSafetyTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(RuntimeError, "provider 与 --hub"):
                     launcher.parse_args(["DeepSeek", "--hub"])
+                with self.assertRaisesRegex(
+                    RuntimeError, "--hub 后的位置参数"
+                ):
+                    launcher.parse_args(["--hub", "DeepSeek"])
+                self.assertEqual(
+                    launcher.parse_args(["--hub", "--", "hello"]),
+                    ("hub", None, ["--", "hello"]),
+                )
+
+    def test_hub_identity_colors_and_chart_coordinates_wrap_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                colors = launcher._HUB_IDENTITY_COLORS
+                self.assertEqual(
+                    launcher._hub_identity_color(len(colors)), colors[0]
+                )
+                self.assertEqual(launcher._hub_identity_color(-1), colors[-1])
+                self.assertEqual(launcher._scale_chart_index(0, 7, 28), 0)
+                self.assertEqual(launcher._scale_chart_index(6, 7, 28), 27)
 
     def test_missing_notion_config_is_not_forwarded_to_claude(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1066,6 +1190,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 import hmac
                 import json
                 import os
+                import socket
                 from http.server import BaseHTTPRequestHandler
                 from socketserver import TCPServer
 
@@ -1078,7 +1203,17 @@ class LauncherSafetyTests(unittest.TestCase):
                         self.wfile.write(body)
                     def log_message(self, *_args):
                         return
-                TCPServer(("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler).serve_forever()
+                server = TCPServer(
+                    ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])),
+                    Handler,
+                    bind_and_activate=False,
+                )
+                server.socket.close()
+                server.socket = socket.socket(
+                    fileno=int(os.environ["CLAUDE_HUB_LISTEN_FD"])
+                )
+                server.server_address = server.socket.getsockname()
+                server.serve_forever()
                 """,
             )
             with loaded_launcher(env) as launcher:
@@ -1109,6 +1244,45 @@ class LauncherSafetyTests(unittest.TestCase):
                         if process.poll() is None:
                             process.terminate()
                             process.wait(timeout=5)
+
+    def test_hub_start_reports_an_occupied_port_before_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            script = Path(env["CLAUDE1_HUB_SCRIPT"])
+            script.parent.mkdir(parents=True)
+            write_executable(script, "#!/bin/sh\nexit 0\n")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                port = int(listener.getsockname()[1])
+                with loaded_launcher(env) as launcher, mock.patch.object(
+                    launcher, "hub_healthy", return_value=False
+                ), mock.patch.object(launcher.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(
+                        RuntimeError, rf"端口 {port}.*占用"
+                    ):
+                        launcher.ensure_hub(port)
+
+            popen.assert_not_called()
+
+    def test_hub_start_preserves_non_address_socket_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            script = Path(env["CLAUDE1_HUB_SCRIPT"])
+            script.parent.mkdir(parents=True)
+            write_executable(script, "#!/bin/sh\nexit 0\n")
+            failure = OSError(errno.ENFILE, "fixture file table full")
+            with loaded_launcher(env) as launcher, mock.patch.object(
+                launcher, "hub_healthy", return_value=False
+            ), mock.patch.object(
+                launcher, "_reserve_loopback_port", side_effect=failure
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "fixture file table full"
+                ) as raised:
+                    launcher.ensure_hub(18787)
+
+            self.assertNotIn("已被占用", str(raised.exception))
 
     def test_noninteractive_provider_selection_has_a_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1231,6 +1405,8 @@ class LauncherSafetyTests(unittest.TestCase):
                 "DEFAULT_CLAUDE_BIN": "CLAUDE1_DEFAULT_CLAUDE_BIN",
                 "MRU_PATH": "CLAUDE1_MRU_PATH",
                 "CONFIG_PATH": "CLAUDE1_CONFIG_PATH",
+                "ACCOUNT_POOL_CONFIG": "CLAUDE1_ACCOUNT_POOL_CONFIG",
+                "ACCOUNT_POOL_STATE": "CLAUDE1_ACCOUNT_POOL_STATE",
                 "BACKEND_STATE": "CLAUDE1_BACKEND_STATE",
                 "BACKEND_STICKY": "CLAUDE1_BACKEND_STICKY",
                 "ANYROUTER_OBSERVER": "CLAUDE1_ANYROUTER_OBSERVER",
@@ -1327,6 +1503,448 @@ class LauncherSafetyTests(unittest.TestCase):
                     self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"], "")
                     self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL_NAME"], "")
                 self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "")
+
+    def test_explicit_proxy_removes_the_api_host_from_no_proxy_case_insensitively(self) -> None:
+        provider = {
+            "id": "proxy",
+            "name": "Proxy Provider",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://API.EXAMPLE.COM/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                        "HTTPS_PROXY": "http://127.0.0.1:7890",
+                        "NO_PROXY": "API.EXAMPLE.COM,localhost",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                settings = launcher.build_settings(provider)
+
+        self.assertEqual(settings["env"]["NO_PROXY"], "localhost")
+
+    def test_anyrouter_observer_leaves_legacy_hook_shapes_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            observer = Path(env["CLAUDE1_ANYROUTER_OBSERVER"])
+            observer.parent.mkdir(parents=True)
+            observer.write_text("fixture", encoding="utf-8")
+            settings = {"hooks": []}
+
+            with loaded_launcher(env) as launcher:
+                launcher.add_anyrouter_observer(settings, "Any router")
+
+        self.assertEqual(settings, {"hooks": []})
+
+    def test_native_provider_pool_rotates_only_the_credential_per_session(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            database = Path(env["CLAUDE1_DB_PATH"])
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, app_type TEXT, sort_index INTEGER, "
+                    "settings_config TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
+                    [
+                        (
+                            "primary",
+                            "Pooled provider",
+                            0,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-primary-token",
+                                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "primary-model",
+                                    }
+                                }
+                            ),
+                        ),
+                        (
+                            "secondary",
+                            "Pooled provider account 2",
+                            1,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-secondary-token",
+                                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "must-not-replace-primary-model",
+                                    }
+                                }
+                            ),
+                        ),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+            pool_config = Path(env["CLAUDE1_ACCOUNT_POOL_CONFIG"])
+            pool_config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "providers": {
+                            "id:primary": {
+                                "strategy": "round_robin",
+                                "cooldown_seconds": 60,
+                                "max_cooldown_seconds": 3600,
+                                "members": [
+                                    {"provider": "id:primary"},
+                                    {"provider": "id:secondary"},
+                                ],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pool_config.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                selected = launcher._provider_from_row(launcher.db_claude_rows()[0])
+                observed = []
+
+                def capture(settings, _args):
+                    observed.append(json.loads(json.dumps(settings)))
+                    return 0
+
+                with mock.patch.object(
+                    launcher, "launch_with_settings", side_effect=capture
+                ):
+                    self.assertEqual(launcher.launch_provider(selected, []), 0)
+                    self.assertEqual(launcher.launch_provider(selected, []), 0)
+
+            self.assertEqual(
+                [item["env"]["ANTHROPIC_AUTH_TOKEN"] for item in observed],
+                ["fixture-primary-token", "fixture-secondary-token"],
+            )
+            self.assertEqual(
+                [item["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] for item in observed],
+                ["primary-model", "primary-model"],
+            )
+
+    def test_accounts_cli_groups_existing_provider_ids_without_copying_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = isolated_env(home)
+            database = Path(env["CLAUDE1_DB_PATH"])
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, app_type TEXT, sort_index INTEGER, "
+                    "settings_config TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
+                    [
+                        (
+                            "primary",
+                            "Main account",
+                            0,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-main-key",
+                                    }
+                                }
+                            ),
+                        ),
+                        (
+                            "secondary",
+                            "Backup account",
+                            1,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-backup-key",
+                                    }
+                                }
+                            ),
+                        ),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(
+                        launcher.cli_accounts(
+                            [
+                                "add",
+                                "id:primary",
+                                "id:secondary",
+                                "--weight",
+                                "3",
+                                "--priority",
+                                "2",
+                            ]
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        launcher.cli_accounts(
+                            ["policy", "id:primary", "weighted"]
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        launcher.cli_accounts(
+                            [
+                                "set",
+                                "id:primary",
+                                "id:primary",
+                                "--weight",
+                                "2",
+                                "--priority",
+                                "1",
+                            ]
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        launcher.cli_accounts(["list", "id:primary"]),
+                        0,
+                    )
+
+            config_path = Path(env["CLAUDE1_ACCOUNT_POOL_CONFIG"])
+            config_text = config_path.read_text(encoding="utf-8")
+            config = json.loads(config_text)
+            pool = config["providers"]["id:primary"]
+            self.assertEqual(pool["strategy"], "weighted")
+            self.assertEqual(pool["members"][0]["weight"], 2)
+            self.assertEqual(pool["members"][0]["priority"], 1)
+            self.assertEqual(pool["members"][1]["weight"], 3)
+            self.assertEqual(pool["members"][1]["priority"], 2)
+            self.assertNotIn("fixture-main-key", config_text)
+            self.assertNotIn("fixture-backup-key", config_text)
+            rendered = output.getvalue()
+            self.assertIn("Main account", rendered)
+            self.assertIn("Backup account", rendered)
+            self.assertNotIn("fixture-main-key", rendered)
+            self.assertNotIn("fixture-backup-key", rendered)
+            if os.name == "posix":
+                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_accounts_cli_normalizes_v1_and_rejects_duplicate_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            database = Path(env["CLAUDE1_DB_PATH"])
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, app_type TEXT, sort_index INTEGER, "
+                    "settings_config TEXT)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
+                    [
+                        (
+                            "primary",
+                            "Main account",
+                            0,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-main-key",
+                                    }
+                                }
+                            ),
+                        ),
+                        (
+                            "secondary",
+                            "Second account",
+                            1,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-second-key",
+                                    }
+                                }
+                            ),
+                        ),
+                        (
+                            "duplicate",
+                            "Duplicate key",
+                            2,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": "fixture-second-key",
+                                    }
+                                }
+                            ),
+                        ),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.cli_accounts(
+                        ["add", "id:primary", "id:secondary"]
+                    ),
+                    0,
+                )
+                with self.assertRaisesRegex(RuntimeError, "同一个凭证"):
+                    launcher.cli_accounts(
+                        ["add", "id:primary", "id:duplicate"]
+                    )
+
+    def test_accounts_cli_removes_orphaned_member_by_stable_id(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            database = Path(env["CLAUDE1_DB_PATH"])
+            database.parent.mkdir(parents=True)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, app_type TEXT, sort_index INTEGER, "
+                    "settings_config TEXT)"
+                )
+                for index, provider_id in enumerate(("primary", "secondary")):
+                    connection.execute(
+                        "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
+                        (
+                            provider_id,
+                            provider_id.title(),
+                            index,
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": "https://pool.invalid/v1",
+                                        "ANTHROPIC_AUTH_TOKEN": f"fixture-{provider_id}-key",
+                                    }
+                                }
+                            ),
+                        ),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            database.chmod(0o600)
+
+            with loaded_launcher(env) as launcher:
+                self.assertEqual(
+                    launcher.cli_accounts(
+                        ["add", "id:primary", "id:secondary"]
+                    ),
+                    0,
+                )
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute(
+                        "DELETE FROM providers WHERE id='secondary'"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.assertEqual(
+                    launcher.cli_accounts(
+                        ["remove", "id:primary", "id:secondary"]
+                    ),
+                    0,
+                )
+
+            config = json.loads(
+                Path(env["CLAUDE1_ACCOUNT_POOL_CONFIG"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                [
+                    item["provider"]
+                    for item in config["providers"]["id:primary"]["members"]
+                ],
+                ["id:primary"],
+            )
+
+    def test_launch_rejects_invalid_provider_settings_with_the_provider_name(self) -> None:
+        provider = {
+            "id": "broken",
+            "name": "Broken JSON",
+            "settings_config": "{",
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                with mock.patch.object(launcher, "launch_with_settings") as launch:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "Broken JSON.*settings_config",
+                    ):
+                        launcher.launch_provider(provider, [])
+
+                launch.assert_not_called()
+
+    def test_launch_rejects_a_malformed_provider_url_with_the_provider_name(self) -> None:
+        provider = {
+            "id": "broken-url",
+            "name": "Broken URL",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "http://[::1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-token",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                with mock.patch.object(launcher, "launch_with_settings") as launch:
+                    with self.assertRaisesRegex(RuntimeError, "Broken URL.*URL 无效"):
+                        launcher.launch_provider(provider, [])
+
+                launch.assert_not_called()
+
+    def test_launch_rejects_a_non_object_provider_environment(self) -> None:
+        provider = {
+            "id": "broken-env",
+            "name": "Broken Env",
+            "settings_config": json.dumps({"env": []}),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Broken Env.*env 必须是 JSON 对象",
+                ):
+                    launcher.build_settings(provider)
 
     def test_regular_launch_records_last_session_without_touching_sticky(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1426,8 +2044,19 @@ class LauncherSafetyTests(unittest.TestCase):
             env = isolated_env(home)
             fake_claude = home / "bin" / "claude"
             capture = home / "capture.json"
+            global_settings = home / "global-settings.json"
             fake_claude.parent.mkdir(parents=True)
             Path(env["CLAUDE1_TMP_DIR"]).mkdir(parents=True)
+            global_settings.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_AUTH_TOKEN": "fixture-current-credential"
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             write_executable(
                 fake_claude,
                 """
@@ -1440,12 +2069,21 @@ class LauncherSafetyTests(unittest.TestCase):
 
                 idx = sys.argv.index("--settings")
                 settings_path = Path(sys.argv[idx + 1])
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                effective = dict(os.environ)
+                effective.update(json.loads(
+                    Path(os.environ["FAKE_GLOBAL_SETTINGS"]).read_text(
+                        encoding="utf-8"
+                    )
+                )["env"])
+                effective.update(settings["env"])
                 Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(json.dumps({
                     "argv": sys.argv[1:],
                     "env": dict(os.environ),
+                    "effective_auth": effective["ANTHROPIC_AUTH_TOKEN"],
                     "mode": stat.S_IMODE(settings_path.stat().st_mode),
                     "settings_path": str(settings_path),
-                    "settings": json.loads(settings_path.read_text(encoding="utf-8")),
+                    "settings": settings,
                 }), encoding="utf-8")
                 raise SystemExit(0)
                 """,
@@ -1453,6 +2091,7 @@ class LauncherSafetyTests(unittest.TestCase):
             env.update(
                 CLAUDE1_CLAUDE_BIN=str(fake_claude),
                 FAKE_CLAUDE_CAPTURE=str(capture),
+                FAKE_GLOBAL_SETTINGS=str(global_settings),
                 ANTHROPIC_BASE_URL="https://untrusted.invalid",
                 ANTHROPIC_AUTH_TOKEN="must-not-leak",
                 HTTP_PROXY="http://must-not-leak.invalid",
@@ -1477,8 +2116,17 @@ class LauncherSafetyTests(unittest.TestCase):
 
             observed = json.loads(capture.read_text(encoding="utf-8"))
             self.assertEqual(observed["mode"], 0o600)
-            self.assertEqual(observed["settings"], settings)
+            self.assertEqual(
+                observed["settings"],
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://fixture.invalid",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-secret",
+                    }
+                },
+            )
             self.assertNotIn("fixture-secret", observed["argv"])
+            self.assertEqual(observed["effective_auth"], "fixture-secret")
             self.assertFalse(Path(observed["settings_path"]).exists())
             child_env = observed["env"]
             self.assertEqual(
@@ -1566,6 +2214,7 @@ class LauncherSafetyTests(unittest.TestCase):
             script = Path(env["CLAUDE1_HUB_SCRIPT"])
             script.parent.mkdir(parents=True)
             write_executable(script, "#!/bin/sh\nexit 0\n")
+            port = free_local_port()
             with loaded_launcher(env) as launcher:
                 process = mock.Mock()
                 process.poll.return_value = None
@@ -1580,7 +2229,7 @@ class LauncherSafetyTests(unittest.TestCase):
                     launcher.time, "monotonic", side_effect=[0, 2]
                 ):
                     with self.assertRaisesRegex(RuntimeError, "启动失败"):
-                        launcher.ensure_hub(18787, token="fixture-local-token")
+                        launcher.ensure_hub(port, token="fixture-local-token")
 
                 process.terminate.assert_called_once_with()
                 process.wait.assert_called_once()
@@ -1608,7 +2257,7 @@ class LauncherSafetyTests(unittest.TestCase):
                     launcher, "_atomic_private_write", side_effect=capture
                 ), mock.patch.object(
                     launcher.subprocess, "Popen", return_value=process
-                ), mock.patch.object(
+                ) as popen, mock.patch.object(
                     launcher, "hub_healthy", return_value=True
                 ), mock.patch.object(
                     launcher, "launch_with_settings", return_value=0
@@ -1624,6 +2273,12 @@ class LauncherSafetyTests(unittest.TestCase):
                 self.assertEqual(
                     written[0]["channels"]["direct"]["provider"],
                     "id:provider-id",
+                )
+                spawn = popen.call_args
+                inherited_fd = spawn.kwargs["pass_fds"][0]
+                self.assertEqual(
+                    spawn.kwargs["env"]["CLAUDE_HUB_LISTEN_FD"],
+                    str(inherited_fd),
                 )
 
     def test_gateway_health_requires_a_successful_http_response(self) -> None:
@@ -1665,6 +2320,7 @@ class LauncherSafetyTests(unittest.TestCase):
                 import hmac
                 import json
                 import os
+                import socket
                 from http.server import BaseHTTPRequestHandler
                 from pathlib import Path
                 from socketserver import TCPServer
@@ -1703,8 +2359,15 @@ class LauncherSafetyTests(unittest.TestCase):
                         return
 
                 server = TCPServer(
-                    ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])), Handler
+                    ("127.0.0.1", int(os.environ["CLAUDE_HUB_PORT"])),
+                    Handler,
+                    bind_and_activate=False,
                 )
+                server.socket.close()
+                server.socket = socket.socket(
+                    fileno=int(os.environ["CLAUDE_HUB_LISTEN_FD"])
+                )
+                server.server_address = server.socket.getsockname()
                 server.serve_forever()
                 """,
             )
@@ -1752,6 +2415,511 @@ class LauncherSafetyTests(unittest.TestCase):
                     stat.S_IMODE(Path(env["CLAUDE1_HUB_LOG"]).stat().st_mode),
                     0o600,
                 )
+
+    def test_isolated_wechat_coding_plan_text_and_tool_smoke(self) -> None:
+        """Run the public launcher -> Hub path without a real Claude credential.
+
+        The fake Claude is deliberately a process rather than an in-process
+        client: it receives the private settings overlay produced by the
+        launcher, sends two Anthropic Messages requests to the real Hub, and
+        performs the normal tool-use / tool-result continuation.  It writes
+        only non-sensitive outcome facts for this test to inspect.
+        """
+
+        received: list[dict] = []
+        received_lock = threading.Lock()
+
+        class LoopbackUpstream(ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _send_json(self, payload: dict, status: int = 200) -> None:
+                body = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+                if self.path != "/v1/chat/completions":
+                    self._send_json({"error": "unexpected fixture path"}, 404)
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", ""))
+                    payload = json.loads(
+                        self.rfile.read(content_length).decode("utf-8")
+                    )
+                except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                    self._send_json({"error": "invalid fixture request"}, 400)
+                    return
+                if not isinstance(payload, dict):
+                    self._send_json({"error": "invalid fixture request"}, 400)
+                    return
+
+                # Do not capture request headers: they can contain the
+                # fixture upstream credential and are irrelevant to the
+                # conversion contract under test.
+                with received_lock:
+                    received.append(payload)
+                    call_number = len(received)
+
+                if call_number == 1:
+                    self._send_json(
+                        {
+                            "id": "chatcmpl_fixture_plan_tool",
+                            "object": "chat.completion",
+                            "model": "fixture-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_fixture_plan",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "write_plan",
+                                                    "arguments": (
+                                                        '{"title":"微信 Coding Plan"}'  # secret-guard: allow private-provider-name 65941246a1
+                                                    ),
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 7,
+                                "completion_tokens": 3,
+                            },
+                        }
+                    )
+                    return
+                if call_number == 2:
+                    self._send_json(
+                        {
+                            "id": "chatcmpl_fixture_plan_final",
+                            "object": "chat.completion",
+                            "model": "fixture-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "plan complete",
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 13,
+                                "completion_tokens": 2,
+                            },
+                        }
+                    )
+                    return
+                self._send_json({"error": "too many fixture requests"}, 409)
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        server = LoopbackUpstream(("127.0.0.1", 0), Handler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            upstream_port = int(server.server_address[1])
+            with tempfile.TemporaryDirectory() as raw_home:
+                home = Path(raw_home)
+                hub_port = free_local_port()
+                env = isolated_env(
+                    home,
+                    CLAUDE1_HUB_PORT=str(hub_port),
+                    CLAUDE1_HUB_START_TIMEOUT="5",
+                    FIXTURE_HUB_TOKEN="fixture-local-token",
+                    # Sentinel routing values prove the launcher/Hub child
+                    # processes do not inherit ambient provider or proxy state.
+                    ANTHROPIC_AUTH_TOKEN="must-not-leak",
+                    ANTHROPIC_API_KEY="must-not-leak",
+                    ANTHROPIC_BASE_URL="http://must-not-leak.invalid",
+                    HTTP_PROXY="http://must-not-leak.invalid",
+                    HTTPS_PROXY="http://must-not-leak.invalid",
+                    ALL_PROXY="socks5://must-not-leak.invalid",
+                    CLAUDE_HUB_LOCAL_TOKEN="must-not-leak",
+                )
+
+                provider_db = Path(env["CLAUDE1_HUB_DB"])
+                provider_db.parent.mkdir(parents=True)
+                with sqlite3.connect(provider_db) as connection:
+                    connection.execute(
+                        "CREATE TABLE providers ("
+                        "id TEXT, name TEXT, app_type TEXT, "
+                        "settings_config TEXT, meta TEXT, sort_index INTEGER)"
+                    )
+                    connection.execute(
+                        "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?, 1)",
+                        (
+                            "fixture-provider",
+                            "Fixture OpenAI Chat",
+                            json.dumps(
+                                {
+                                    "env": {
+                                        "ANTHROPIC_BASE_URL": (
+                                            f"http://127.0.0.1:{upstream_port}/v1"
+                                        ),
+                                        "ANTHROPIC_AUTH_TOKEN": (
+                                            "fixture-upstream-token"
+                                        ),
+                                    }
+                                }
+                            ),
+                            json.dumps({"apiFormat": "openai_chat"}),
+                        ),
+                    )
+                provider_db.chmod(0o600)
+
+                selector = "wechat,fixture-model"
+                hub_config = Path(env["CLAUDE1_HUB_CONFIG"])
+                hub_config.parent.mkdir(parents=True)
+                hub_config.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "port": hub_port,
+                            "local_token_env": "FIXTURE_HUB_TOKEN",
+                            "default_channel": "wechat",
+                            "channels": {
+                                "wechat": {
+                                    "provider": "id:fixture-provider",
+                                    "models": ["fixture-model"],
+                                }
+                            },
+                            "launch_slot": "fable",
+                            "model_slots": {
+                                "fable": selector,
+                                "opus": selector,
+                                "sonnet": selector,
+                                "haiku": selector,
+                            },
+                            "effort_by_slot": {
+                                "fable": "high",
+                                "opus": "high",
+                                "sonnet": "medium",
+                                "haiku": "low",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                hub_config.chmod(0o600)
+
+                # Avoid the production file's ``uv run --script`` shebang in
+                # the test while still executing its real Python entry point.
+                hub_wrapper = Path(env["CLAUDE1_HUB_SCRIPT"])
+                aiohttp_spec = importlib.util.find_spec("aiohttp")
+                self.assertIsNotNone(aiohttp_spec)
+                assert aiohttp_spec is not None
+                package_locations = aiohttp_spec.submodule_search_locations
+                self.assertIsNotNone(package_locations)
+                assert package_locations is not None
+                dependency_root = Path(next(iter(package_locations))).parent
+                runtime_pythonpath = os.pathsep.join(
+                    (str(dependency_root), str(ROOT))
+                )
+                hub_wrapper.parent.mkdir(parents=True)
+                write_executable(
+                    hub_wrapper,
+                    """
+                    #!__PYTHON__
+                    import os
+                    import sys
+
+                    # The temporary HOME deliberately hides Python's user
+                    # site-packages.  This is a dependency-only path found by
+                    # the parent test process, not inherited configuration.
+                    os.environ["PYTHONPATH"] = __PYTHONPATH__
+                    os.execv(
+                        sys.executable,
+                        [sys.executable, __HUB_SCRIPT__, *sys.argv[1:]],
+                    )
+                    """
+                    .replace("__PYTHON__", sys.executable)
+                    .replace("__HUB_SCRIPT__", repr(str(ROOT / "claude-hub.py")))
+                    .replace("__PYTHONPATH__", repr(runtime_pythonpath)),
+                )
+
+                result_path = home / "fake-claude-result.json"
+                fake_claude = home / "bin" / "claude"
+                fake_claude.parent.mkdir(parents=True, exist_ok=True)
+                write_executable(
+                    fake_claude,
+                    """
+                    #!__PYTHON__
+                    import json
+                    import os
+                    import sys
+                    import urllib.request
+                    from pathlib import Path
+
+
+                    def require(value):
+                        if not value:
+                            raise RuntimeError("fixture assertion failed")
+
+
+                    def post(base_url, token, payload):
+                        request = urllib.request.Request(
+                            base_url.rstrip("/") + "/v1/messages",
+                            data=json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "x-api-key": token,
+                                "anthropic-version": "2023-06-01",
+                            },
+                            method="POST",
+                        )
+                        opener = urllib.request.build_opener(
+                            urllib.request.ProxyHandler({})
+                        )
+                        with opener.open(request, timeout=5) as response:
+                            require(response.status == 200)
+                            result = json.loads(response.read().decode("utf-8"))
+                        require(isinstance(result, dict))
+                        return result
+
+
+                    try:
+                        settings_index = sys.argv.index("--settings")
+                        settings = json.loads(
+                            Path(sys.argv[settings_index + 1]).read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        settings_env = settings.get("env")
+                        require(isinstance(settings_env, dict))
+                        base_url = settings_env.get("ANTHROPIC_BASE_URL")
+                        token = settings_env.get("ANTHROPIC_AUTH_TOKEN")
+                        require(isinstance(base_url, str) and base_url)
+                        require(isinstance(token, str) and token)
+
+                        forwarded = sys.argv[settings_index + 2 :]
+                        require("--" in forwarded)
+                        claude_args = forwarded[forwarded.index("--") + 1 :]
+                        prompt_index = claude_args.index("-p")
+                        require(
+                            claude_args[prompt_index + 1]
+                            == "微信 Coding Plan"  # secret-guard: allow private-provider-name 65941246a1
+                        )
+
+                        tool = {
+                            "name": "write_plan",
+                            "description": "Write a Coding Plan",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"}
+                                },
+                                "required": ["title"],
+                            },
+                        }
+                        initial = post(
+                            base_url,
+                            token,
+                            {
+                                "model": settings_env["ANTHROPIC_MODEL"],
+                                "max_tokens": 128,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "微信 Coding Plan",  # secret-guard: allow private-provider-name 65941246a1
+                                    }
+                                ],
+                                "tools": [tool],
+                            },
+                        )
+                        tool_blocks = [
+                            block
+                            for block in initial.get("content", [])
+                            if isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                        ]
+                        require(initial.get("stop_reason") == "tool_use")
+                        require(len(tool_blocks) == 1)
+                        tool_block = tool_blocks[0]
+                        require(tool_block.get("id") == "call_fixture_plan")
+                        require(tool_block.get("name") == "write_plan")
+                        require(
+                            tool_block.get("input")
+                            == {"title": "微信 Coding Plan"}  # secret-guard: allow private-provider-name 65941246a1
+                        )
+
+                        final = post(
+                            base_url,
+                            token,
+                            {
+                                "model": settings_env["ANTHROPIC_MODEL"],
+                                "max_tokens": 128,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "微信 Coding Plan",  # secret-guard: allow private-provider-name 65941246a1
+                                    },
+                                    {
+                                        "role": "assistant",
+                                        "content": [tool_block],
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "tool_result",
+                                                "tool_use_id": tool_block["id"],
+                                                "is_error": True,
+                                                "content": [
+                                                    {
+                                                        "type": "text",
+                                                        "text": (
+                                                            "draft validation failed"
+                                                        ),
+                                                    },
+                                                    {
+                                                        "type": "document",
+                                                        "source": {
+                                                            "type": "text",
+                                                            "media_type": (
+                                                                "text/plain"
+                                                            ),
+                                                            "data": (
+                                                                "missing milestone"
+                                                            ),
+                                                        },
+                                                    },
+                                                ],
+                                            }
+                                        ],
+                                    },
+                                ],
+                            },
+                        )
+                        final_text = [
+                            block.get("text")
+                            for block in final.get("content", [])
+                            if isinstance(block, dict)
+                            and block.get("type") == "text"
+                        ]
+                        require(final.get("stop_reason") == "end_turn")
+                        require(final_text == ["plan complete"])
+                        Path(os.environ["FAKE_CLAUDE_RESULT"]).write_text(
+                            json.dumps(
+                                {
+                                    "tool_id": tool_block["id"],
+                                    "first_stop_reason": initial["stop_reason"],
+                                    "final_stop_reason": final["stop_reason"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                    except Exception:
+                        raise SystemExit(1)
+                    """.replace("__PYTHON__", sys.executable),
+                )
+                env.update(
+                    CLAUDE1_CLAUDE_BIN=str(fake_claude),
+                    FAKE_CLAUDE_RESULT=str(result_path),
+                )
+
+                with loaded_launcher(env) as launcher:
+                    try:
+                        self.assertEqual(
+                            launcher.main(
+                                ["--hub", "--", "-p", "微信 Coding Plan"]  # secret-guard: allow private-provider-name 65941246a1
+                            ),
+                            0,
+                        )
+                    finally:
+                        for process in tuple(launcher._hub_processes):
+                            launcher._stop_spawned_process(process, timeout=5)
+
+                self.assertEqual(
+                    json.loads(result_path.read_text(encoding="utf-8")),
+                    {
+                        "tool_id": "call_fixture_plan",
+                        "first_stop_reason": "tool_use",
+                        "final_stop_reason": "end_turn",
+                    },
+                )
+                with received_lock:
+                    self.assertEqual(len(received), 2)
+                    initial_upstream, continued_upstream = received
+
+                self.assertEqual(initial_upstream["model"], "fixture-model")
+                self.assertEqual(
+                    initial_upstream["messages"],
+                    [{"role": "user", "content": "微信 Coding Plan"}],  # secret-guard: allow private-provider-name 65941246a1
+                )
+                function = initial_upstream["tools"][0]["function"]
+                self.assertEqual(function["name"], "write_plan")
+                self.assertEqual(
+                    function["parameters"]["required"],
+                    ["title"],
+                )
+
+                self.assertEqual(
+                    continued_upstream["messages"][1]["tool_calls"][0]["id"],
+                    "call_fixture_plan",
+                )
+                tool_result = continued_upstream["messages"][2]
+                self.assertEqual(tool_result["role"], "tool")
+                self.assertEqual(tool_result["tool_call_id"], "call_fixture_plan")
+                self.assertEqual(
+                    json.loads(tool_result["content"]),
+                    {
+                        "type": "anthropic_tool_result",
+                        "is_error": True,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "draft validation failed",
+                            },
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "text",
+                                    "media_type": "text/plain",
+                                    "data": "missing milestone",
+                                },
+                            },
+                        ],
+                    },
+                )
+                serialized_requests = json.dumps(
+                    received,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                self.assertNotIn("must-not-leak", serialized_requests)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
 
     def test_hub_supports_environment_backed_local_token(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1805,7 +2973,16 @@ class LauncherSafetyTests(unittest.TestCase):
 
                     path = Path(sys.argv[sys.argv.index("--settings") + 1])
                     Path(os.environ["FAKE_CLAUDE_CAPTURE"]).write_text(
-                        json.dumps(json.loads(path.read_text(encoding="utf-8"))),
+                        json.dumps(
+                            {
+                                "settings": json.loads(
+                                    path.read_text(encoding="utf-8")
+                                ),
+                                "credential": os.environ.get(
+                                    "ANTHROPIC_AUTH_TOKEN"
+                                ),
+                            }
+                        ),
                         encoding="utf-8",
                     )
                     """,
@@ -1829,7 +3006,8 @@ class LauncherSafetyTests(unittest.TestCase):
                         token_env="FIXTURE_HUB_TOKEN",
                     )
 
-                    settings = json.loads(capture.read_text(encoding="utf-8"))
+                    launched = json.loads(capture.read_text(encoding="utf-8"))
+                    settings = launched["settings"]
                     self.assertEqual(
                         settings["env"]["ANTHROPIC_BASE_URL"],
                         f"http://127.0.0.1:{port}",
@@ -1838,6 +3016,7 @@ class LauncherSafetyTests(unittest.TestCase):
                         settings["env"]["ANTHROPIC_AUTH_TOKEN"],
                         "fixture-local-token",
                     )
+                    self.assertEqual(launched["credential"], "fixture-local-token")
                     self.assertEqual(
                         settings["env"]["ANTHROPIC_MODEL"],
                         "glm,glm-fixture",
@@ -1878,12 +3057,15 @@ class LauncherSafetyTests(unittest.TestCase):
                     os.environ["FIXTURE_HUB_TOKEN"] = ""
                     os.environ["CLAUDE_HUB_LOCAL_TOKEN"] = ""
                     self.assertEqual(launcher.exec_hub([]), 0)
-                    legacy_settings = json.loads(
+                    legacy_launch = json.loads(
                         capture.read_text(encoding="utf-8")
                     )
                     self.assertEqual(
-                        legacy_settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+                        legacy_launch["settings"]["env"]["ANTHROPIC_AUTH_TOKEN"],
                         "fixture-local-token",
+                    )
+                    self.assertEqual(
+                        legacy_launch["credential"], "fixture-local-token"
                     )
                 self.assertEqual(sticky.read_text(encoding="utf-8"), "direct\n")
 
@@ -1922,7 +3104,7 @@ class LauncherSafetyTests(unittest.TestCase):
                         json.dumps({"type": "assistant", "message": {"model": "grok-4.5"}}),
                     )
                 )
-                + "\n",
+                + '\n{"type":"assistant"',
                 encoding="utf-8",
             )
             fake_claude = home / "bin" / "claude"
@@ -1955,7 +3137,11 @@ class LauncherSafetyTests(unittest.TestCase):
             )
 
             with loaded_launcher(env) as launcher:
-                with mock.patch.object(launcher, "ensure_hub"):
+                with mock.patch.object(
+                    launcher,
+                    "ensure_hub",
+                    side_effect=lambda port, **_kwargs: port,
+                ):
                     self.assertEqual(
                         launcher.exec_hub(["--resume", session_id]),
                         0,
@@ -2158,12 +3344,12 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(status.default_model, "glm-5.2")
                 self.assertEqual(
                     status.summary,
-                    "4 槽 · 4 渠道 · 默认 any,claude-fixture-5[1m] · xhigh",
+                    "4 槽 · 4 渠道 · 启动 any,claude-fixture-5[1m] · xhigh",
                 )
 
                 self.assertTrue(options[0].is_default)
                 self.assertEqual(options[0].selector, "glm,glm-5.2")
-                self.assertEqual(options[0].status_label, "默认")
+                self.assertEqual(options[0].status_label, "回退")
                 self.assertEqual(len(options), 6)
 
                 by_selector = {opt.selector: opt for opt in options}
@@ -2177,6 +3363,107 @@ class HubWorkspaceTests(unittest.TestCase):
                 self.assertEqual(
                     by_selector["any,claude-fixture-5[1m]"].status_label, "1M"
                 )
+
+    def test_hub_display_uses_slot_count_and_distinct_route_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                hub_ref = launcher.HubRef(
+                    "fixture-hub",
+                    "Fixture Hub",
+                    Path("hub.json"),
+                    Path("hub.log"),
+                    Path("usage.jsonl"),
+                )
+                status = launcher.HubStatus(
+                    port=18787,
+                    default_channel="fast",
+                    default_model="expected-model",
+                    channel_count=1,
+                    model_count=1,
+                    launch_slot="fable",
+                    launch_selector="other,start-model",
+                    launch_effort="high",
+                )
+                ready = launcher.NamedHubLauncherState(
+                    hub_ref,
+                    launcher.HubLauncherState(status, (), ()),
+                )
+                setup = launcher.NamedHubLauncherState(hub_ref, None, 2)
+                slots = (*launcher.HUB_SLOT_ORDER, "extra")
+
+                with mock.patch.object(launcher, "HUB_SLOT_ORDER", slots):
+                    ready_text = launcher._hub_home_text(ready, 120)
+                    setup_text = launcher._hub_home_text(setup, 120)
+                    setup_window = ScriptedWindow([], size=(18, 100))
+                    launcher.C = {}
+                    launcher._draw_hub_setup(
+                        setup_window,
+                        hub_ref,
+                        {"mappings": {}},
+                        0,
+                    )
+                    choice_window = ScriptedWindow([], size=(18, 100))
+                    launcher._draw_hub_setup_choice_shell(
+                        choice_window,
+                        hub_ref.name,
+                        "fable",
+                        "选择渠道",
+                    )
+
+                setup_rendered = " ".join(
+                    value
+                    for call in setup_window.added + choice_window.added
+                    for value in call
+                    if isinstance(value, str)
+                )
+                self.assertIn("5 槽", ready_text)
+                self.assertIn("启动 Fable", ready_text)
+                self.assertIn("2/5", setup_text)
+                self.assertIn("已完成 0/5", setup_rendered)
+                self.assertIn("第 1/5 槽", setup_rendered)
+
+                mismatch_window = ScriptedWindow([], size=(18, 100))
+                launcher._draw_hub_workspace(
+                    mismatch_window,
+                    status,
+                    [
+                        launcher.HubChannel(
+                            "fast", "Fixture", ("first-model",), False
+                        )
+                    ],
+                    0,
+                    tab="channels",
+                )
+                mismatch = " ".join(
+                    value
+                    for call in mismatch_window.added
+                    for value in call
+                    if isinstance(value, str)
+                )
+                self.assertIn("启动 other,start-model", mismatch)
+                self.assertIn("可用", mismatch)
+                self.assertNotIn("回退", mismatch)
+
+                fallback_window = ScriptedWindow([], size=(18, 100))
+                launcher._draw_hub_workspace(
+                    fallback_window,
+                    launcher.replace(status, default_model="first-model"),
+                    [
+                        launcher.HubChannel(
+                            "fast", "Fixture", ("first-model",), False
+                        )
+                    ],
+                    0,
+                    tab="channels",
+                )
+                fallback = " ".join(
+                    value
+                    for call in fallback_window.added
+                    for value in call
+                    if isinstance(value, str)
+                )
+                self.assertIn("回退", fallback)
 
     def test_loading_v1_config_migrates_once_and_keeps_route_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2330,6 +3617,18 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertEqual(ref.config_path, config)
             self.assertEqual(resolved_port, 19999)
 
+    def test_hub_port_rejects_boolean_and_fractional_values(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                for value in (True, 18787.5):
+                    with self.subTest(value=value), self.assertRaisesRegex(
+                        RuntimeError,
+                        "hub 端口无效",
+                    ):
+                        launcher._hub_port({"port": value})
+
+                self.assertEqual(launcher._hub_port({"port": "18787"}), 18787)
+
     def test_workspace_has_four_native_slots_then_only_unbound_models(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = self._hub_env(Path(raw_home))
@@ -2368,7 +3667,11 @@ class HubWorkspaceTests(unittest.TestCase):
             config_path.chmod(0o600)
             with loaded_launcher(env) as launcher:
                 with (
-                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher,
+                        "ensure_hub",
+                        side_effect=lambda port, **_kwargs: port,
+                    ),
                     mock.patch.object(
                         launcher, "launch_with_settings", return_value=0
                     ) as launch,
@@ -2401,7 +3704,11 @@ class HubWorkspaceTests(unittest.TestCase):
             env = self._multi_hub_env(Path(raw_home))
             with loaded_launcher(env) as launcher:
                 with (
-                    mock.patch.object(launcher, "ensure_hub") as ensure,
+                    mock.patch.object(
+                        launcher,
+                        "ensure_hub",
+                        side_effect=lambda port, **_kwargs: port,
+                    ) as ensure,
                     mock.patch.object(
                         launcher, "launch_with_settings", return_value=0
                     ) as launch,
@@ -2477,7 +3784,11 @@ class HubWorkspaceTests(unittest.TestCase):
             path.chmod(0o600)
             with loaded_launcher(env) as launcher:
                 with (
-                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher,
+                        "ensure_hub",
+                        side_effect=lambda port, **_kwargs: port,
+                    ),
                     mock.patch.object(
                         launcher, "launch_with_settings", return_value=0
                     ) as launch,
@@ -2515,7 +3826,11 @@ class HubWorkspaceTests(unittest.TestCase):
             path.chmod(0o600)
             with loaded_launcher(env) as launcher:
                 with (
-                    mock.patch.object(launcher, "ensure_hub"),
+                    mock.patch.object(
+                        launcher,
+                        "ensure_hub",
+                        side_effect=lambda port, **_kwargs: port,
+                    ),
                     mock.patch.object(
                         launcher, "_resume_session_selector", return_value=selector
                     ),
@@ -2742,6 +4057,47 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertTrue(any("▸ ◆ Opus" in value for value in rendered_strings))
             self.assertIn("未设置", rendered)
 
+    def test_corrupt_setup_draft_remains_visible_as_an_error_row(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                created = launcher.create_named_hub("broken-setup")
+                assert created.draft_path is not None
+                created.draft_path.write_text("{", encoding="utf-8")
+
+                states = launcher._load_named_hub_launcher_states()
+                broken = next(
+                    item for item in states if item.hub.hub_id == created.hub_id
+                )
+                rendered = launcher._hub_home_text(broken, 80)
+                window = ScriptedWindow([10, ord("q")])
+                cfg = {
+                    "providers": {
+                        "alpha-id": {"name": "Alpha", "hidden": False}
+                    }
+                }
+                launcher._logo_pairs[:] = [0]
+                with (
+                    mock.patch.object(launcher, "_init_colors", return_value={}),
+                    mock.patch.object(launcher, "_intro", return_value=None),
+                    mock.patch.object(launcher, "load_mru", return_value={}),
+                    mock.patch.object(
+                        launcher,
+                        "_load_named_hub_launcher_states",
+                        return_value=[broken],
+                    ),
+                    mock.patch.object(launcher, "_hub_setup_wizard") as wizard,
+                ):
+                    result = launcher._launcher_main(
+                        window, cfg, {"alpha-id"}
+                    )
+
+            self.assertIsNone(broken.state)
+            self.assertEqual(broken.error, "配置异常")
+            self.assertIn("配置异常", rendered)
+            self.assertIsNone(result)
+            wizard.assert_not_called()
+
     def test_setup_overview_keeps_all_slots_and_finish_visible_at_eight_rows(
         self,
     ) -> None:
@@ -2802,6 +4158,126 @@ class HubWorkspaceTests(unittest.TestCase):
             ]
             self.assertTrue(selected_rows)
             self.assertTrue(all(row < 7 for row in selected_rows))
+
+    def test_setup_provider_picker_starts_from_initial_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            providers = [
+                {"id": "provider-a", "name": "Provider A"},
+                {"id": "provider-b", "name": "Provider B"},
+            ]
+            window = ScriptedWindow([10])
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                launcher.C = {}
+                selected = launcher._choose_hub_setup_provider(
+                    window,
+                    "Fixture Hub",
+                    "fable",
+                    providers,
+                    initial_provider_id="provider-b",
+                )
+
+            self.assertEqual(selected, providers[1])
+
+    def test_api_format_pickers_share_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                launcher.C = {}
+                for shortcut, expected in (
+                    ("a", "anthropic"),
+                    ("c", "openai_chat"),
+                    ("r", "openai_responses"),
+                ):
+                    with self.subTest(shortcut=shortcut):
+                        add_window = ScriptedWindow([ord(shortcut)])
+                        setup_window = ScriptedWindow([ord(shortcut)])
+
+                        self.assertEqual(
+                            launcher._choose_hub_api_format(add_window),
+                            expected,
+                        )
+                        self.assertEqual(
+                            launcher._choose_hub_setup_api_format(
+                                setup_window,
+                                "Fixture Hub",
+                                "fable",
+                                "metadata unavailable",
+                            ),
+                            expected,
+                        )
+
+            setup_text = " ".join(
+                str(value)
+                for call in setup_window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIn("a/c/r 快捷选择", setup_text)
+
+    def test_choice_pickers_keep_enter_and_escape_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            providers = [{"id": "provider-a", "name": "Provider A"}]
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                launcher.C = {}
+                for key, expected_provider, expected_format in (
+                    (10, providers[0], "anthropic"),
+                    (27, None, None),
+                ):
+                    with self.subTest(key=key):
+                        self.assertEqual(
+                            launcher._choose_hub_provider(
+                                ScriptedWindow([key]), providers
+                            ),
+                            expected_provider,
+                        )
+                        self.assertEqual(
+                            launcher._choose_hub_setup_provider(
+                                ScriptedWindow([key]),
+                                "Fixture Hub",
+                                "fable",
+                                providers,
+                            ),
+                            expected_provider,
+                        )
+                        self.assertEqual(
+                            launcher._choose_hub_api_format(
+                                ScriptedWindow([key])
+                            ),
+                            expected_format,
+                        )
+                        self.assertEqual(
+                            launcher._choose_hub_setup_api_format(
+                                ScriptedWindow([key]),
+                                "Fixture Hub",
+                                "fable",
+                                "metadata unavailable",
+                            ),
+                            expected_format,
+                        )
+
+    def test_manual_setup_model_explains_that_commas_are_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            window = ScriptedWindow(
+                [*map(ord, "bad,model"), 10, 27],
+                size=(18, 90),
+            )
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                launcher.C = {}
+                result = launcher._prompt_hub_setup_model(
+                    window,
+                    "Fixture Hub",
+                    "fable",
+                    "Fixture Provider",
+                )
+
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertIsNone(result)
+            self.assertIn("不能包含逗号", rendered)
 
     def test_completing_fourth_mapping_makes_hub_launchable(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2885,6 +4361,39 @@ class HubWorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(catalog["hubs"][ready.hub_id]["state"], "ready")
             self.assertNotIn("draft", catalog["hubs"][ready.hub_id])
+
+    def test_setup_wizard_stays_open_when_its_hub_was_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            window = ScriptedWindow([10, 27], size=(18, 90))
+            with loaded_launcher(env) as launcher:
+                stale = launcher.create_named_hub("stale-hub")
+                provider = {"id": "fixture-provider", "name": "Fixture Provider"}
+                for slot in launcher.HUB_SLOT_ORDER:
+                    launcher.set_hub_setup_mapping(
+                        stale,
+                        slot,
+                        provider,
+                        f"{slot}-model",
+                        api_format="anthropic",
+                    )
+
+                def remove_stale(catalog):
+                    catalog["order"].remove(stale.hub_id)
+                    del catalog["hubs"][stale.hub_id]
+
+                launcher.mutate_hub_catalog(remove_stale)
+                launcher.C = {}
+                outcome = launcher._hub_setup_wizard(window, stale)
+
+            rendered = " ".join(
+                str(value)
+                for call in window.added
+                for value in call
+                if isinstance(value, str)
+            )
+            self.assertEqual(outcome, "back")
+            self.assertIn("已被移除", rendered)
 
     def test_failed_catalog_write_removes_the_new_hub_draft(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -2976,6 +4485,7 @@ class HubWorkspaceTests(unittest.TestCase):
                 interrupted_config = launcher._hub_config_from_setup_draft(
                     created, draft, port
                 )
+                interrupted_config["future_field"] = {"preserved": True}
                 launcher._atomic_private_write(
                     created.config_path,
                     launcher._hub_config_text(interrupted_config),
@@ -2986,6 +4496,7 @@ class HubWorkspaceTests(unittest.TestCase):
 
             self.assertEqual(ready.state, "ready")
             self.assertEqual(recovered, interrupted_config)
+            self.assertEqual(recovered["future_field"], {"preserved": True})
             self.assertEqual(catalog["hubs"][ready.hub_id]["state"], "ready")
             self.assertFalse(created.draft_path.exists())
 
@@ -3030,6 +4541,69 @@ class HubWorkspaceTests(unittest.TestCase):
             self.assertEqual(recovered_ref.state, "ready")
             self.assertEqual(
                 recovered_config["local_token"], crashed_config["local_token"]
+            )
+
+    def test_named_hub_launch_reassigns_a_port_taken_after_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            script = Path(env["CLAUDE1_HUB_SCRIPT"])
+            script.parent.mkdir(parents=True, exist_ok=True)
+            write_executable(script, "#!/bin/sh\nexit 0\n")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as thief:
+                thief.bind(("127.0.0.1", 0))
+                thief.listen()
+                stolen_port = int(thief.getsockname()[1])
+
+                with loaded_launcher(env) as launcher:
+                    hub = launcher.resolve_hub_ref("kimi-hub")
+
+                    def steal_configured_port(config):
+                        config["port"] = stolen_port
+
+                    launcher.mutate_hub_config(
+                        steal_configured_port,
+                        hub=hub,
+                    )
+                    process = mock.Mock()
+                    process.poll.return_value = None
+                    spawned: dict[str, object] = {}
+
+                    def capture_spawn(log_path, child_env, listener):
+                        spawned["log_path"] = log_path
+                        spawned["port"] = int(listener.getsockname()[1])
+                        spawned["env_port"] = child_env["CLAUDE_HUB_PORT"]
+                        return process
+
+                    with mock.patch.object(
+                        launcher,
+                        "hub_healthy",
+                        side_effect=[False, False, False, True],
+                    ), mock.patch.object(
+                        launcher,
+                        "_spawn_hub_process",
+                        side_effect=capture_spawn,
+                    ), mock.patch.object(
+                        launcher,
+                        "launch_with_settings",
+                        return_value=0,
+                    ) as launch:
+                        status = launcher.exec_hub(
+                            [],
+                            hub_id=hub.hub_id,
+                        )
+
+                    persisted = launcher.load_hub_config(hub=hub)
+                    settings = launch.call_args.args[0]
+                    launcher._hub_processes.clear()
+
+            actual_port = spawned["port"]
+            self.assertEqual(status, 0)
+            self.assertNotEqual(actual_port, stolen_port)
+            self.assertEqual(persisted["port"], actual_port)
+            self.assertEqual(spawned["env_port"], str(actual_port))
+            self.assertEqual(
+                settings["env"]["ANTHROPIC_BASE_URL"],
+                f"http://127.0.0.1:{actual_port}",
             )
 
     def test_create_rejects_a_symlinked_catalog_parent_directory(self) -> None:

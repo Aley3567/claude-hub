@@ -1,0 +1,9 @@
+event:response.created
+data:{"type":"response.created","response":{"id":"resp_refusal_fixture","model":"responses-model"}}
+
+event:response.refusal.delta
+data:{"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"cannot comply"}
+
+event:response.completed
+data:{"type":"response.completed","response":{"id":"resp_refusal_fixture","model":"responses-model","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}
+

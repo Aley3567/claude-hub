@@ -25,6 +25,31 @@ META_TYPES = {
     "permission-mode",
     "last-prompt",
 }
+TRANSCRIPT_TAIL_BYTES = 256 * 1024
+TRANSCRIPT_TAIL_LINES = 400
+
+
+def _tail_lines(
+    path: Path,
+    *,
+    max_bytes: int = TRANSCRIPT_TAIL_BYTES,
+    max_lines: int = TRANSCRIPT_TAIL_LINES,
+) -> list[str]:
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        start = max(0, size - max_bytes)
+        stream.seek(start - 1 if start else 0)
+        tail = stream.read(max_bytes + 1 if start else max_bytes)
+
+    if start:
+        starts_mid_line = tail[:1] != b"\n"
+        tail = tail[1:]
+        if starts_mid_line:
+            _, separator, tail = tail.partition(b"\n")
+            if not separator:
+                return []
+    return tail.decode("utf-8", errors="replace").splitlines()[-max_lines:]
 
 
 def _timestamp(value: object) -> float | None:
@@ -67,7 +92,7 @@ def latest_response_model(
     assistant: tuple[float, str] | None = None
     latest_semantic: float | None = None
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
+        lines = _tail_lines(path)
     except OSError:
         return ""
     for line in lines:
@@ -125,6 +150,7 @@ def _current_provider_env(db_path: Path) -> dict[str, str]:
     if not db_path.is_file():
         return {}
     uri = db_path.resolve(strict=False).as_uri() + "?mode=ro"
+    connection = None
     try:
         connection = sqlite3.connect(uri, uri=True)
         rows = connection.execute(
@@ -134,10 +160,8 @@ def _current_provider_env(db_path: Path) -> dict[str, str]:
     except sqlite3.Error:
         return {}
     finally:
-        try:
+        if connection is not None:
             connection.close()
-        except UnboundLocalError:
-            pass
     if len(rows) != 1:
         return {}
     try:
