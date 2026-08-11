@@ -28,6 +28,36 @@ class ProviderFormatTests(unittest.TestCase):
 
 
 class RequestTransformTests(unittest.TestCase):
+    def test_system_message_role_is_preserved_for_current_claude_code(self) -> None:
+        payload = {
+            "model": "system-message-model",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "machine context"}]},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        _, chat = protocol.transform_request(payload, "openai_chat")
+        _, responses = protocol.transform_request(payload, "openai_responses")
+
+        self.assertEqual(
+            chat["messages"][:2],
+            [
+                {"role": "system", "content": "machine context"},
+                {"role": "user", "content": "hello"},
+            ],
+        )
+        self.assertEqual(
+            responses["input"][:2],
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "machine context"}],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        )
+
     def test_orphan_or_duplicate_tool_results_fail_closed_for_both_formats(self) -> None:
         orphan = {
             "model": "tool-model",
@@ -661,6 +691,44 @@ class StreamingTransformTests(unittest.TestCase):
                     ),
                 )
 
+    def test_chat_text_starts_after_reasoning_block_stops(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "think",
+                                "content": "answer",
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                (event["type"], event.get("index"))
+                for event in events
+                if event["type"] != "message_start"
+            ],
+            [
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+            ],
+        )
+
     def test_chat_sse_is_emitted_as_terminal_anthropic_stream(self) -> None:
         upstream = [
             b'data: {"id":"chat_1","model":"model-test","choices":'
@@ -770,6 +838,163 @@ class StreamingTransformTests(unittest.TestCase):
             if b'"type":"content_block_delta"' in chunk
         ]
         self.assertEqual([delta["delta"]["text"] for delta in deltas], ["partial"])
+
+    def test_responses_zero_output_index_is_a_tool_identifier(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = bridge.feed(
+            "response.output_item.added",
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "function_call", "name": "lookup"},
+                }
+            ),
+        )
+        chunks.extend(
+            bridge.feed(
+                "response.function_call_arguments.done",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": 0,
+                        "arguments": '{"q":"zero"}',
+                    }
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        tool = next(
+            event["content_block"]
+            for event in events
+            if event["type"] == "content_block_start"
+        )
+        self.assertEqual(tool["id"], "0")
+        self.assertEqual(
+            [
+                event["delta"]["partial_json"]
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            ['{"q":"zero"}'],
+        )
+
+    def test_responses_anonymous_tool_snapshots_stay_distinct(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = []
+        for name, arguments in (
+            ("first", '{"value":1}'),
+            ("second", '{"value":2}'),
+        ):
+            chunks.extend(
+                bridge.feed(
+                    "response.output_item.added",
+                    json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }
+                    ),
+                )
+            )
+        chunks.extend(
+            bridge.feed(
+                "response.function_call_arguments.delta",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "delta": "unidentifiable",
+                    }
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                (event["index"], event["content_block"]["id"])
+                for event in events
+                if event["type"] == "content_block_start"
+            ],
+            [
+                (0, "response_function_call_0"),
+                (1, "response_function_call_1"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (event["index"], event["delta"]["partial_json"])
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            [(0, '{"value":1}'), (1, '{"value":2}')],
+        )
+
+    def test_responses_single_anonymous_tool_accepts_argument_events(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        chunks = bridge.feed(
+            "response.output_item.added",
+            json.dumps(
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "name": "lookup",
+                    },
+                }
+            ),
+        )
+        for delta in ('{"q":', '"x"}'):
+            chunks.extend(
+                bridge.feed(
+                    "response.function_call_arguments.delta",
+                    json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "delta": delta,
+                        }
+                    ),
+                )
+            )
+        chunks.extend(
+            bridge.feed(
+                "response.function_call_arguments.done",
+                json.dumps(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "arguments": '{"q":"x"}',
+                    }
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1])
+            for chunk in chunks
+        ]
+
+        self.assertEqual(
+            [
+                event["delta"]["partial_json"]
+                for event in events
+                if event["type"] == "content_block_delta"
+            ],
+            ['{"q":', '"x"}'],
+        )
+        self.assertEqual(
+            [event["index"] for event in events if event["type"] == "content_block_stop"],
+            [0],
+        )
 
     def test_responses_tool_arguments_done_accepts_call_id_and_arguments(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")

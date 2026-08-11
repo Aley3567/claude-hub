@@ -38,8 +38,8 @@ source ~/.zshrc
 
 安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub、命名 Hub 目录模块、共享协议桥和 statusline 模型
-解析器五份 Python 文件。已有目标文件和
+安装器实际复制启动器、Hub、命名 Hub 目录模块、共享协议桥、账号池调度和
+statusline 模型解析器六份 Python 文件。已有目标文件和
 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
@@ -67,6 +67,7 @@ claude1 hub --model lab,model   # 从默认命名 Hub 的指定渠道与模型�
 claude1 list                    # 稳定顺序列出可见渠道
 claude1 doctor                  # 本机只读检查，不连接 provider
 claude1 doctor --fix            # 备份 DB 后清理 provider 的子代理模型固定值
+claude1 accounts list           # 查看同一 provider 的多账号池与运行状态
 claude1 usage                   # 查看 token 用量与缓存命中率曲线
 claude1 --help                  # 查看完整命令与快捷键
 CLAUDE1_NO_ANIMATION=1 claude1  # 关闭启动动画
@@ -87,8 +88,9 @@ Provider 名称匹配不区分大小写；如果 CC Switch 中存在重名 provi
 - `claude1` 的普通启动只影响本次 Claude Code 会话；
 - 不切换 CC Switch 的全局 current provider；
 - 不接管普通 `claude`；
-- provider 凭证只进入本次 Claude Code 子进程使用的临时 settings；临时文件
-  权限为 `0600`，进程结束后删除；
+- provider 凭证只进入本次 Claude Code 子进程环境及其独享的临时 settings；
+  临时 settings 权限为 `0600`，用于覆盖 CC Switch 的全局 current 配置，进程
+  结束后立即删除；
 - Hub 以只读方式从 CC Switch DB 获取上游地址和凭证，配置示例中不保存上游
   token。
 
@@ -114,6 +116,67 @@ source ~/.zshrc
 `claude1 current` 与 statusline 的 CC Switch 回退都以数据库中唯一的
 `providers.is_current=1` 为准；`~/.cc-switch/settings.json` 只视为缓存，不再
 作为启动器的当前 provider 真相源。零个或多个 current 标记会 fail closed。
+
+## 可选：同一 provider 使用多个账号 / key
+
+账号池适合“同一个上游、多个账号各有独立额度”的情况。每个 key 仍先在
+CC Switch 中建立为一个独立 Claude provider；`claude1` 只把这些现有 provider
+的稳定 id 组成逻辑池，不接收 key，也不会把 key 复制到自己的配置或状态库。
+
+下面以唯一 provider 名为例；有重名时改用 `id:<provider-id>`：
+
+```bash
+claude1 accounts add "主账号" "第二账号"
+claude1 accounts add "主账号" "备用账号" --priority 10
+claude1 accounts set "主账号" "主账号" --weight 2 --priority 0
+claude1 accounts set "主账号" "第二账号" --weight 3 --priority 0
+claude1 accounts policy "主账号" weighted
+claude1 accounts list "主账号"
+```
+
+第一次 `add` 会自动把主 provider 本身和新增账号一起放进池。调度先选择数值最小
+的 `priority`；同一优先级内，`round-robin` 等量轮换，`weighted` 按 `weight`
+长期比例轮换。因此相同 priority 适合额度分摊，更大的 priority 适合备用账号。
+`weighted` 使用确定性的连续权重槽，较大的 weight 可能连续命中同一账号；希望
+请求分布更平滑时优先使用默认的 `round-robin` 或较小权重。
+
+运行时规则刻意保持保守：
+
+- `401/403` 会停用该 key，直到 CC Switch 中的 key 发生变化，或手动执行
+  `claude1 accounts reset <主provider> [账号provider]`；
+- `429` 优先遵守上游 `Retry-After`；缺失或无效时默认冷却 60 秒，默认最长
+  3600 秒；
+- Hub 和 OpenAI 协议桥只会在尚未向 Claude Code 开始响应时切换 key；连接错误、
+  `5xx`、已经开始的 SSE 都不会重放，避免重复提交或重复计费；
+- Anthropic 原生直连在会话启动时选择一次账号，整个会话固定；下一次启动才继续
+  轮换，无法在会话中途观察 `429` 并自动切换；
+- 上游 URL、模型、协议和 proxy 始终由主 provider 决定，成员 provider 只贡献
+  credential；成员必须使用相同上游 URL 和相同凭证类型，尾部 `/v1` 会统一
+  归一化；重复 key 会在 CLI 和运行时被拒绝。
+
+账号池不会修改 CC Switch 的 `is_current`，因此控制面互不抢占；它也不会建立
+跨应用的独占 lease。多个 native 会话、多个 Hub 进程或 CC Switch 自己启动的
+会话仍可能同时使用同一个 key，账号池提供的是轮换和故障隔离，不是额度锁或全局
+并发配额。
+
+其他管理命令：
+
+```bash
+claude1 accounts policy <主provider> round-robin
+claude1 accounts remove <主provider> <账号provider>
+claude1 accounts reset <主provider> [账号provider]
+claude1 accounts delete <主provider>
+```
+
+任一启用成员在 CC Switch 中缺失、凭证为空或 endpoint 不兼容时，池会 fail
+closed，避免静默把 key 发往错误上游。若成员已先从 CC Switch 删除，可用其原始
+稳定 id 清理：`claude1 accounts remove id:<主provider-id> id:<已删除成员-id>`。
+
+非敏感规则默认写入 `~/.cc-switch/claude1-account-pools.json`，共享 cursor、冷却、
+停用状态和 credential 指纹写入
+`~/.cc-switch/claude1-account-state.sqlite3`；两者都不保存 key。建议通过上述 CLI
+维护；完整字段可参考
+[`examples/claude1-account-pools.example.json`](examples/claude1-account-pools.example.json)。
 
 ## 可选：在自定义 statusline 中显示实际上游模型
 
@@ -224,7 +287,9 @@ DB、provider 或 current 状态。
 
 请求经过 Hub 时，网关会把每条响应的 token 用量（输入 / 输出 / 缓存读 /
 缓存写）追加到 `~/.cc-switch/logs/claude-hub-usage.jsonl`（权限 `0600`，只
-存 token 计数与时间，不含任何凭证）。平时由 Hub 实时写入；也可以把 Claude
+存 token 计数、时间和稳定账号 id，不含任何凭证）。账号池请求的响应头
+`x-hub-account` 和 JSONL 的 `account` 字段可用于定位实际使用的账号；当前
+`claude1 usage` 图表仍按全部账号汇总。平时由 Hub 实时写入；也可以把 Claude
 Code 本地会话记录里已有的用量一次性导入同一文件（见下）。
 
 ```bash
@@ -294,6 +359,8 @@ EOF
 ├── scripts/
 │   ├── claude-provider-once.py
 │   ├── claude-hub.py
+│   ├── claude_hub_catalog.py
+│   ├── claude1_account_pool.py
 │   ├── claude1_protocol.py
 │   └── statusline-model.py
 ├── claude1/
@@ -318,19 +385,25 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | --- | --- |
 | `claude-provider-once.py` | 一次性 provider 选择、TUI 与 Claude Code 启动 |
 | `claude-hub.py` | 可选的本地 Anthropic gateway |
+| `claude_hub_catalog.py` | 命名 Hub 目录、路径与迁移规则 |
+| `claude1_account_pool.py` | 多账号选择、冷却、停用状态与非敏感配置写入 |
 | `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
 | `statusline-model.py` | 自定义 statusline 可复用的实际上游模型解析 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |
+| `examples/claude1-account-pools.example.json` | 无凭证账号池规则示例 |
 | `install.sh` | 幂等安装与改写前备份 |
 | `tests/` | launcher、Hub、shell 与安装器的隔离测试 |
+| `docs/tracer-bullet-audit.md` | 端到端审计证据与分阶段性能优化合同 |
 | `docs/product-research.md` | 产品边界、同类产品研究与验收合同 |
 | `docs/release-verification.md` | 0.1.0 的测试、实机隔离与发布验证记录 |
 
 产品取舍和协议范围见
 [docs/product-research.md](docs/product-research.md)，发布证据与已知限制见
-[docs/release-verification.md](docs/release-verification.md)。
+[docs/release-verification.md](docs/release-verification.md)，当前 tracer-bullet 审计与
+后续性能阶段见
+[docs/tracer-bullet-audit.md](docs/tracer-bullet-audit.md)。
 
 ## 开发验证
 

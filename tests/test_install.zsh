@@ -89,9 +89,15 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude_hub_catalog.py" \
     "$home/install root/scripts/claude_hub_catalog.py" ||
     fail "hub catalog module was not installed"
+  command cmp -s "$REPO_ROOT/claude1_account_pool.py" \
+    "$home/install root/scripts/claude1_account_pool.py" ||
+    fail "account pool module was not installed"
   command cmp -s "$REPO_ROOT/claude1_protocol.py" \
     "$home/install root/scripts/claude1_protocol.py" ||
     fail "protocol bridge was not installed"
+  command cmp -s "$REPO_ROOT/claude1_transport.py" \
+    "$home/install root/scripts/claude1_transport.py" ||
+    fail "transport module was not installed"
   command cmp -s "$REPO_ROOT/statusline-model.py" \
     "$home/install root/scripts/statusline-model.py" ||
     fail "statusline model resolver was not installed"
@@ -199,7 +205,9 @@ test_existing_files_are_backed_up() {
   print -r -- 'old launcher' > "$home/install root/scripts/claude-provider-once.py"
   print -r -- 'old hub' > "$home/install root/scripts/claude-hub.py"
   print -r -- 'old hub catalog' > "$home/install root/scripts/claude_hub_catalog.py"
+  print -r -- 'old account pool' > "$home/install root/scripts/claude1_account_pool.py"
   print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
+  print -r -- 'old transport' > "$home/install root/scripts/claude1_transport.py"
   print -r -- 'old statusline model' > "$home/install root/scripts/statusline-model.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
   command mkdir -p -- "$home/dotfiles"
@@ -215,7 +223,9 @@ test_existing_files_are_backed_up() {
   assert_file_content "old launcher" "$backup/claude-provider-once.py"
   assert_file_content "old hub" "$backup/claude-hub.py"
   assert_file_content "old hub catalog" "$backup/claude_hub_catalog.py"
+  assert_file_content "old account pool" "$backup/claude1_account_pool.py"
   assert_file_content "old protocol" "$backup/claude1_protocol.py"
+  assert_file_content "old transport" "$backup/claude1_transport.py"
   assert_file_content "old statusline model" "$backup/statusline-model.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
   assert_file_content "old zshrc" "$backup/zshrc"

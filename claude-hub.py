@@ -21,6 +21,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import ssl
 import stat
@@ -28,6 +29,8 @@ import sys
 import tempfile
 import time
 import zlib
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -44,6 +47,23 @@ from claude1_protocol import (
     transform_error,
     transform_request,
     transform_response,
+)
+from claude1_account_pool import (
+    AccountCandidate,
+    AccountLease,
+    AccountPool,
+    AccountPoolError,
+    PoolConfigError,
+    PoolExhausted,
+    PoolStateError,
+    credential_fingerprint,
+    normalize_account_endpoint,
+)
+from claude1_transport import (
+    TransportConfigError,
+    UpstreamExecutor,
+    normalize_transport_config,
+    resolve_transport_policy,
 )
 
 
@@ -62,6 +82,12 @@ DEFAULT_CONFIG_PATH = HOME / ".cc-switch" / "claude-hub.json"
 DEFAULT_DB_PATH = HOME / ".cc-switch" / "cc-switch.db"
 DEFAULT_LOG_PATH = HOME / ".cc-switch" / "logs" / "claude-hub.log"
 DEFAULT_USAGE_PATH = HOME / ".cc-switch" / "logs" / "claude-hub-usage.jsonl"
+DEFAULT_ACCOUNT_POOL_CONFIG_PATH = (
+    HOME / ".cc-switch" / "claude1-account-pools.json"
+)
+DEFAULT_ACCOUNT_POOL_STATE_PATH = (
+    HOME / ".cc-switch" / "claude1-account-state.sqlite3"
+)
 
 ENV_CONFIG = "CLAUDE_HUB_CONFIG"
 ENV_DB = "CLAUDE_HUB_DB"
@@ -69,10 +95,16 @@ ENV_LOG = "CLAUDE_HUB_LOG"
 ENV_USAGE = "CLAUDE_HUB_USAGE"
 ENV_PORT = "CLAUDE_HUB_PORT"
 ENV_LOCAL_TOKEN = "CLAUDE_HUB_LOCAL_TOKEN"
+ENV_LISTEN_FD = "CLAUDE_HUB_LISTEN_FD"
+ENV_ACCOUNT_POOL_CONFIG = "CLAUDE1_ACCOUNT_POOL_CONFIG"
+ENV_ACCOUNT_POOL_STATE = "CLAUDE1_ACCOUNT_POOL_STATE"
 
 LOG_MAX_BYTES = 10 * 1024 * 1024
 USAGE_LOG_MAX_BYTES = 10 * 1024 * 1024
 MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024
+UPSTREAM_KEEPALIVE_IDLE_SECONDS = 30
+UPSTREAM_KEEPALIVE_INTERVAL_SECONDS = 15
+UPSTREAM_KEEPALIVE_PROBES = 4
 CONTEXT_1M_BETA = "context-1m-2025-08-07"
 HUB_SLOT_ORDER = ("fable", "opus", "sonnet", "haiku")
 HUB_EFFORT_LEVELS = {"low", "medium", "high", "xhigh"}
@@ -132,6 +164,14 @@ def log_path() -> Path:
 
 def usage_path() -> Path:
     return _env_path(ENV_USAGE, DEFAULT_USAGE_PATH)
+
+
+def account_pool_config_path() -> Path:
+    return _env_path(ENV_ACCOUNT_POOL_CONFIG, DEFAULT_ACCOUNT_POOL_CONFIG_PATH)
+
+
+def account_pool_state_path() -> Path:
+    return _env_path(ENV_ACCOUNT_POOL_STATE, DEFAULT_ACCOUNT_POOL_STATE_PATH)
 
 
 def log(msg: str) -> None:
@@ -281,6 +321,7 @@ def record_usage(
     usage: dict | None,
     *,
     instance_id: str | None = None,
+    account_id: str | None = None,
 ) -> None:
     """把一条请求的 token 用量追加到 JSONL。统计绝不能搞挂转发主路径，全部异常静默。"""
     try:
@@ -297,6 +338,8 @@ def record_usage(
         }
         if instance_id is not None:
             row["hub"] = instance_id
+        if account_id is not None:
+            row["account"] = account_id
         global _usage_fp
         if _usage_fp is None:
             _usage_fp = _open_usage_log()
@@ -405,11 +448,8 @@ def _config_port(raw: object) -> int:
 
 
 def _normalize_base_url(value: object) -> str:
-    base = value.strip().rstrip("/") if isinstance(value, str) else ""
     # Forwarded paths already begin with /v1. Avoid /v1/v1/messages.
-    if base.endswith("/v1"):
-        base = base[:-3].rstrip("/")
-    return base
+    return normalize_account_endpoint(value)
 
 
 def validate_config(raw: object) -> dict:
@@ -473,6 +513,13 @@ def validate_config(raw: object) -> dict:
             "models": [model.strip() for model in models_raw],
             "allow_insecure_http": allow_insecure,
         }
+        if "transport" in channel_raw:
+            try:
+                channel["transport"] = normalize_transport_config(
+                    channel_raw["transport"]
+                )
+            except TransportConfigError as exc:
+                raise ConfigError(f"channels.{alias}.{exc}") from exc
         api_format = channel_raw.get("api_format")
         if api_format is not None:
             if api_format not in {
@@ -550,6 +597,11 @@ def validate_config(raw: object) -> dict:
     if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
         raise ConfigError("proxy must be a non-empty string or null")
 
+    try:
+        transport = normalize_transport_config(raw.get("transport"))
+    except TransportConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
     return {
         "version": version,
         "instance_id": instance_id,
@@ -558,6 +610,7 @@ def validate_config(raw: object) -> dict:
         "default_channel": default_channel,
         "channels": channels,
         "proxy": proxy.strip() if isinstance(proxy, str) else None,
+        "transport": transport,
         "launch_slot": launch_slot,
         "model_slots": model_slots,
         "effort_by_slot": effort_by_slot,
@@ -630,20 +683,23 @@ def _read_provider_rows(path: Path) -> dict:
                 continue
             is_full_url = meta.get("isFullUrl") is True
             raw_base = env.get("ANTHROPIC_BASE_URL")
-            base = (
-                raw_base.strip().rstrip("/")
-                if is_full_url and isinstance(raw_base, str)
-                else _normalize_base_url(raw_base)
+            base = normalize_account_endpoint(
+                raw_base,
+                is_full_url=is_full_url,
             )
             if not base:
                 continue
-            token = (
-                env.get("ANTHROPIC_AUTH_TOKEN")
-                or env.get("ANTHROPIC_API_KEY")
-                or ""
-            )
-            if not isinstance(token, str):
+            auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
+            api_key = env.get("ANTHROPIC_API_KEY")
+            if isinstance(auth_token, str) and auth_token:
+                token = auth_token
+                credential_type = "ANTHROPIC_AUTH_TOKEN"
+            elif isinstance(api_key, str) and api_key:
+                token = api_key
+                credential_type = "ANTHROPIC_API_KEY"
+            else:
                 token = ""
+                credential_type = ""
             folded_env = {
                 str(key).upper(): value for key, value in env.items()
             }
@@ -654,10 +710,24 @@ def _read_provider_rows(path: Path) -> dict:
                 if isinstance(raw_proxy, str) and raw_proxy.strip()
                 else None
             )
+            provider_transport = None
+            transport_error = None
+            if "transport" in settings:
+                try:
+                    provider_transport = normalize_transport_config(
+                        settings["transport"]
+                    )
+                except TransportConfigError as exc:
+                    transport_error = str(exc)
             record = {
+                "selector": f"id:{provider_id}",
+                "name": name,
                 "base_url": base,
                 "token": token,
+                "credential_type": credential_type,
                 "proxy": provider_proxy,
+                "transport": provider_transport,
+                "transport_error": transport_error,
                 "api_format": provider_api_format(
                     meta=meta,
                     settings=settings,
@@ -854,8 +924,22 @@ def route(
             raise RouteError(400, f"empty model after channel alias '{alias}'")
         return alias, upstream_model
 
+    channels = cfg["channels"]
+    aliases = [
+        alias
+        for alias, channel in channels.items()
+        if model in channel.get("models", [])
+    ]
+    if len(aliases) == 1:
+        return aliases[0], model
+    if len(aliases) > 1:
+        raise RouteError(
+            400,
+            f"ambiguous model '{model}'; use channel,model",
+        )
+
     alias = cfg["default_channel"]
-    channel = cfg["channels"].get(alias)
+    channel = channels.get(alias)
     if not channel:
         raise RouteError(500, f"default_channel '{alias}' not in channels config")
     if providers is None:
@@ -863,11 +947,14 @@ def route(
     provider = _match_channel_provider(channel, providers)
     model_lower = model.lower()
     if provider:
-        for tier in ("opus", "sonnet", "haiku", "fable"):
+        for tier in HUB_SLOT_ORDER:
             mapped = provider["model_map"].get(tier)
-            if tier in model_lower and mapped:
+            if model_lower == tier and mapped:
                 return alias, mapped
-    return alias, model
+    raise RouteError(
+        400,
+        f"unknown model '{model}'; use channel,model or a configured model slot",
+    )
 
 
 def _is_loopback(hostname: str | None) -> bool:
@@ -1006,6 +1093,11 @@ def resolve_provider(
             502,
             f"channel '{alias}' provider has no Anthropic credential",
         )
+    if provider.get("transport_error"):
+        raise RouteError(
+            502,
+            f"channel '{alias}' provider transport is invalid",
+        )
     validate_upstream_url(
         provider["base_url"],
         alias,
@@ -1017,7 +1109,176 @@ def resolve_provider(
     return resolved
 
 
+class _AccountAttempt:
+    __slots__ = ("provider", "lease")
+
+    def __init__(self, provider: dict, lease: AccountLease) -> None:
+        self.provider = provider
+        self.lease = lease
+
+
+class _AccountCandidateDirectory(Mapping):
+    """Resolve and fingerprint only pool members requested by the scheduler."""
+
+    def __init__(self, primary: dict, providers: dict) -> None:
+        self.primary = primary
+        self.primary_selector = str(primary.get("selector") or "")
+        self.providers = providers
+        self._cache: dict[str, AccountCandidate] = {}
+
+    def record(self, selector: str) -> dict | None:
+        if selector == self.primary_selector:
+            return self.primary
+        record = self.providers.get(selector)
+        return record if isinstance(record, dict) else None
+
+    def __getitem__(self, selector: str) -> AccountCandidate:
+        cached = self._cache.get(selector)
+        if cached is not None:
+            return cached
+        record = self.record(selector)
+        if record is None:
+            raise KeyError(selector)
+        candidate = AccountCandidate(
+            credential_fingerprint(str(record.get("token") or "")),
+            endpoint=str(record.get("base_url") or ""),
+            credential_type=str(record.get("credential_type") or ""),
+        )
+        self._cache[selector] = candidate
+        return candidate
+
+    def __iter__(self):
+        seen: set[str] = set()
+        if self.primary_selector:
+            seen.add(self.primary_selector)
+            yield self.primary_selector
+        for record in self.providers.values():
+            if not isinstance(record, dict):
+                continue
+            selector = record.get("selector")
+            if isinstance(selector, str) and selector not in seen:
+                seen.add(selector)
+                yield selector
+
+    def __len__(self) -> int:
+        return sum(1 for _selector in self)
+
+
+class _RequestAccountPool:
+    """Bind one provider snapshot to the shared non-secret account scheduler."""
+
+    def __init__(self, primary: dict, providers: dict) -> None:
+        self.primary = dict(primary)
+        self.primary_selector = str(primary.get("selector") or "")
+        self.scheduler = AccountPool(
+            account_pool_config_path(),
+            account_pool_state_path(),
+        )
+        self.directory = _AccountCandidateDirectory(self.primary, providers)
+
+    def acquire(self, *, exclude: set[str] | None = None) -> _AccountAttempt:
+        if not self.primary_selector:
+            token = str(self.primary.get("token") or "")
+            if not token:
+                raise PoolConfigError("provider has no credential")
+            return _AccountAttempt(
+                provider=dict(self.primary),
+                lease=AccountLease(
+                    "id:legacy",
+                    "id:legacy",
+                    credential_fingerprint(token),
+                ),
+            )
+        lease = self.scheduler.acquire(
+            self.primary_selector,
+            self.directory,
+            exclude=exclude or (),
+        )
+        account = self.directory.record(lease.member)
+        if account is None or not account.get("token"):
+            raise PoolConfigError("selected account has no credential")
+        provider = dict(self.primary)
+        provider["token"] = account["token"]
+        provider["account"] = lease.member
+        return _AccountAttempt(provider=provider, lease=lease)
+
+    def report(
+        self,
+        attempt: _AccountAttempt,
+        status: int,
+        retry_after: str | None,
+    ) -> None:
+        self.scheduler.report(attempt.lease, status, retry_after)
+
+
+def _account_pool_error(exc: AccountPoolError) -> web.Response:
+    if isinstance(exc, PoolExhausted):
+        if exc.reason != "cooldown" or exc.retry_after is None:
+            if exc.reason == "auth_disabled":
+                message = (
+                    "hub: all account credentials for this provider are disabled; "
+                    "update the credentials or reset the account pool"
+                )
+            elif exc.reason == "config_disabled":
+                message = "hub: all accounts for this provider are disabled"
+            else:
+                message = "hub: no provider account is currently available"
+            return anthropic_error(503, message, "api_error")
+        response = anthropic_error(
+            429,
+            "hub: all accounts for this provider are temporarily unavailable",
+            "rate_limit_error",
+        )
+        if exc.retry_after is not None:
+            response.headers["retry-after"] = str(exc.retry_after)
+        return response
+    if isinstance(exc, PoolConfigError):
+        return anthropic_error(
+            502,
+            "hub: provider account pool configuration is invalid",
+            "api_error",
+        )
+    return anthropic_error(
+        503,
+        "hub: provider account pool state is unavailable",
+        "api_error",
+    )
+
+
 # ---------------------------------------------------------------- forwarding
+
+
+def _upstream_url(provider: dict, path: str) -> str:
+    """Resolve a provider base URL against one protocol endpoint path."""
+    if provider.get("is_full_url"):
+        return provider["base_url"]
+    return provider["base_url"] + path
+
+
+def _upstream_session(request: web.Request):
+    session = request.app.get(UPSTREAM_SESSION_KEY)
+    if session is None:
+        session = request.app.get("session")
+    if session is None:
+        raise ConfigError("upstream client session is unavailable")
+    return session
+
+
+def _full_endpoint_matches_format(provider: dict, api_format: str) -> bool:
+    """Check recognized standard endpoint suffixes without rejecting custom paths."""
+    if not provider.get("is_full_url"):
+        return True
+    path = urlparse(provider["base_url"]).path.rstrip("/")
+    formats = {
+        "/v1/messages": "anthropic",
+        "/v1/chat/completions": "openai_chat",
+        "/v1/responses": "openai_responses",
+    }
+    expected = next(
+        (value for suffix, value in formats.items() if path.endswith(suffix)),
+        None,
+    )
+    return expected is None or expected == api_format
 
 
 def check_local_auth(request: web.Request, cfg: dict) -> bool:
@@ -1039,6 +1300,29 @@ def channel_proxy(alias: str, cfg: dict, provider: dict | None = None) -> str | 
         or cfg.get("proxy")
         or None
     )
+
+
+def channel_transport_policy(
+    alias: str,
+    cfg: dict,
+    provider: dict | None,
+    endpoint: str,
+):
+    """Resolve one channel's transport while preserving legacy proxy intent."""
+    channel = cfg["channels"].get(alias, {})
+    if channel.get("transport") is not None:
+        transport = channel["transport"]
+    elif channel.get("proxy"):
+        transport = {"mode": "proxy", "proxies": [channel["proxy"]]}
+    elif (provider or {}).get("transport") is not None:
+        transport = provider["transport"]
+    elif (provider or {}).get("proxy"):
+        transport = {"mode": "proxy", "proxies": [provider["proxy"]]}
+    elif cfg.get("proxy"):
+        transport = {"mode": "proxy", "proxies": [cfg["proxy"]]}
+    else:
+        transport = cfg.get("transport")
+    return resolve_transport_policy(endpoint, transport)
 
 
 def _header_values(headers, name: str) -> list[str]:
@@ -1121,6 +1405,87 @@ def upstream_headers(request: web.Request, token: str) -> CIMultiDict:
     headers["authorization"] = f"Bearer {token}"
     headers["x-api-key"] = token
     return headers
+
+
+class StreamTelemetry:
+    """Collect content-free timing and byte metrics for one upstream stream."""
+
+    __slots__ = (
+        "_clock",
+        "_started_at",
+        "_headers_at",
+        "_first_chunk_at",
+        "_last_chunk_at",
+        "_max_gap",
+        "_chunks",
+        "_upstream_bytes",
+    )
+
+    def __init__(self, *, started_at: float, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._started_at = started_at
+        self._headers_at = clock()
+        self._first_chunk_at = None
+        self._last_chunk_at = None
+        self._max_gap = 0.0
+        self._chunks = 0
+        self._upstream_bytes = 0
+
+    def observe(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        now = self._clock()
+        if self._first_chunk_at is None:
+            self._first_chunk_at = now
+        elif self._last_chunk_at is not None:
+            self._max_gap = max(self._max_gap, now - self._last_chunk_at)
+        self._last_chunk_at = now
+        self._chunks += 1
+        self._upstream_bytes += len(chunk)
+
+    @staticmethod
+    def _milliseconds(seconds: float) -> int:
+        return int(round(seconds * 1000))
+
+    def snapshot(self) -> dict:
+        first_chunk_ms = None
+        if self._first_chunk_at is not None:
+            first_chunk_ms = self._milliseconds(
+                self._first_chunk_at - self._started_at
+            )
+        return {
+            "headers_ms": self._milliseconds(
+                self._headers_at - self._started_at
+            ),
+            "first_chunk_ms": first_chunk_ms,
+            "max_gap_ms": self._milliseconds(self._max_gap),
+            "chunks": self._chunks,
+            "upstream_bytes": self._upstream_bytes,
+        }
+
+
+def stream_telemetry_fields(
+    telemetry: StreamTelemetry,
+    *,
+    terminal: str,
+    error: str | None = None,
+    downstream_bytes: int | None = None,
+) -> str:
+    metrics = telemetry.snapshot()
+    first_chunk_ms = metrics["first_chunk_ms"]
+    fields = [
+        f"headers_ms={metrics['headers_ms']}",
+        f"first_chunk_ms={first_chunk_ms if first_chunk_ms is not None else 'none'}",
+        f"max_gap_ms={metrics['max_gap_ms']}",
+        f"chunks={metrics['chunks']}",
+        f"upstream_bytes={metrics['upstream_bytes']}",
+    ]
+    if downstream_bytes is not None:
+        fields.append(f"downstream_bytes={downstream_bytes}")
+    fields.append(f"terminal={terminal}")
+    if error is not None:
+        fields.append(f"error={error}")
+    return " ".join(fields)
 
 
 class _SSETerminalTracker:
@@ -1443,15 +1808,66 @@ def _transformed_headers(token: str, streaming: bool) -> CIMultiDict:
     return headers
 
 
-async def _read_upstream_body(
-    upstream, limit: int = MAX_UPSTREAM_BODY_BYTES
-) -> bytes:
-    body = bytearray()
-    async for chunk in upstream.content.iter_any():
-        body.extend(chunk)
-        if len(body) > limit:
-            raise ProtocolTransformError("upstream response exceeds size limit")
-    return bytes(body)
+@asynccontextmanager
+async def _post_with_account_failover(
+    *,
+    session,
+    account_pool: _RequestAccountPool,
+    url: str,
+    data: bytes,
+    headers_for_token,
+    timeout: aiohttp.ClientTimeout,
+    transport_policy,
+    log_context: str,
+):
+    """Open one upstream response, retrying only explicit pre-commit rejects."""
+    attempted: set[str] = set()
+    attempt = await asyncio.to_thread(account_pool.acquire)
+    executor = UpstreamExecutor(log=log)
+    while True:
+        async with executor.open(
+            session=session,
+            method="POST",
+            url=url,
+            policy=transport_policy,
+            request_kwargs={
+                "data": data,
+                "headers": headers_for_token(attempt.provider["token"]),
+                "timeout": timeout,
+                "allow_redirects": False,
+            },
+            retry_response=lambda response: response.status == 403,
+        ) as opened:
+            upstream = opened.response
+            retryable = upstream.status in (401, 403, 429)
+            if retryable and attempt.lease.managed:
+                retry_after = upstream.headers.get("retry-after")
+                await asyncio.to_thread(
+                    account_pool.report,
+                    attempt,
+                    upstream.status,
+                    retry_after,
+                )
+                attempted.add(attempt.lease.member)
+                try:
+                    replacement = await asyncio.to_thread(
+                        account_pool.acquire,
+                        exclude=attempted,
+                    )
+                except PoolExhausted:
+                    # No account remains. Preserve the final upstream status,
+                    # headers and body rather than manufacturing a success.
+                    yield upstream, attempt
+                    return
+                log(
+                    f"{log_context} account failover "
+                    f"{attempt.lease.member} -> {replacement.lease.member} "
+                    f"after upstream {upstream.status}"
+                )
+                attempt = replacement
+                continue
+            yield upstream, attempt
+            return
 
 
 async def _read_decoded_upstream_body(
@@ -1501,21 +1917,12 @@ async def _handle_transformed_messages(
     alias: str,
     model_in: str,
     model_out: str,
-    is_count: bool,
     started: float,
+    account_pool: _RequestAccountPool | None = None,
 ) -> web.StreamResponse:
+    if account_pool is None:
+        account_pool = _RequestAccountPool(provider, {})
     api_format = provider["api_format"]
-    if is_count:
-        estimate = _estimated_input_tokens(payload)
-        log(
-            f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"{api_format} locally estimated {estimate} tokens"
-        )
-        return web.json_response(
-            {"input_tokens": estimate},
-            headers={"x-hub-estimated": "1"},
-        )
-
     endpoint, upstream_payload = transform_request(
         payload,
         api_format,
@@ -1528,25 +1935,21 @@ async def _handle_transformed_messages(
         separators=(",", ":"),
     ).encode()
     streaming = upstream_payload.get("stream") is True
-    url = (
-        provider["base_url"]
-        if provider.get("is_full_url")
-        else provider["base_url"] + endpoint
-    )
-    session = request.app.get(UPSTREAM_SESSION_KEY)
-    if session is None:
-        session = request.app["session"]
+    url = _upstream_url(provider, endpoint)
+    session = _upstream_session(request)
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
 
     try:
-        async with session.post(
-            url,
+        async with _post_with_account_failover(
+            session=session,
+            account_pool=account_pool,
+            url=url,
             data=data,
-            headers=_transformed_headers(provider["token"], streaming),
+            headers_for_token=lambda token: _transformed_headers(token, streaming),
             timeout=timeout,
-            proxy=channel_proxy(alias, cfg, provider),
-            allow_redirects=False,
-        ) as upstream:
+            transport_policy=channel_transport_policy(alias, cfg, provider, url),
+            log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
+        ) as (upstream, account_attempt):
             content_type = (
                 upstream.headers.get("content-type", "")
                 .split(";", 1)[0]
@@ -1570,7 +1973,20 @@ async def _handle_transformed_messages(
                         f"{request.path} '{model_in}' -> {alias}/{model_out} "
                         f"{api_format} upstream {upstream.status}"
                     )
-                    return web.json_response(body, status=upstream.status)
+                    error_headers = {
+                        "x-hub-channel": alias,
+                        "x-hub-model": model_out,
+                        "x-hub-upstream-format": api_format,
+                        "x-hub-account": account_attempt.lease.member,
+                    }
+                    retry_after = upstream.headers.get("retry-after")
+                    if upstream.status == 429 and retry_after:
+                        error_headers["retry-after"] = retry_after
+                    return web.json_response(
+                        body,
+                        status=upstream.status,
+                        headers=error_headers,
+                    )
                 if not isinstance(decoded, dict):
                     raise ProtocolTransformError(
                         "upstream returned a non-object JSON response"
@@ -1582,6 +1998,7 @@ async def _handle_transformed_messages(
                     api_format,
                     body.get("usage") if isinstance(body, dict) else None,
                     instance_id=cfg.get("instance_id"),
+                    account_id=account_attempt.lease.member,
                 )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -1595,6 +2012,7 @@ async def _handle_transformed_messages(
                         "x-hub-channel": alias,
                         "x-hub-model": model_out,
                         "x-hub-upstream-format": api_format,
+                        "x-hub-account": account_attempt.lease.member,
                     },
                 )
 
@@ -1614,12 +2032,15 @@ async def _handle_transformed_messages(
                     "x-hub-channel": alias,
                     "x-hub-model": model_out,
                     "x-hub-upstream-format": api_format,
+                    "x-hub-account": account_attempt.lease.member,
                 },
             )
             await response.prepare(request)
             byte_count = 0
+            stream_telemetry = StreamTelemetry(started_at=started)
             try:
                 async for chunk in upstream.content.iter_any():
+                    stream_telemetry.observe(chunk)
                     for decoded_chunk in decoder.feed(chunk):
                         for event, event_data in parser.feed(decoded_chunk):
                             for translated in bridge.feed(event, event_data):
@@ -1628,10 +2049,6 @@ async def _handle_transformed_messages(
                         await asyncio.sleep(0)
                 decoder.finish()
                 parser.finish()
-                if not bridge.upstream_terminal:
-                    raise ProtocolTransformError(
-                        "upstream SSE ended without a terminal event"
-                    )
                 for translated in bridge.finish():
                     await response.write(translated)
                     byte_count += len(translated)
@@ -1647,6 +2064,7 @@ async def _handle_transformed_messages(
                         "cache_creation_input_tokens": bridge.cache_write,
                     },
                     instance_id=cfg.get("instance_id"),
+                    account_id=account_attempt.lease.member,
                 )
             except (
                 aiohttp.ClientError,
@@ -1661,7 +2079,13 @@ async def _handle_transformed_messages(
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
                     f"{api_format} stream failed after {byte_count}B: "
-                    f"{type(exc).__name__}"
+                    f"{type(exc).__name__} "
+                    + stream_telemetry_fields(
+                        stream_telemetry,
+                        terminal="error",
+                        error=type(exc).__name__,
+                        downstream_bytes=byte_count,
+                    )
                 )
                 transport = request.transport
                 if transport is not None:
@@ -1672,11 +2096,22 @@ async def _handle_transformed_messages(
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
                 f"{api_format} 200 stream {time.monotonic() - started:.1f}s "
-                f"{byte_count}B"
+                f"{byte_count}B "
+                + stream_telemetry_fields(
+                    stream_telemetry,
+                    terminal="complete",
+                    downstream_bytes=byte_count,
+                )
             )
             return response
     except UpstreamStreamAborted:
         raise
+    except AccountPoolError as exc:
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"ACCOUNT POOL FAIL: {type(exc).__name__}: {exc}"
+        )
+        return _account_pool_error(exc)
     except ProtocolTransformError as exc:
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -1736,6 +2171,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         UnicodeDecodeError,
         UnicodeEncodeError,
         ValueError,
+        RecursionError,
     ):
         return anthropic_error(400, "request body must be valid JSON")
     if not isinstance(payload, dict):
@@ -1748,6 +2184,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         providers = await asyncio.to_thread(get_providers)
         alias, model_out = route(model_in, cfg, providers)
         provider = resolve_provider(alias, cfg, providers)
+        account_pool = _RequestAccountPool(provider, providers)
     except RouteError as exc:
         log(f"{request.path} '{model_in}' -> ROUTE ERROR {exc.status}: {exc.message}")
         return anthropic_error(
@@ -1757,16 +2194,29 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         )
 
     payload["model"] = model_out
-    if provider.get("api_format", "anthropic") != "anthropic":
+    api_format = provider.get("api_format", "anthropic")
+    if is_count and (
+        api_format != "anthropic" or provider.get("is_full_url")
+    ):
+        estimate = _estimated_input_tokens(payload)
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"{api_format} locally estimated {estimate} tokens"
+        )
+        return web.json_response(
+            {"input_tokens": estimate},
+            headers={"x-hub-estimated": "1"},
+        )
+    if api_format != "anthropic":
         return await _handle_transformed_messages(
             request,
             cfg=cfg,
             provider=provider,
+            account_pool=account_pool,
             payload=payload,
             alias=alias,
             model_in=model_in,
             model_out=model_out,
-            is_count=is_count,
             started=started,
         )
     try:
@@ -1779,25 +2229,26 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         return anthropic_error(400, "request body contains unsupported JSON values")
 
     path_and_query = request.path_qs
-    url = provider["base_url"] + path_and_query
-    headers = upstream_headers(request, provider["token"])
-    ensure_1m_beta(headers, model_out)
-    proxy = channel_proxy(alias, cfg, provider)
-    session = request.app.get(UPSTREAM_SESSION_KEY)
-    if session is None:
-        # Kept for small fake-request fixtures that do not construct an aiohttp app.
-        session = request.app["session"]
+    url = _upstream_url(provider, path_and_query)
+    session = _upstream_session(request)
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
 
+    def headers_for_token(token: str) -> CIMultiDict:
+        headers = upstream_headers(request, token)
+        ensure_1m_beta(headers, model_out)
+        return headers
+
     try:
-        async with session.post(
-            url,
+        async with _post_with_account_failover(
+            session=session,
+            account_pool=account_pool,
+            url=url,
             data=data,
-            headers=headers,
+            headers_for_token=headers_for_token,
             timeout=timeout,
-            proxy=proxy,
-            allow_redirects=False,
-        ) as upstream:
+            transport_policy=channel_transport_policy(alias, cfg, provider, url),
+            log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
+        ) as (upstream, account_attempt):
             if is_count and upstream.status in (404, 405, 501):
                 estimate = max(
                     1,
@@ -1869,14 +2320,17 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     response.headers.add(key, value)
             response.headers["x-hub-channel"] = alias
             response.headers["x-hub-model"] = model_out
+            response.headers["x-hub-account"] = account_attempt.lease.member
             await response.prepare(request)
 
             byte_count = 0
+            stream_telemetry = StreamTelemetry(started_at=started)
             sse_tracker = _SSETerminalTracker() if streamed else None
             usage_tracker = _SSEUsageTracker() if streamed else None
             json_buf = bytearray() if not streamed and upstream.status == 200 else None
             try:
                 async for chunk in upstream.content.iter_any():
+                    stream_telemetry.observe(chunk)
                     if sse_tracker is not None:
                         for decoded in sse_decoder.feed(chunk):
                             sse_tracker.feed(decoded)
@@ -1900,7 +2354,13 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
                     f"upstream broke or was invalid after {byte_count}B: "
-                    f"{type(exc).__name__}"
+                    f"{type(exc).__name__} "
+                    + stream_telemetry_fields(
+                        stream_telemetry,
+                        terminal="error",
+                        error=type(exc).__name__,
+                        downstream_bytes=byte_count,
+                    )
                 )
                 transport = request.transport
                 if transport is not None:
@@ -1913,7 +2373,12 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
                     f"upstream SSE ended without a valid terminal event after "
-                    f"{byte_count}B"
+                    f"{byte_count}B "
+                    + stream_telemetry_fields(
+                        stream_telemetry,
+                        terminal="missing",
+                        downstream_bytes=byte_count,
+                    )
                 )
                 transport = request.transport
                 if transport is not None:
@@ -1930,6 +2395,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     "anthropic",
                     usage_tracker.usage,
                     instance_id=cfg.get("instance_id"),
+                    account_id=account_attempt.lease.member,
                 )
             elif json_buf is not None:
                 record_usage(
@@ -1938,13 +2404,30 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                     "anthropic",
                     _usage_from_json_bytes(json_buf),
                     instance_id=cfg.get("instance_id"),
+                    account_id=account_attempt.lease.member,
                 )
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
                 f"{upstream.status} {'stream' if streamed else 'json'} "
                 f"{time.monotonic() - started:.1f}s {byte_count}B"
+                + (
+                    " "
+                    + stream_telemetry_fields(
+                        stream_telemetry,
+                        terminal="complete",
+                        downstream_bytes=byte_count,
+                    )
+                    if streamed
+                    else ""
+                )
             )
             return response
+    except AccountPoolError as exc:
+        log(
+            f"{request.path} '{model_in}' -> {alias}/{model_out} "
+            f"ACCOUNT POOL FAIL: {type(exc).__name__}: {exc}"
+        )
+        return _account_pool_error(exc)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -2076,8 +2559,49 @@ def _upstream_ssl_context() -> ssl.SSLContext:
     return context
 
 
+def upstream_socket_factory(address_info: tuple) -> socket.socket:
+    """Create an upstream TCP socket with kernel keepalive enabled."""
+    family, socket_type, protocol, _canonical_name, _address = address_info
+    sock = socket.socket(family, socket_type, protocol)
+
+    def set_option(level: int, option: int, value: int) -> None:
+        try:
+            sock.setsockopt(level, option, value)
+        except OSError:
+            # Keepalive tuning varies across kernels and container runtimes.
+            # A missing option must not make the gateway unable to connect.
+            pass
+
+    set_option(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    idle_option = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+        socket, "TCP_KEEPALIVE", None
+    )
+    if idle_option is not None:
+        set_option(
+            socket.IPPROTO_TCP,
+            idle_option,
+            UPSTREAM_KEEPALIVE_IDLE_SECONDS,
+        )
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        set_option(
+            socket.IPPROTO_TCP,
+            socket.TCP_KEEPINTVL,
+            UPSTREAM_KEEPALIVE_INTERVAL_SECONDS,
+        )
+    if hasattr(socket, "TCP_KEEPCNT"):
+        set_option(
+            socket.IPPROTO_TCP,
+            socket.TCP_KEEPCNT,
+            UPSTREAM_KEEPALIVE_PROBES,
+        )
+    return sock
+
+
 def _upstream_connector() -> aiohttp.TCPConnector:
-    return aiohttp.TCPConnector(ssl=_upstream_ssl_context())
+    return aiohttp.TCPConnector(
+        ssl=_upstream_ssl_context(),
+        socket_factory=upstream_socket_factory,
+    )
 
 
 async def _client_session_context(app: web.Application):
@@ -2108,6 +2632,28 @@ def create_app() -> web.Application:
     return app
 
 
+def _inherited_loopback_listener(cfg: dict) -> socket.socket | None:
+    raw_fd = os.environ.get(ENV_LISTEN_FD)
+    if raw_fd is None:
+        return None
+    try:
+        listener = socket.socket(fileno=int(raw_fd))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"{ENV_LISTEN_FD} is invalid") from exc
+    address = listener.getsockname()
+    if (
+        listener.family != socket.AF_INET
+        or address[:2] != ("127.0.0.1", cfg["port"])
+    ):
+        listener.close()
+        raise ConfigError(
+            f"{ENV_LISTEN_FD} must be a listening socket for "
+            f"127.0.0.1:{cfg['port']}"
+        )
+    listener.setblocking(False)
+    return listener
+
+
 async def run_server(fg: bool) -> None:
     global _log_stderr
     _log_stderr = fg
@@ -2115,16 +2661,21 @@ async def run_server(fg: bool) -> None:
     cfg = get_config()
     # Fail before binding when the credential-bearing DB is unreadable or unsafe.
     get_providers()
+    listener = _inherited_loopback_listener(cfg)
     app = create_app()
 
     runner = web.AppRunner(app, access_log=None)
     try:
         await runner.setup()
         try:
-            site = web.TCPSite(runner, "127.0.0.1", cfg["port"])
+            site = (
+                web.SockSite(runner, listener)
+                if listener is not None
+                else web.TCPSite(runner, "127.0.0.1", cfg["port"])
+            )
             await site.start()
         except OSError as exc:
-            log(f"FATAL: cannot bind 127.0.0.1:{cfg['port']}: {exc}")
+            log(f"FATAL: cannot listen on 127.0.0.1:{cfg['port']}: {exc}")
             raise
 
         log(
@@ -2136,6 +2687,8 @@ async def run_server(fg: bool) -> None:
             await asyncio.sleep(3600)
     finally:
         await runner.cleanup()
+        if listener is not None:
+            listener.close()
 
 
 # ---------------------------------------------------------------- CLI
@@ -2260,6 +2813,12 @@ def cli_doctor() -> int:
                     )
                 except RouteError:
                     problems.append("upstream policy invalid")
+                else:
+                    api_format = channel.get("api_format") or provider.get(
+                        "api_format", "anthropic"
+                    )
+                    if not _full_endpoint_matches_format(provider, api_format):
+                        problems.append("full endpoint format mismatch")
             if problems:
                 report("FAIL", f"channel '{alias}': {', '.join(problems)}")
             else:
@@ -2291,24 +2850,36 @@ async def cli_check(target: str | None) -> None:
             if channel.get("models")
             else "claude-sonnet-4"
         )
-        headers = {
-            "authorization": f"Bearer {provider['token']}",
-            "x-api-key": provider["token"],
-            "anthropic-version": "2023-06-01",
-            "user-agent": "claude-cli/2.1.0 (external, cli)",
-            "x-app": "cli",
-            "anthropic-beta": "claude-code-20250219",
+        probe = {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
         }
-        ensure_1m_beta(headers, model)
+        api_format = provider.get("api_format", "anthropic")
+        endpoint, upstream_payload = transform_request(
+            probe,
+            api_format,
+            provider_type=provider.get("provider_type"),
+        )
+        if api_format == "anthropic":
+            headers = CIMultiDict(
+                {
+                    "authorization": f"Bearer {provider['token']}",
+                    "x-api-key": provider["token"],
+                    "anthropic-version": "2023-06-01",
+                    "user-agent": "claude-cli/2.1.0 (external, cli)",
+                    "x-app": "cli",
+                    "anthropic-beta": "claude-code-20250219",
+                }
+            )
+            ensure_1m_beta(headers, model)
+        else:
+            headers = _transformed_headers(provider["token"], False)
         started = time.monotonic()
         try:
             async with session.post(
-                provider["base_url"] + "/v1/messages",
-                json={
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "hi"}],
-                },
+                _upstream_url(provider, endpoint),
+                json=upstream_payload,
                 headers=headers,
                 proxy=channel_proxy(alias, cfg, provider),
                 timeout=aiohttp.ClientTimeout(total=30),

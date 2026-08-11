@@ -220,7 +220,13 @@ class HubCatalogTests(unittest.TestCase):
             Path("/private/state/hubs/work.json"),
         )
 
-        for unsafe in ("/tmp/work.json", "../work.json", "hubs/../../work.json", "C:\\tmp\\work.json"):
+        for unsafe in (
+            "/tmp/work.json",
+            "../work.json",
+            "hubs/../../work.json",
+            "C:\\tmp\\work.json",
+            "C:work.json",
+        ):
             with self.subTest(unsafe=unsafe):
                 with self.assertRaises(ValueError):
                     catalog.resolve_catalog_path(catalog_path, unsafe)
@@ -277,6 +283,14 @@ class HubCatalogTests(unittest.TestCase):
                 "default_hub": "Work Hub",
                 "order": ["Work Hub"],
                 "hubs": {"Work Hub": valid["hubs"]["work"]},
+            }
+        )
+        invalid_catalogs.append(
+            {
+                **valid,
+                "default_hub": "hub-",
+                "order": ["hub-"],
+                "hubs": {"hub-": valid["hubs"]["work"]},
             }
         )
 
