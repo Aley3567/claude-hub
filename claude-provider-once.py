@@ -5202,11 +5202,26 @@ def _bridge_child_env(
     return child
 
 
+def _bridge_log_tail(log_path: Path, limit: int = 4096) -> str:
+    """Return a bounded tail of the transient bridge log for error messages."""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            tail = handle.read(limit).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    return f"，日志尾部: {tail}" if tail else ""
+
+
 def launch_with_protocol_bridge(
     provider: dict,
     settings: dict,
     api_format: str,
     claude_args: list[str],
+    *,
+    backend_kind: str = "provider",
 ) -> int:
     """Run one isolated Hub for a non-Anthropic provider, then remove it.
 
@@ -5214,10 +5229,17 @@ def launch_with_protocol_bridge(
     provider and its shared proxy are never changed, so concurrent sessions can
     select different wire formats safely.
     """
+    if os.name != "posix":
+        raise RuntimeError(
+            "协议桥依赖 pass_fds 传递监听套接字，"
+            f"仅支持 POSIX 平台（当前: {os.name}）"
+        )
     if not HUB_SCRIPT.is_file():
         raise RuntimeError(
             f"{api_format} 渠道需要协议桥，但 Hub 脚本不存在: {HUB_SCRIPT}"
         )
+    # 与 anthropic 直连分支一致：provider 若走本地网关，先确保网关可用。
+    ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
     if TEMP_DIR is not None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -5240,6 +5262,8 @@ def launch_with_protocol_bridge(
                     "provider": f"id:{provider['id']}",
                     "api_format": api_format,
                     "models": _provider_models(settings),
+                    # 隔离单渠道桥:Claude Code 内置默认模型名透传到 default channel。
+                    "route_unknown_to_default": True,
                 }
             },
         }
@@ -5268,13 +5292,16 @@ def launch_with_protocol_bridge(
                     if return_code is not None:
                         raise RuntimeError(
                             f"协议桥提前退出（状态 {return_code}），"
-                            f"日志: {log_path}"
+                            f"日志: {log_path}{_bridge_log_tail(log_path)}"
                         )
                     time.sleep(
                         min(0.25, max(0.0, deadline - time.monotonic()))
                     )
                 else:
-                    raise RuntimeError(f"协议桥启动超时，日志: {log_path}")
+                    raise RuntimeError(
+                        f"协议桥启动超时，日志: {log_path}"
+                        f"{_bridge_log_tail(log_path)}"
+                    )
 
                 # The child now accepts on the inherited descriptor; retaining
                 # the parent duplicate would mask an unexpected child exit.
@@ -5290,6 +5317,9 @@ def launch_with_protocol_bridge(
                     f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
                     f"(隔离端口 {port})"
                 )
+                # 桥已确认可用、即将真正启动时才计数，失败启动不入账。
+                record_use(str(provider["id"]))
+                record_backend(backend_kind, provider["name"])
                 return launch_with_settings(bridged, claude_args)
             finally:
                 _stop_spawned_process(process)
@@ -6349,8 +6379,6 @@ def launch_provider(
     if api_format == "anthropic":
         settings, account_label = apply_native_account_pool(selected, settings)
     add_anyrouter_observer(settings, selected["name"])
-    record_use(str(selected["id"]))
-    record_backend(backend_kind, selected["name"])
     if backend_kind == "current":
         print(f"[claude1] 本次使用 CC Switch 当前 provider: {selected['name']}")
     else:
@@ -6363,8 +6391,12 @@ def launch_provider(
             settings,
             api_format,
             claude_args,
+            backend_kind=backend_kind,
         )
     ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
+    # 启动前置检查全部通过、即将真正启动时才计数，失败启动不入账。
+    record_use(str(selected["id"]))
+    record_backend(backend_kind, selected["name"])
     return launch_with_settings(settings, claude_args)
 
 

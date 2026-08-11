@@ -47,6 +47,7 @@ from claude1_protocol import (
     prepare_request,
     prepare_response,
     provider_api_format,
+    sse_event,
     transform_error,
     transform_request,
     transform_response,
@@ -565,11 +566,18 @@ def validate_config(raw: object) -> dict:
         if not isinstance(allow_insecure, bool):
             raise ConfigError(f"channels.{alias}.allow_insecure_http must be a boolean")
 
+        route_unknown = channel_raw.get("route_unknown_to_default", False)
+        if not isinstance(route_unknown, bool):
+            raise ConfigError(
+                f"channels.{alias}.route_unknown_to_default must be a boolean"
+            )
+
         channel = {
             "provider": provider,
             "provider_base_url": provider_base_url,
             "models": [model.strip() for model in models_raw],
             "allow_insecure_http": allow_insecure,
+            "route_unknown_to_default": route_unknown,
         }
         api_format = channel_raw.get("api_format")
         if api_format is not None:
@@ -996,6 +1004,10 @@ def route(
             mapped = provider["model_map"].get(tier)
             if model_lower == tier and mapped:
                 return alias, mapped
+    if channel.get("route_unknown_to_default"):
+        # Explicit opt-in for isolated single-channel protocol bridges:
+        # unlisted models are forwarded to the default channel unchanged.
+        return alias, model
     raise RouteError(
         400,
         f"unknown model '{model}'; use channel,model or a configured model slot",
@@ -1872,6 +1884,145 @@ def _append_bounded_json_buffer(
     return buffer
 
 
+def _synthesize_message_stream(body: dict, plan: object) -> bytes:
+    """Render one complete Anthropic message as a one-shot SSE stream."""
+    content = body.get("content")
+    if not isinstance(content, list):
+        raise ProtocolTransformError(
+            "upstream message content must be an array",
+            code="HUB_UPSTREAM_RESPONSE_INVALID",
+        )
+    usage, _source = _usage_for_recording(body.get("usage"), plan)
+    message = {
+        "id": body.get("id"),
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": body.get("model"),
+        "stop_reason": None,
+        "stop_sequence": None,
+    }
+    if usage:
+        # Only counters actually observed upstream are emitted; placeholders
+        # without provenance were removed by _usage_for_recording.
+        message["usage"] = usage
+    events = [
+        sse_event("message_start", {"type": "message_start", "message": message})
+    ]
+    for index, block in enumerate(content):
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            raise ProtocolTransformError(
+                "upstream message content blocks must be typed objects",
+                code="HUB_UPSTREAM_RESPONSE_INVALID",
+            )
+        kind = block["type"]
+        if kind == "text":
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise ProtocolTransformError(
+                    "upstream text block text must be a string",
+                    code="HUB_UPSTREAM_RESPONSE_INVALID",
+                )
+            start_block = {"type": "text", "text": ""}
+            deltas = [{"type": "text_delta", "text": text}]
+        elif kind == "thinking":
+            thinking = block.get("thinking")
+            if not isinstance(thinking, str):
+                raise ProtocolTransformError(
+                    "upstream thinking block text must be a string",
+                    code="HUB_UPSTREAM_RESPONSE_INVALID",
+                )
+            start_block = {"type": "thinking", "thinking": ""}
+            deltas = [{"type": "thinking_delta", "thinking": thinking}]
+            signature = block.get("signature")
+            if signature is not None:
+                if not isinstance(signature, str):
+                    raise ProtocolTransformError(
+                        "upstream thinking block signature must be a string",
+                        code="HUB_UPSTREAM_RESPONSE_INVALID",
+                    )
+                deltas.append(
+                    {"type": "signature_delta", "signature": signature}
+                )
+        elif kind == "tool_use":
+            tool_input = block.get("input")
+            if not isinstance(tool_input, dict):
+                raise ProtocolTransformError(
+                    "upstream tool_use block input must be an object",
+                    code="HUB_UPSTREAM_RESPONSE_INVALID",
+                )
+            try:
+                partial_json = json.dumps(
+                    tool_input,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ProtocolTransformError(
+                    "upstream tool_use block input is not JSON serializable",
+                    code="HUB_UPSTREAM_RESPONSE_INVALID",
+                ) from exc
+            start_block = {
+                "type": "tool_use",
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input": {},
+            }
+            deltas = [
+                {"type": "input_json_delta", "partial_json": partial_json}
+            ]
+        else:
+            # Blocks without a delta encoding (redacted_thinking, future
+            # server-side blocks) are delivered whole so nothing is dropped.
+            start_block = dict(block)
+            deltas = []
+        events.append(
+            sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": start_block,
+                },
+            )
+        )
+        for delta in deltas:
+            events.append(
+                sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": delta,
+                    },
+                )
+            )
+        events.append(
+            sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": index},
+            )
+        )
+    message_delta = {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": body.get("stop_reason"),
+            "stop_sequence": body.get("stop_sequence"),
+        },
+    }
+    trailing_usage = {
+        key: usage[key]
+        for key in ("output_tokens", "cache_creation", "server_tool_use")
+        if key in usage
+    }
+    if trailing_usage:
+        message_delta["usage"] = trailing_usage
+    events.append(sse_event("message_delta", message_delta))
+    events.append(sse_event("message_stop", {"type": "message_stop"}))
+    return b"".join(events)
+
+
 async def _handle_transformed_messages(
     request: web.Request,
     *,
@@ -1958,6 +2109,10 @@ async def _handle_transformed_messages(
                         "x-hub-upstream-format": api_format,
                         "x-hub-account": account_attempt.lease.member,
                     }
+                    if request_warning_codes:
+                        error_headers["x-hub-protocol-warnings"] = ",".join(
+                            request_warning_codes
+                        )
                     retry_after = upstream.headers.get("retry-after")
                     if upstream.status == 429 and retry_after:
                         error_headers["retry-after"] = retry_after
@@ -2004,6 +2159,19 @@ async def _handle_transformed_messages(
                 if warning_codes:
                     response_headers["x-hub-protocol-warnings"] = ",".join(
                         warning_codes
+                    )
+                if streaming:
+                    # The client asked for a stream but the upstream answered
+                    # with a complete JSON message; synthesize the one-shot
+                    # Anthropic SSE sequence Claude Code expects.
+                    response_headers["cache-control"] = "no-cache"
+                    return web.Response(
+                        body=_synthesize_message_stream(
+                            body, prepared_response.plan
+                        ),
+                        status=upstream.status,
+                        content_type="text/event-stream",
+                        headers=response_headers,
                     )
                 return web.json_response(
                     body,
@@ -2205,6 +2373,11 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
 
     payload["model"] = model_out
     api_format = provider.get("api_format", "anthropic")
+    if provider.get("is_full_url") and request.query_string:
+        return anthropic_error(
+            400,
+            "full-url channels do not accept a request query string",
+        )
     protocol_warning_codes: tuple[str, ...] = ()
     if api_format == "anthropic":
         try:
@@ -2225,6 +2398,21 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
     if is_count and (
         api_format != "anthropic" or provider.get("is_full_url")
     ):
+        if api_format != "anthropic":
+            # Estimation shares the messages-path inbound validation so a
+            # malformed payload is rejected instead of estimated.
+            try:
+                prepare_request(
+                    payload,
+                    api_format,
+                    provider_type=provider.get("provider_type"),
+                )
+            except ProtocolRequestError as exc:
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    f"REQUEST REJECT {exc.code} {exc.path or '$'}"
+                )
+                return protocol_request_error(exc)
         estimate = _estimated_input_tokens(payload)
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -2232,7 +2420,11 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         )
         return web.json_response(
             {"input_tokens": estimate},
-            headers=_token_count_estimate_headers(),
+            headers={
+                "x-hub-channel": alias,
+                "x-hub-model": model_out,
+                **_token_count_estimate_headers(),
+            },
         )
     if api_format != "anthropic":
         return await _handle_transformed_messages(
@@ -2285,7 +2477,11 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                 )
                 return web.json_response(
                     {"input_tokens": estimate},
-                    headers=_token_count_estimate_headers(),
+                    headers={
+                        "x-hub-channel": alias,
+                        "x-hub-model": model_out,
+                        **_token_count_estimate_headers(),
+                    },
                 )
 
             response_connection_tokens = _connection_header_tokens(

@@ -924,8 +924,10 @@ def _validate_tool_result_causality(messages: object) -> None:
         # messages array. Both OpenAI request formats support that role, while
         # tool causality still remains restricted to assistant/user below.
         if role not in {"system", "user", "assistant"}:
-            raise ProtocolTransformError(
-                f"message roles must be system, user, or assistant, got {role!r}"
+            raise ProtocolRequestError(
+                f"message roles must be system, user, or assistant, got {role!r}",
+                code="HUB_INVALID_TOOL_CAUSALITY",
+                path="$.messages[].role",
             )
         content = message.get("content")
         if not isinstance(content, list):
@@ -936,19 +938,25 @@ def _validate_tool_result_causality(messages: object) -> None:
             kind = block.get("type")
             if kind == "tool_use":
                 if role != "assistant":
-                    raise ProtocolTransformError(
-                        "tool_use blocks require the assistant role"
+                    raise ProtocolRequestError(
+                        "tool_use blocks require the assistant role",
+                        code="HUB_INVALID_TOOL_CAUSALITY",
+                        path="$.messages[].content[]",
                     )
                 call_id = block.get("id")
                 if not isinstance(call_id, str) or not call_id or call_id in declared:
-                    raise ProtocolTransformError(
-                        "tool_use ids must be non-empty and unique"
+                    raise ProtocolRequestError(
+                        "tool_use ids must be non-empty and unique",
+                        code="HUB_INVALID_TOOL_CAUSALITY",
+                        path="$.messages[].content[].id",
                     )
                 declared.add(call_id)
             elif kind == "tool_result":
                 if role != "user":
-                    raise ProtocolTransformError(
-                        "tool_result blocks require the user role"
+                    raise ProtocolRequestError(
+                        "tool_result blocks require the user role",
+                        code="HUB_INVALID_TOOL_CAUSALITY",
+                        path="$.messages[].content[]",
                     )
                 call_id = block.get("tool_use_id")
                 if (
@@ -956,8 +964,10 @@ def _validate_tool_result_causality(messages: object) -> None:
                     or call_id not in declared
                     or call_id in consumed
                 ):
-                    raise ProtocolTransformError(
-                        "tool_result must reference one earlier unconsumed tool_use"
+                    raise ProtocolRequestError(
+                        "tool_result must reference one earlier unconsumed tool_use",
+                        code="HUB_INVALID_TOOL_CAUSALITY",
+                        path="$.messages[].content[].tool_use_id",
                     )
                 consumed.add(call_id)
 
@@ -968,6 +978,11 @@ def anthropic_to_chat(
     plan: ConversionPlan | None = None,
     compatibility_mode: str = "visible_lossy",
 ) -> dict:
+    """Internal request adapter; call only via ``prepare_request``.
+
+    The payload must already have passed request-IR validation; calling this
+    directly skips the fail-closed request checks.
+    """
     _validate_tool_result_causality(payload.get("messages"))
     result: dict = {"model": payload.get("model"), "messages": []}
     system = _system_text(payload.get("system"))
@@ -1530,6 +1545,11 @@ def anthropic_to_responses(
     plan: ConversionPlan | None = None,
     compatibility_mode: str = "visible_lossy",
 ) -> dict:
+    """Internal request adapter; call only via ``prepare_request``.
+
+    The payload must already have passed request-IR validation; calling this
+    directly skips the fail-closed request checks.
+    """
     _validate_tool_result_causality(payload.get("messages"))
     result: dict = {
         "model": payload.get("model"),
@@ -2256,6 +2276,12 @@ def _parse_request_ir(
         if content_was_string:
             raw_blocks: list[object] = [{"type": "text", "text": content}]
         elif isinstance(content, list):
+            if not content:
+                raise ProtocolRequestError(
+                    "message content must contain at least one block",
+                    code="HUB_INVALID_CONTENT_BLOCK",
+                    path=f"{message_path}.content",
+                )
             raw_blocks = content
         else:
             raise ProtocolRequestError(
@@ -2834,6 +2860,25 @@ def _response_base_usage(
     return raw, values[0], values[1]
 
 
+def _input_tokens_excluding_cache_read(
+    raw_usage: dict,
+    input_key: str,
+    input_tokens: int,
+    cache_read: object,
+) -> int:
+    """OpenAI base input counters include cached tokens; Anthropic's do not."""
+    if input_key not in raw_usage or not isinstance(cache_read, int):
+        return input_tokens
+    adjusted = input_tokens - cache_read
+    if adjusted < 0:
+        raise ProtocolTransformError(
+            "upstream input usage is smaller than its cache-read counter",
+            code="HUB_UPSTREAM_USAGE_INVALID",
+            path=f"$.usage.{input_key}",
+        )
+    return adjusted
+
+
 def _usage_detail(
     raw_usage: dict,
     key: str,
@@ -2871,8 +2916,13 @@ def _validate_cache_creation_consistency(
     total: object,
     detail: object,
 ) -> None:
-    if total is _MISSING or total is None or detail is _MISSING or detail is None:
+    if detail is _MISSING or detail is None:
         return
+    if total is _MISSING or total is None:
+        raise ProtocolTransformError(
+            "upstream cache-creation detail arrived without its total counter",
+            code="HUB_UPSTREAM_USAGE_INVALID",
+        )
     if not isinstance(total, int) or not isinstance(detail, dict):
         raise ProtocolTransformError(
             "upstream cache-creation usage has an invalid shape",
@@ -3370,6 +3420,7 @@ def chat_to_anthropic(
             code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
         )
     has_tool = False
+    seen_call_ids: set[str] = set()
     raw_tool_calls = message.get("tool_calls", [])
     if raw_tool_calls is None:
         raw_tool_calls = []
@@ -3434,6 +3485,13 @@ def chat_to_anthropic(
                 "OpenAI Chat tool calls require a non-empty id",
                 code="HUB_UPSTREAM_TOOL_CALL_INVALID",
             )
+        if call_id in seen_call_ids:
+            raise ProtocolTransformError(
+                "OpenAI Chat tool call ids must be unique",
+                code="HUB_UPSTREAM_TOOL_CALL_INVALID",
+                path=f"{call_path}.id",
+            )
+        seen_call_ids.add(call_id)
         if not isinstance(name, str) or not name:
             raise ProtocolTransformError(
                 "OpenAI Chat tool calls require a non-empty function name",
@@ -3464,9 +3522,14 @@ def chat_to_anthropic(
         plan=plan,
     )
     cache_read = _cache_read(raw_usage)
+    input_tokens = _input_tokens_excluding_cache_read(
+        raw_usage, "prompt_tokens", input_tokens, cache_read
+    )
     cache_write = _cache_write(raw_usage)
     cache_creation_detail = _cache_creation_detail(raw_usage)
     _validate_cache_creation_consistency(cache_write, cache_creation_detail)
+    if "model" not in body:
+        _record_response_metadata_degradation(plan, "$.model")
     return {
         "id": body.get("id") or f"msg_{uuid.uuid4().hex}",
         "type": "message",
@@ -3541,6 +3604,7 @@ def responses_to_anthropic(
             "OpenAI Responses output must be an array",
             code="HUB_UPSTREAM_RESPONSE_INVALID",
         )
+    seen_call_ids: set[str] = set()
     for item_index, item in enumerate(output):
         if not isinstance(item, dict):
             raise ProtocolTransformError(
@@ -3673,6 +3737,13 @@ def responses_to_anthropic(
                     "Responses function calls require a non-empty call id",
                     code="HUB_UPSTREAM_TOOL_CALL_INVALID",
                 )
+            if call_id in seen_call_ids:
+                raise ProtocolTransformError(
+                    "Responses function call ids must be unique",
+                    code="HUB_UPSTREAM_TOOL_CALL_INVALID",
+                    path=f"{item_path}.call_id",
+                )
+            seen_call_ids.add(call_id)
             if not isinstance(name, str) or not name:
                 raise ProtocolTransformError(
                     "Responses function calls require a non-empty name",
@@ -3796,9 +3867,14 @@ def responses_to_anthropic(
         plan=plan,
     )
     cache_read = _cache_read(raw_usage)
+    input_tokens = _input_tokens_excluding_cache_read(
+        raw_usage, "input_tokens", input_tokens, cache_read
+    )
     cache_write = _cache_write(raw_usage)
     cache_creation_detail = _cache_creation_detail(raw_usage)
     _validate_cache_creation_consistency(cache_write, cache_creation_detail)
+    if "model" not in body:
+        _record_response_metadata_degradation(plan, "$.model")
     return {
         "id": body.get("id") or f"msg_{uuid.uuid4().hex}",
         "type": "message",
@@ -3921,19 +3997,43 @@ def sse_event(event: str, payload: dict) -> bytes:
     ).encode()
 
 
+# Two consecutive line terminators (CRLF/LF/CR) end an SSE event.  The bare
+# CR alternative must not eat the CR of a CRLF pair, so it refuses a
+# following LF instead of relying on backtracking.
+_SSE_BOUNDARY = re.compile(br"(?:\r\n|\r(?!\n)|\n)(?:\r\n|\r(?!\n)|\n)")
+_SSE_BOM = b"\xef\xbb\xbf"
+
+
 class SSEParser:
     """Incrementally parse upstream SSE without assuming chunk boundaries."""
 
     def __init__(self, *, max_buffer: int = 2 * 1024 * 1024):
         self.buffer = bytearray()
         self.max_buffer = max_buffer
+        # Resume scanning where the previous feed stopped, so parsing stays
+        # O(n) for pathologically small chunks.
+        self._scan_offset = 0
+        self._at_stream_start = True
 
     def feed(self, chunk: bytes) -> list[tuple[str, str]]:
+        if self._at_stream_start:
+            self._at_stream_start = False
+            # A leading UTF-8 BOM is framing noise, not event content.
+            if chunk.startswith(_SSE_BOM):
+                chunk = chunk[len(_SSE_BOM) :]
         self.buffer.extend(chunk)
         events: list[tuple[str, str]] = []
         while True:
-            match = re.search(br"\r\n\r\n|\n\n|\r\r", self.buffer)
+            if self._scan_offset > self.max_buffer:
+                raise ProtocolTransformError(
+                    "upstream SSE event exceeds size limit",
+                    code="HUB_SSE_EVENT_TOO_LARGE",
+                )
+            match = _SSE_BOUNDARY.search(self.buffer, self._scan_offset)
             if match is None:
+                # A boundary may straddle the tail, so the next feed resumes
+                # three bytes back instead of rescanning the whole buffer.
+                self._scan_offset = max(0, len(self.buffer) - 3)
                 break
             if match.start() > self.max_buffer:
                 raise ProtocolTransformError(
@@ -3942,6 +4042,7 @@ class SSEParser:
                 )
             raw = bytes(self.buffer[: match.start()])
             del self.buffer[: match.end()]
+            self._scan_offset = 0
             event = "message"
             data: list[str] = []
             try:
@@ -3998,6 +4099,7 @@ MAX_STREAM_TOOL_ARGUMENT_BYTES = 2 * 1024 * 1024
 MAX_STREAM_TEXT_BYTES = 2 * 1024 * 1024
 MAX_STREAM_TEXT_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_STREAM_BLOCKS = 4096
+MAX_STREAM_ITEM_ID_CHARS = 1024
 
 _RESPONSES_SSE_EVENT_FIELDS = {
     "response.output_text.delta": {
@@ -4294,7 +4396,6 @@ class AnthropicStreamBridge:
         default_factory=dict
     )
     response_text_total_bytes: int = 0
-    response_tool_argument_deltas: set[int] = field(default_factory=set)
     response_tool_done_snapshots: dict[int, str] = field(default_factory=dict)
     tool_argument_fragments: dict[int, list[str]] = field(default_factory=dict)
     tool_argument_bytes: dict[int, int] = field(default_factory=dict)
@@ -4307,6 +4408,7 @@ class AnthropicStreamBridge:
     output_tokens: int = 0
     saw_input_usage: bool = False
     saw_output_usage: bool = False
+    late_input_usage: bool = False
     cache_read: int | None = None
     cache_write: int | None = None
     cache_creation_detail: dict[str, int] | None = None
@@ -4415,6 +4517,7 @@ class AnthropicStreamBridge:
         if first_observation:
             if attribute == "input_tokens" and self.started:
                 self._observe("HUB_DEGRADE_LATE_INPUT_USAGE")
+                self.late_input_usage = True
             setattr(self, flag, True)
 
     def _update_usage_detail(self, attribute: str, value: object) -> None:
@@ -4498,6 +4601,17 @@ class AnthropicStreamBridge:
             return []
         self.fsm.start_message()
         self.started = True
+        # Usage fields are only emitted when the upstream actually reported
+        # them; a fabricated zero would hide the unobserved state.
+        usage: dict = {}
+        if self.saw_input_usage:
+            usage["input_tokens"] = self.input_tokens
+        if self.saw_output_usage:
+            usage["output_tokens"] = self.output_tokens
+        if self.cache_read is not None:
+            usage["cache_read_input_tokens"] = self.cache_read
+        if self.cache_write is not None:
+            usage["cache_creation_input_tokens"] = self.cache_write
         return [
             sse_event(
                 "message_start",
@@ -4511,9 +4625,7 @@ class AnthropicStreamBridge:
                         "model": self.model,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": _usage(
-                            self.input_tokens, 0, self.cache_read, self.cache_write
-                        ),
+                        "usage": usage,
                     },
                 },
             )
@@ -4602,6 +4714,8 @@ class AnthropicStreamBridge:
         chunks: list[bytes] = []
         if self.thinking_index is None:
             chunks.extend(self._close_open_tools())
+            chunks.extend(self._close(self.text_index))
+            self.text_index = None
             self.thinking_index, opened = self._open(
                 "thinking", {"thinking": ""}
             )
@@ -5391,6 +5505,12 @@ class AnthropicStreamBridge:
                     path="$.item.encrypted_content",
                 )
             if prior_encrypted is None:
+                if len(self.response_redacted_snapshots) >= MAX_STREAM_BLOCKS:
+                    raise ProtocolTransformError(
+                        "stream tracked too many redacted reasoning snapshots",
+                        code="HUB_SSE_TOO_MANY_BLOCKS",
+                        path="$.item.encrypted_content",
+                    )
                 self.response_redacted_snapshots[redaction_key] = encrypted
                 chunks.extend(self._redacted_thinking(encrypted))
         if isinstance(summary, list):
@@ -5427,6 +5547,11 @@ class AnthropicStreamBridge:
                         path="$.item.id",
                     )
                 chunks.extend(self._response_reasoning_snapshot(key, text))
+                if state is not None:
+                    # See _response_message_item_snapshot: the terminal item
+                    # snapshot stands in for the omitted summary_part.done.
+                    state.open = False
+                    state.done_snapshot = text
         return chunks
 
     def _response_message_item_snapshot(
@@ -5536,6 +5661,11 @@ class AnthropicStreamBridge:
             chunks.extend(
                 self._response_text_snapshot((text_kind, *coordinates), text)
             )
+            if state is not None:
+                # A terminal item snapshot completes the part even when the
+                # upstream omitted the matching content_part.done event.
+                state.open = False
+                state.done_snapshot = text
             if part.get("annotations") or part.get("citations"):
                 self._observe("HUB_DEGRADE_CITATION_METADATA_DROPPED")
         return chunks
@@ -5570,6 +5700,12 @@ class AnthropicStreamBridge:
                 code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
                 path="$.item.id",
             )
+        if isinstance(item_id, str) and len(item_id) > MAX_STREAM_ITEM_ID_CHARS:
+            raise ProtocolTransformError(
+                "Responses output item id exceeds the length limit",
+                code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+                path="$.item.id",
+            )
         existing = self.response_output_items.get(output_index)
         if existing is not None:
             existing_type, existing_id = existing
@@ -5586,6 +5722,12 @@ class AnthropicStreamBridge:
             if existing_id is None and isinstance(item_id, str):
                 self.response_output_items[output_index] = (item_type, item_id)
         else:
+            if len(self.response_output_items) >= MAX_STREAM_BLOCKS:
+                raise ProtocolTransformError(
+                    "stream tracked too many response output items",
+                    code="HUB_SSE_TOO_MANY_BLOCKS",
+                    path="$.output_index",
+                )
             self.response_output_items[output_index] = (item_type, item_id)
         if isinstance(item_id, str):
             previous_index = self.response_output_item_ids.get(item_id)
@@ -5593,6 +5735,15 @@ class AnthropicStreamBridge:
                 raise ProtocolTransformError(
                     "Responses output item id moved to another output position",
                     code="HUB_SSE_DUPLICATE_CONFLICT",
+                    path="$.item.id",
+                )
+            if (
+                previous_index is None
+                and len(self.response_output_item_ids) >= MAX_STREAM_BLOCKS
+            ):
+                raise ProtocolTransformError(
+                    "stream tracked too many response output item ids",
+                    code="HUB_SSE_TOO_MANY_BLOCKS",
                     path="$.item.id",
                 )
             self.response_output_item_ids[item_id] = output_index
@@ -5993,7 +6144,6 @@ class AnthropicStreamBridge:
         if snapshot is None:
             snapshot = "".join(self.tool_argument_fragments.get(index, []))
         self.response_tool_done_snapshots[index] = snapshot
-        self.response_tool_argument_deltas.discard(index)
         self.anonymous_response_tool_keys.discard(key)
         return [*chunks, *self._close(index)]
 
@@ -6244,7 +6394,8 @@ class AnthropicStreamBridge:
         if self.upstream_terminal:
             if payload.get("choices") not in (None, []):
                 raise ProtocolTransformError(
-                    "upstream Chat emitted choices after finish_reason"
+                    "upstream Chat emitted choices after finish_reason",
+                    code="HUB_SSE_ORDER_VIOLATION",
                 )
             return []
         choices = payload.get("choices")
@@ -6444,7 +6595,8 @@ class AnthropicStreamBridge:
         if finish_reason is not None:
             if not isinstance(finish_reason, str) or not finish_reason:
                 raise ProtocolTransformError(
-                    "upstream Chat finish_reason must be a non-empty string or null"
+                    "upstream Chat finish_reason must be a non-empty string or null",
+                    code="HUB_UPSTREAM_STOP_REASON_UNMAPPABLE",
                 )
             self.upstream_terminal = True
             self.stop = _stop_reason(
@@ -6495,7 +6647,7 @@ class AnthropicStreamBridge:
                 self.refused = True
             key = self._response_text_event_key(text_kind, payload)
             text_key = "text" if text_kind == "response.output_text" else "refusal"
-            text = payload.get(text_key, payload.get("delta"))
+            text = payload.get(text_key)
             if not isinstance(text, str):
                 raise ProtocolTransformError(
                     "Responses text done snapshot must be a string",
@@ -6590,7 +6742,6 @@ class AnthropicStreamBridge:
                     output_index=output_index,
                 )
                 if arguments:
-                    self.response_tool_argument_deltas.add(index)
                     chunks.extend(self._tool_delta(key, arguments))
                 return chunks
             self._validate_response_output_item_added(item)
@@ -6603,7 +6754,6 @@ class AnthropicStreamBridge:
         if kind == "response.function_call_arguments.delta":
             key = self._response_tool_argument_key(payload)
             index = self.tool_indices[key]
-            self.response_tool_argument_deltas.add(index)
             delta = payload.get("delta", _MISSING)
             if not isinstance(delta, str):
                 raise ProtocolTransformError(
@@ -6626,7 +6776,6 @@ class AnthropicStreamBridge:
             if arguments:
                 chunks.extend(self._tool_snapshot(key, arguments))
             self.response_tool_done_snapshots[index] = arguments
-            self.response_tool_argument_deltas.discard(index)
             self.anonymous_response_tool_keys.discard(key)
             return [*chunks, *self._close(index)]
         if kind == "response.output_item.done":
@@ -6784,7 +6933,14 @@ class AnthropicStreamBridge:
         chunks: list[bytes] = [*self._start()]
         for index in sorted(self.open_indices):
             chunks.extend(self._close(index))
-        final_usage: dict = {"output_tokens": self.output_tokens}
+        final_usage: dict = {}
+        if self.saw_output_usage:
+            final_usage["output_tokens"] = self.output_tokens
+        if self.late_input_usage:
+            # Input usage arrived after message_start; message_delta can
+            # still carry it truthfully, and the late arrival stays
+            # observable via HUB_DEGRADE_LATE_INPUT_USAGE.
+            final_usage["input_tokens"] = self.input_tokens
         if self.cache_read is not None:
             final_usage["cache_read_input_tokens"] = self.cache_read
         if self.cache_write is not None:

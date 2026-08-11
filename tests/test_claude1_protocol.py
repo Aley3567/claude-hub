@@ -142,8 +142,13 @@ class RequestTransformTests(unittest.TestCase):
         for api_format in ("openai_chat", "openai_responses"):
             for kind, payload in (("orphan", orphan), ("duplicate", duplicate)):
                 with self.subTest(api_format=api_format, kind=kind):
-                    with self.assertRaises(protocol.ProtocolTransformError):
+                    with self.assertRaises(protocol.ProtocolRequestError) as caught:
                         protocol.transform_request(payload, api_format)
+                    exc = caught.exception
+                    self.assertEqual(exc.code, "HUB_INVALID_TOOL_CAUSALITY")
+                    self.assertEqual(exc.http_status, 400)
+                    self.assertEqual(exc.phase, "request")
+                    self.assertTrue(exc.path)
 
     def test_chat_request_preserves_tools_and_tool_results(self) -> None:
         endpoint, body = protocol.transform_request(
@@ -196,6 +201,20 @@ class RequestTransformTests(unittest.TestCase):
         self.assertEqual(body["messages"][2]["role"], "tool")
         parameters = body["tools"][0]["function"]["parameters"]
         self.assertNotIn("format", parameters["properties"]["url"])
+
+    def test_empty_content_arrays_fail_closed_for_both_formats(self) -> None:
+        payload = {
+            "model": "empty-content-model",
+            "messages": [{"role": "user", "content": []}],
+        }
+        for api_format in ("openai_chat", "openai_responses"):
+            with self.subTest(api_format=api_format):
+                with self.assertRaises(protocol.ProtocolRequestError) as caught:
+                    protocol.transform_request(payload, api_format)
+                exc = caught.exception
+                self.assertEqual(exc.code, "HUB_INVALID_CONTENT_BLOCK")
+                self.assertEqual(exc.http_status, 400)
+                self.assertEqual(exc.path, "$.messages[0].content")
 
     def test_url_images_are_preserved_for_chat_and_responses(self) -> None:
         payload = {
@@ -621,6 +640,85 @@ class StreamingTransformTests(unittest.TestCase):
                     "HUB_SSE_ORDER_VIOLATION",
                 )
 
+    def _feed_responses_item(self, bridge, event: str, payload: dict) -> None:
+        bridge.feed(event, json.dumps({"type": event, **payload}))
+
+    def test_response_output_item_registries_are_bounded(self) -> None:
+        item = {
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        }
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        for index in range(protocol.MAX_STREAM_BLOCKS):
+            bridge.response_output_items[str(index)] = ("message", None)
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            self._feed_responses_item(
+                bridge,
+                "response.output_item.added",
+                {"output_index": protocol.MAX_STREAM_BLOCKS, "item": item},
+            )
+        self.assertEqual(raised.exception.code, "HUB_SSE_TOO_MANY_BLOCKS")
+        self.assertEqual(raised.exception.path, "$.output_index")
+
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        for index in range(protocol.MAX_STREAM_BLOCKS):
+            bridge.response_output_item_ids[f"item_{index}"] = str(index)
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            self._feed_responses_item(
+                bridge,
+                "response.output_item.added",
+                {
+                    "output_index": 0,
+                    "item": {**item, "id": "item_overflow"},
+                },
+            )
+        self.assertEqual(raised.exception.code, "HUB_SSE_TOO_MANY_BLOCKS")
+        self.assertEqual(raised.exception.path, "$.item.id")
+
+    def test_response_output_item_id_length_is_bounded(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            self._feed_responses_item(
+                bridge,
+                "response.output_item.added",
+                {
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "x" * (protocol.MAX_STREAM_ITEM_ID_CHARS + 1),
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                },
+            )
+        self.assertEqual(
+            raised.exception.code, "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED"
+        )
+        self.assertEqual(raised.exception.path, "$.item.id")
+
+    def test_response_redacted_snapshots_are_bounded(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_responses")
+        for index in range(protocol.MAX_STREAM_BLOCKS):
+            bridge.response_redacted_snapshots[f"output:prefill_{index}"] = "enc"
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            self._feed_responses_item(
+                bridge,
+                "response.output_item.done",
+                {
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "encrypted-snapshot",
+                    },
+                },
+            )
+        self.assertEqual(raised.exception.code, "HUB_SSE_TOO_MANY_BLOCKS")
+        self.assertEqual(raised.exception.path, "$.item.encrypted_content")
+
     def test_chat_stream_rejects_a_nonzero_choice_index(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_chat")
         with self.assertRaises(protocol.ProtocolTransformError) as raised:
@@ -904,7 +1002,7 @@ class StreamingTransformTests(unittest.TestCase):
         self.assertEqual((bridge.input_tokens, bridge.output_tokens), (13, 5))
         with self.assertRaisesRegex(
             protocol.ProtocolTransformError, "after finish_reason"
-        ):
+        ) as raised:
             bridge.feed(
                 "message",
                 json.dumps(
@@ -918,6 +1016,7 @@ class StreamingTransformTests(unittest.TestCase):
                     }
                 ),
             )
+        self.assertEqual(raised.exception.code, "HUB_SSE_ORDER_VIOLATION")
         terminal = b"".join(bridge.finish())
         self.assertIn(b'"output_tokens":5', terminal)
 
@@ -926,7 +1025,7 @@ class StreamingTransformTests(unittest.TestCase):
             bridge = protocol.AnthropicStreamBridge("openai_chat")
             with self.subTest(finish_reason=finish_reason), self.assertRaisesRegex(
                 protocol.ProtocolTransformError, "finish_reason"
-            ):
+            ) as raised:
                 bridge.feed(
                     "message",
                     json.dumps(
@@ -937,6 +1036,9 @@ class StreamingTransformTests(unittest.TestCase):
                         }
                     ),
                 )
+            self.assertEqual(
+                raised.exception.code, "HUB_UPSTREAM_STOP_REASON_UNMAPPABLE"
+            )
 
     def test_chat_text_starts_after_reasoning_block_stops(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_chat")

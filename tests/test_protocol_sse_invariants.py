@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 import unittest
 from pathlib import Path
 
@@ -214,6 +215,252 @@ class SSEParserContractTests(unittest.TestCase):
                         b"".join(protocol.translate_sse_chunks(api_format, chunks)),
                         reference,
                     )
+
+    def test_parser_accepts_mixed_line_ending_boundaries(self) -> None:
+        wire = b"data: one\n\r\ndata: two\r\rdata: three\r\n\r\ndata: four\n\n"
+        self.assertEqual(
+            protocol.SSEParser().feed(wire),
+            [
+                ("message", "one"),
+                ("message", "two"),
+                ("message", "three"),
+                ("message", "four"),
+            ],
+        )
+
+    def test_parser_strips_a_single_leading_utf8_bom(self) -> None:
+        self.assertEqual(
+            protocol.SSEParser().feed(b"\xef\xbb\xbfdata: hello\n\n"),
+            [("message", "hello")],
+        )
+        parser = protocol.SSEParser()
+        events = parser.feed(b"\xef\xbb\xbfdata: he")
+        events.extend(parser.feed(b"llo\n\n"))
+        parser.finish()
+        self.assertEqual(events, [("message", "hello")])
+        # A BOM after the first feed is event content, not framing noise.
+        parser = protocol.SSEParser()
+        events = parser.feed(b"data: x")
+        events.extend(parser.feed(b"\xef\xbb\xbf\n\n"))
+        self.assertEqual(events, [("message", "x\ufeff")])
+
+    def test_parser_stays_linear_for_single_byte_chunks(self) -> None:
+        parser = protocol.SSEParser()
+        payload = b"data: " + b"a" * (200 * 1024) + b"\n\n"
+        started = time.monotonic()
+        events = []
+        for index in range(len(payload)):
+            events.extend(parser.feed(payload[index : index + 1]))
+        elapsed = time.monotonic() - started
+        self.assertEqual(events, [("message", "a" * (200 * 1024))])
+        self.assertLess(elapsed, 10)
+
+    def test_chat_text_thinking_text_interleave_closes_each_block(self) -> None:
+        payloads = [
+            {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]},
+            {
+                "choices": [
+                    {"delta": {"reasoning_content": "think"}, "finish_reason": None}
+                ]
+            },
+            {"choices": [{"delta": {"content": "world"}, "finish_reason": None}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+        ]
+        wire = b"".join(
+            b"data: " + json.dumps(payload).encode() + b"\n\n" for payload in payloads
+        ) + b"data: [DONE]\n\n"
+
+        rendered = b"".join(protocol.translate_sse_chunks("openai_chat", [wire]))
+        _assert_anthropic_stream_invariants(self, rendered)
+
+        parser = protocol.SSEParser()
+        block_events = []
+        for event, data in parser.feed(rendered):
+            body = json.loads(data)
+            if body["type"].startswith("content_block_"):
+                block_events.append(
+                    (
+                        body["type"],
+                        body["index"],
+                        body.get("content_block", {}).get("type"),
+                    )
+                )
+        self.assertEqual(
+            block_events,
+            [
+                ("content_block_start", 0, "text"),
+                ("content_block_delta", 0, None),
+                ("content_block_stop", 0, None),
+                ("content_block_start", 1, "thinking"),
+                ("content_block_delta", 1, None),
+                ("content_block_stop", 1, None),
+                ("content_block_start", 2, "text"),
+                ("content_block_delta", 2, None),
+                ("content_block_stop", 2, None),
+            ],
+        )
+
+    def test_responses_terminal_snapshot_closes_parts_without_part_done(self) -> None:
+        events = [
+            (
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_1", "model": "responses-model"},
+                },
+            ),
+            (
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                },
+            ),
+            (
+                "response.content_part.added",
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": ""},
+                },
+            ),
+            (
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "hel",
+                },
+            ),
+            (
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "model": "responses-model",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_1",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {"type": "output_text", "text": "hello"}
+                                ],
+                            }
+                        ],
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                    },
+                },
+            ),
+        ]
+        wire = b"".join(
+            (
+                f"event: {event}\n"
+                "data: "
+                + json.dumps(payload, separators=(",", ":"))
+                + "\n\n"
+            ).encode()
+            for event, payload in events
+        )
+
+        rendered = b"".join(protocol.translate_sse_chunks("openai_responses", [wire]))
+        _assert_anthropic_stream_invariants(self, rendered)
+
+        parser = protocol.SSEParser()
+        text = []
+        final_usage = None
+        for _, data in parser.feed(rendered):
+            body = json.loads(data)
+            if body["type"] == "content_block_delta":
+                text.append(body["delta"].get("text", ""))
+            elif body["type"] == "message_delta":
+                final_usage = body["usage"]
+        self.assertEqual("".join(text), "hello")
+        self.assertIsNotNone(final_usage)
+
+    @staticmethod
+    def _message_usages(chunks: list[bytes]) -> tuple[dict, dict]:
+        parser = protocol.SSEParser()
+        start_usage = delta_usage = None
+        for _, data in parser.feed(b"".join(chunks)):
+            body = json.loads(data)
+            if body["type"] == "message_start":
+                start_usage = body["message"]["usage"]
+            elif body["type"] == "message_delta":
+                delta_usage = body["usage"]
+        return start_usage, delta_usage
+
+    def test_unobserved_stream_usage_is_omitted_not_zeroed(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            '{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+        )
+        chunks.extend(bridge.feed("message", "[DONE]"))
+        chunks.extend(bridge.finish())
+        self.assertIn("HUB_USAGE_PROVENANCE_UNAVAILABLE", bridge.warning_codes)
+
+        start_usage, delta_usage = self._message_usages(chunks)
+        self.assertEqual(start_usage, {})
+        self.assertEqual(delta_usage, {})
+
+    def test_late_input_usage_is_carried_by_message_delta_observably(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            '{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+        )
+        chunks.extend(
+            bridge.feed(
+                "message",
+                '{"choices":[{"delta":{},"finish_reason":"stop"}],'
+                '"usage":{"prompt_tokens":5,"completion_tokens":3}}',
+            )
+        )
+        chunks.extend(bridge.feed("message", "[DONE]"))
+        chunks.extend(bridge.finish())
+        self.assertIn("HUB_DEGRADE_LATE_INPUT_USAGE", bridge.warning_codes)
+
+        start_usage, delta_usage = self._message_usages(chunks)
+        self.assertEqual(start_usage, {})
+        self.assertEqual(delta_usage, {"output_tokens": 3, "input_tokens": 5})
+
+    def test_early_input_usage_stays_in_message_start(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        bridge.feed(
+            "message",
+            '{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3}}',
+        )
+        chunks = bridge.feed(
+            "message",
+            '{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+        )
+        chunks.extend(bridge.feed("message", "[DONE]"))
+        chunks.extend(bridge.finish())
+        self.assertNotIn("HUB_DEGRADE_LATE_INPUT_USAGE", bridge.warning_codes)
+
+        start_usage, delta_usage = self._message_usages(chunks)
+        self.assertEqual(
+            start_usage, {"input_tokens": 5, "output_tokens": 3}
+        )
+        self.assertEqual(delta_usage, {"output_tokens": 3})
 
     def test_invalid_utf8_partial_event_and_invalid_json_have_stable_errors(self) -> None:
         with self.assertRaises(protocol.ProtocolTransformError) as utf8:
