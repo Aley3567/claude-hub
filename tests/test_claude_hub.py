@@ -3989,6 +3989,8 @@ class ClaudeHubTests(unittest.TestCase):
                     headers={
                         "authorization": "Bearer fixture-local-token",
                         "anthropic-version": "2023-06-01",
+                        # Claude Code advertises br; the hub must not forward it.
+                        "accept-encoding": "br, gzip",
                     },
                     json={
                         "model": "fast,custom-model",
@@ -4004,7 +4006,7 @@ class ClaudeHubTests(unittest.TestCase):
                 self.assertEqual(response.headers["content-encoding"], "gzip")
                 self.assertEqual(body, compressed)
                 self.assertEqual(gzip.decompress(body), payload)
-                self.assertEqual(seen_accept_encoding, [])
+                self.assertEqual(seen_accept_encoding, ["identity"])
             finally:
                 if client is not None:
                     await client.close()

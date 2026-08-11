@@ -130,6 +130,7 @@ HOP_BY_HOP = {
 REQ_STRIP = HOP_BY_HOP | {
     "content-length",
     "content-encoding",
+    "accept-encoding",
     "authorization",
     "x-api-key",
 }
@@ -1433,6 +1434,11 @@ def upstream_headers(request: web.Request, token: str) -> CIMultiDict:
             headers.add(key, value)
     headers["authorization"] = f"Bearer {token}"
     headers["x-api-key"] = token
+    # Ask upstreams not to compress SSE: clients may advertise br/zstd, which
+    # _SSEContentDecoder cannot validate while forwarding raw bytes. identity
+    # is always safe to forward to any client. A non-compliant upstream that
+    # still answers gzip/deflate is handled by _SSEContentDecoder.
+    headers["accept-encoding"] = "identity"
     return headers
 
 
