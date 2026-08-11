@@ -206,9 +206,12 @@ def _validate_tool_result_causality(messages: object) -> None:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
-        if role not in {"user", "assistant"}:
+        # Claude Code 2.1.220 can place machine-generated system context in the
+        # messages array. Both OpenAI request formats support that role, while
+        # tool causality still remains restricted to assistant/user below.
+        if role not in {"system", "user", "assistant"}:
             raise ProtocolTransformError(
-                "message roles must be user or assistant"
+                f"message roles must be system, user, or assistant, got {role!r}"
             )
         content = message.get("content")
         if not isinstance(content, list):
@@ -505,6 +508,13 @@ def _token_count(value: object, default: int = 0) -> int:
     return default
 
 
+def _stream_identifier(*values: object) -> str | None:
+    for value in values:
+        if value is not None and value != "":
+            return str(value)
+    return None
+
+
 def _cache_read(raw_usage: dict) -> object:
     """从 OpenAI 两种 usage 形状里取缓存读 token 数（多数上游不返回则为 0）。"""
     details = raw_usage.get("prompt_tokens_details")
@@ -747,6 +757,8 @@ class AnthropicStreamBridge:
     text_index: int | None = None
     thinking_index: int | None = None
     tool_indices: dict[str, int] = field(default_factory=dict)
+    next_response_tool_key: int = 0
+    anonymous_response_tool_keys: set[str] = field(default_factory=set)
     response_text_deltas: set[tuple[str, str, str]] = field(default_factory=set)
     response_text_done: set[tuple[str, str, str]] = field(default_factory=set)
     response_tool_argument_deltas: set[int] = field(default_factory=set)
@@ -818,6 +830,8 @@ class AnthropicStreamBridge:
         chunks: list[bytes] = []
         if self.text_index is None:
             chunks.extend(self._close_open_tools())
+            chunks.extend(self._close(self.thinking_index))
+            self.thinking_index = None
             self.text_index, opened = self._open("text", {"text": ""})
             chunks.extend(opened)
         chunks.append(
@@ -891,6 +905,14 @@ class AnthropicStreamBridge:
                 },
             )
         ]
+
+    def _single_anonymous_response_tool_key(self) -> str | None:
+        keys = {
+            key
+            for key in self.anonymous_response_tool_keys
+            if self.tool_indices.get(key) in self.open_indices
+        }
+        return next(iter(keys)) if len(keys) == 1 else None
 
     def feed(self, event: str, data: str) -> list[bytes]:
         if self.stopped:
@@ -1030,10 +1052,16 @@ class AnthropicStreamBridge:
         if kind == "response.output_item.added":
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             if item.get("type") == "function_call":
-                key = str(item.get("id") or item.get("call_id") or payload.get("output_index"))
+                key = _stream_identifier(
+                    item.get("id"), item.get("call_id"), payload.get("output_index")
+                )
+                if key is None:
+                    key = f"response_function_call_{self.next_response_tool_key}"
+                    self.next_response_tool_key += 1
+                    self.anonymous_response_tool_keys.add(key)
                 chunks = self._tool_start(
                     key,
-                    str(item.get("call_id") or item.get("id") or ""),
+                    _stream_identifier(item.get("call_id"), item.get("id")) or key,
                     str(item.get("name", "")),
                 )
                 arguments = item.get("arguments")
@@ -1042,22 +1070,30 @@ class AnthropicStreamBridge:
                     chunks.extend(self._tool_delta(key, arguments))
                 return chunks
         if kind == "response.function_call_arguments.delta":
-            key = str(
-                payload.get("item_id")
-                or payload.get("call_id")
-                or payload.get("output_index")
+            key = _stream_identifier(
+                payload.get("item_id"),
+                payload.get("call_id"),
+                payload.get("output_index"),
             )
+            if key is None:
+                key = self._single_anonymous_response_tool_key()
+            if key is None:
+                return []
             index = self.tool_indices.get(key)
             if index is not None:
                 self.response_tool_argument_deltas.add(index)
             delta = payload.get("delta", payload.get("arguments"))
             return self._tool_delta(key, delta) if isinstance(delta, str) else []
         if kind == "response.function_call_arguments.done":
-            key = str(
-                payload.get("item_id")
-                or payload.get("call_id")
-                or payload.get("output_index")
+            key = _stream_identifier(
+                payload.get("item_id"),
+                payload.get("call_id"),
+                payload.get("output_index"),
             )
+            if key is None:
+                key = self._single_anonymous_response_tool_key()
+            if key is None:
+                return []
             chunks: list[bytes] = []
             index = self.tool_indices.get(key)
             if index is not None and index not in self.response_tool_argument_deltas:
@@ -1066,11 +1102,18 @@ class AnthropicStreamBridge:
                     chunks.extend(self._tool_delta(key, arguments))
             if index is not None:
                 self.response_tool_argument_deltas.discard(index)
+                self.anonymous_response_tool_keys.discard(key)
             return [*chunks, *self._close(index)]
         if kind == "response.output_item.done":
             item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
             if item.get("type") == "function_call":
-                key = str(item.get("id") or item.get("call_id") or payload.get("output_index"))
+                key = _stream_identifier(
+                    item.get("id"), item.get("call_id"), payload.get("output_index")
+                )
+                if key is None:
+                    key = self._single_anonymous_response_tool_key()
+                if key is None:
+                    return []
                 chunks: list[bytes] = []
                 index = self.tool_indices.get(key)
                 if index is not None and index not in self.response_tool_argument_deltas:
@@ -1079,6 +1122,7 @@ class AnthropicStreamBridge:
                         chunks.extend(self._tool_delta(key, arguments))
                 if index is not None:
                     self.response_tool_argument_deltas.discard(index)
+                    self.anonymous_response_tool_keys.discard(key)
                 return [*chunks, *self._close(index)]
         if kind in {"response.completed", "response.incomplete"}:
             self.upstream_terminal = True

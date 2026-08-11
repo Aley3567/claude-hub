@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import errno
 import json
 import hmac
 import math
@@ -39,6 +40,22 @@ from urllib.parse import urlparse
 
 from claude1_protocol import provider_api_format
 import claude_hub_catalog as hub_catalog
+from claude1_account_pool import (
+    AccountCandidate,
+    AccountPool,
+    AccountPoolError,
+    PoolConfigError,
+    PoolConfigStore,
+    PoolExhausted,
+    credential_fingerprint,
+    normalize_account_endpoint,
+)
+from claude1_transport import (
+    TransportConfigError,
+    diagnose_transport_policy,
+    normalize_transport_config,
+    resolve_transport_policy,
+)
 
 
 VERSION = "0.1.0"
@@ -57,6 +74,14 @@ DEFAULT_CLAUDE_BIN = _env_path(
 MRU_PATH = _env_path("CLAUDE1_MRU_PATH", HOME / ".cc-switch" / "claude1-mru.json")
 CONFIG_PATH = _env_path(
     "CLAUDE1_CONFIG_PATH", HOME / ".cc-switch" / "claude1-config.json"
+)
+ACCOUNT_POOL_CONFIG = _env_path(
+    "CLAUDE1_ACCOUNT_POOL_CONFIG",
+    HOME / ".cc-switch" / "claude1-account-pools.json",
+)
+ACCOUNT_POOL_STATE = _env_path(
+    "CLAUDE1_ACCOUNT_POOL_STATE",
+    HOME / ".cc-switch" / "claude1-account-state.sqlite3",
 )
 # 最近一次实际启动记录；普通启动只能写这里，不能改变粘性入口。
 BACKEND_STATE = _env_path(
@@ -98,6 +123,7 @@ RESERVED_SELECTOR_WORDS = set(BACKEND_ALIASES) | {
     "help",
     "list",
     "usage",
+    "accounts",
     "use",
     "version",
 }
@@ -116,6 +142,7 @@ HUB_LOG = _env_path(
 HUB_USAGE = _env_path(
     "CLAUDE_HUB_USAGE", HOME / ".cc-switch" / "logs" / "claude-hub-usage.jsonl"
 )
+HUB_LISTEN_FD_ENV = "CLAUDE_HUB_LISTEN_FD"
 HUB_CATALOG = _env_path(
     "CLAUDE1_HUB_CATALOG", HOME / ".cc-switch" / "claude-hubs.json"
 )
@@ -338,20 +365,6 @@ def sync_config(cfg: dict, db_providers: list[dict]) -> bool:
     return changed
 
 
-def provider_by_name(name: str) -> dict | None:
-    matches = [
-        _provider_from_row(row)
-        for row in db_claude_rows()
-        if row["name"] == name
-    ]
-    if len(matches) > 1:
-        selectors = "、".join(f"id:{provider['id']}" for provider in matches)
-        raise RuntimeError(
-            f"provider 名称 '{name}' 不唯一；请设置不同别名或使用 {selectors}"
-        )
-    return matches[0] if matches else None
-
-
 def provider_by_id(provider_id: str) -> dict | None:
     for row in db_claude_rows():
         if str(row["id"]) == provider_id:
@@ -462,11 +475,11 @@ def _local_gateway_url(base_url: str) -> bool:
 def _provider_uses_local_gateway(provider: dict) -> bool:
     """Best-effort doctor check without mutating a provider's settings."""
     try:
-        config = json.loads(provider.get("settings_config") or "{}")
-    except (TypeError, json.JSONDecodeError):
+        config = _provider_settings(provider)
+        env = _provider_environment(provider, config)
+    except RuntimeError:
         return False
-    env = config.get("env") if isinstance(config, dict) else None
-    base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+    base_url = env.get("ANTHROPIC_BASE_URL")
     return isinstance(base_url, str) and _local_gateway_url(base_url)
 
 
@@ -494,7 +507,7 @@ def db_claude_rows() -> list[sqlite3.Row]:
         conn.close()
 
 
-def subagent_model_overrides() -> list[tuple[str, str]]:
+def subagent_model_overrides() -> tuple[list[tuple[str, str]], list[str]]:
     """List providers whose persisted settings pin every Claude subagent."""
     if not DB_PATH.exists():
         raise RuntimeError(f"CC Switch DB 不存在: {DB_PATH}")
@@ -508,12 +521,22 @@ def subagent_model_overrides() -> list[tuple[str, str]]:
         conn.close()
 
     overrides: list[tuple[str, str]] = []
+    invalid: list[str] = []
     for provider_id, name, raw_settings in rows:
-        settings = json.loads(raw_settings or "{}")
-        env = settings.get("env") if isinstance(settings, dict) else None
-        if isinstance(env, dict) and SUBAGENT_MODEL_KEY in env:
+        provider = {
+            "id": provider_id,
+            "name": name,
+            "settings_config": raw_settings,
+        }
+        try:
+            settings = _provider_settings(provider)
+            env = _provider_environment(provider, settings)
+        except RuntimeError:
+            invalid.append(str(name))
+            continue
+        if SUBAGENT_MODEL_KEY in env:
             overrides.append((str(provider_id), str(name)))
-    return overrides
+    return overrides, invalid
 
 
 def _provider_from_row(row: sqlite3.Row) -> dict:
@@ -542,6 +565,45 @@ def selected_provider_api_format(provider: dict) -> str:
         settings=settings,
         provider_type=provider.get("provider_type"),
     )
+
+
+def provider_transport_config(provider: dict, settings: dict | None = None) -> dict:
+    """Return normalized transport intent for one CC Switch provider."""
+    if settings is None:
+        try:
+            settings = json.loads(provider.get("settings_config") or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"provider {provider.get('name', '<unknown>')} 的 settings_config 无效"
+            ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 settings_config 必须是 JSON 对象"
+        )
+    env = settings.get("env") or {}
+    if not isinstance(env, dict):
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 env 必须是 JSON 对象"
+        )
+    raw = settings.get("transport")
+    if raw is None:
+        folded = {str(key).upper(): value for key, value in env.items()}
+        explicit = (
+            folded.get("HTTPS_PROXY")
+            or folded.get("HTTP_PROXY")
+            or folded.get("ALL_PROXY")
+        )
+        raw = (
+            {"mode": "proxy", "proxies": [explicit]}
+            if isinstance(explicit, str) and explicit.strip()
+            else {"mode": "auto", "proxies": ["system"]}
+        )
+    try:
+        return normalize_transport_config(raw)
+    except TransportConfigError as exc:
+        raise RuntimeError(
+            f"provider {provider.get('name', '<unknown>')} 的 transport 无效: {exc}"
+        ) from exc
 
 
 def list_providers() -> list[dict]:
@@ -615,12 +677,36 @@ def _seal_model_slots(env: dict[str, str]) -> None:
     env[SUBAGENT_MODEL_KEY] = ""
 
 
+def _provider_settings(provider: dict) -> dict:
+    name = str(provider.get("name") or provider.get("id") or "<unknown>")
+    try:
+        settings = json.loads(provider.get("settings_config") or "{}")
+    except (json.JSONDecodeError, TypeError, UnicodeError, RecursionError) as exc:
+        raise RuntimeError(
+            f"provider {name} 的 settings_config 无效"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"provider {name} 的 settings_config 必须是 JSON 对象")
+    return settings
+
+
+def _provider_environment(provider: dict, settings: dict) -> dict:
+    raw_env = settings.get("env")
+    if raw_env is None:
+        return {}
+    if not isinstance(raw_env, dict):
+        name = str(provider.get("name") or provider.get("id") or "<unknown>")
+        raise RuntimeError(f"provider {name} 的 env 必须是 JSON 对象")
+    return raw_env
+
+
 def build_settings(provider: dict) -> dict:
     """Return the provider settings_config from CC Switch DB with NO_PROXY applied."""
-    cfg = json.loads(provider["settings_config"] or "{}")
+    cfg = _provider_settings(provider)
+    raw_env = _provider_environment(provider, cfg)
     env = {
         k: str(v)
-        for k, v in (cfg.get("env") or {}).items()
+        for k, v in raw_env.items()
         if k != SUBAGENT_MODEL_KEY
     }
 
@@ -631,7 +717,11 @@ def build_settings(provider: dict) -> dict:
             f"[claude1] 注意: provider {provider['name']} 没有独立凭证，将使用当前已登录的凭证",
             file=sys.stderr,
         )
-    host = urlparse(env.get("ANTHROPIC_BASE_URL", "")).hostname
+    try:
+        host = urlparse(env.get("ANTHROPIC_BASE_URL", "")).hostname
+    except ValueError as exc:
+        name = str(provider.get("name") or provider.get("id") or "<unknown>")
+        raise RuntimeError(f"provider {name} 的 URL 无效") from exc
     explicit_proxy = any(
         k.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY") for k in env
     )
@@ -643,7 +733,7 @@ def build_settings(provider: dict) -> dict:
             parts = [
                 p.strip()
                 for p in env.get(key, "").split(",")
-                if p.strip() and p.strip() != host
+                if p.strip() and p.strip().casefold() != host.casefold()
             ]
             if parts:
                 env[key] = ",".join(parts)
@@ -652,7 +742,7 @@ def build_settings(provider: dict) -> dict:
     elif host:
         for key in ("NO_PROXY", "no_proxy"):
             parts = [p.strip() for p in env.get(key, "").split(",") if p.strip()]
-            if host not in parts:
+            if all(part.casefold() != host.casefold() for part in parts):
                 parts.append(host)
             env[key] = ",".join(parts)
     _seal_model_slots(env)
@@ -666,18 +756,116 @@ def build_settings(provider: dict) -> dict:
     return cfg
 
 
+def _provider_account_credential(provider: dict) -> tuple[str, str, str]:
+    """Return ``(env key, token, normalized base URL)`` without logging secrets."""
+    settings = _provider_settings(provider)
+    env = _provider_environment(provider, settings)
+    auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
+    api_key = env.get("ANTHROPIC_API_KEY")
+    if isinstance(auth_token, str) and auth_token:
+        credential_key, token = "ANTHROPIC_AUTH_TOKEN", auth_token
+    elif isinstance(api_key, str) and api_key:
+        credential_key, token = "ANTHROPIC_API_KEY", api_key
+    else:
+        credential_key, token = "", ""
+    raw_base = env.get("ANTHROPIC_BASE_URL")
+    try:
+        meta = json.loads(provider.get("meta") or "{}")
+    except (json.JSONDecodeError, TypeError, UnicodeError, RecursionError):
+        meta = {}
+    is_full_url = isinstance(meta, dict) and meta.get("isFullUrl") is True
+    base_url = normalize_account_endpoint(
+        raw_base,
+        is_full_url=is_full_url,
+    )
+    return credential_key, token, base_url
+
+
+def _account_pool_directory(
+    primary_provider: dict,
+    definition,
+    providers: list[dict] | None = None,
+) -> tuple[dict[str, dict], dict[str, AccountCandidate], dict[str, tuple[str, str]]]:
+    """Build one credential-only pool view from a single CC Switch snapshot."""
+    primary = f"id:{primary_provider['id']}"
+    if providers is None:
+        providers = [_provider_from_row(row) for row in db_claude_rows()]
+    records = {f"id:{provider['id']}": provider for provider in providers}
+    records[primary] = primary_provider
+    candidates: dict[str, AccountCandidate] = {}
+    credentials: dict[str, tuple[str, str]] = {}
+    for member in definition.members:
+        record = records.get(member.selector)
+        if record is None:
+            candidates[member.selector] = AccountCandidate("")
+            continue
+        credential_key, token, base_url = _provider_account_credential(record)
+        credentials[member.selector] = (credential_key, token)
+        candidates[member.selector] = AccountCandidate(
+            credential_fingerprint(token),
+            endpoint=base_url,
+            credential_type=credential_key,
+        )
+    return records, candidates, credentials
+
+
+def apply_native_account_pool(provider: dict, settings: dict) -> tuple[dict, str | None]:
+    """Choose one account for an entire native Claude session.
+
+    Member rows contribute only their credential.  Endpoint, model, proxy and
+    all other settings remain owned by the provider the user selected.
+    """
+    primary = f"id:{provider['id']}"
+    scheduler = AccountPool(ACCOUNT_POOL_CONFIG, ACCOUNT_POOL_STATE)
+    try:
+        definition = scheduler.definition(primary)
+    except AccountPoolError as exc:
+        raise RuntimeError(f"账号池配置不可用: {exc}") from exc
+    if definition is None:
+        return settings, None
+
+    records, candidates, credentials = _account_pool_directory(provider, definition)
+
+    try:
+        lease = scheduler.acquire(primary, candidates)
+    except PoolExhausted as exc:
+        retry = f"，约 {exc.retry_after} 秒后可重试" if exc.retry_after else ""
+        raise RuntimeError(f"该 provider 的所有账号当前都不可用{retry}") from exc
+    except AccountPoolError as exc:
+        raise RuntimeError(f"账号池不可用: {exc}") from exc
+
+    credential_key, token = credentials[lease.member]
+    env = settings.setdefault("env", {})
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env[credential_key] = token
+    member = records[lease.member]
+    label = f"{member.get('name') or lease.member} [{str(member.get('id'))[:8]}]"
+    return settings, label
+
+
 def add_anyrouter_observer(settings: dict, provider_name: str) -> None:
     """Observe real Any router turn outcomes without reading conversation content."""
     if provider_name != "Any router" or not ANYROUTER_OBSERVER.is_file():
         return
 
-    hooks = settings.setdefault("hooks", {})
+    hooks = settings.get("hooks")
+    if hooks is None:
+        hooks = {}
+        settings["hooks"] = hooks
+    elif not isinstance(hooks, dict):
+        return
     commands = {
         "Stop": f"{ANYROUTER_OBSERVER} success",
         "StopFailure": f"{ANYROUTER_OBSERVER} failure",
     }
     for event, command in commands.items():
-        groups = hooks.setdefault(event, [])
+        groups = hooks.get(event)
+        if groups is None:
+            groups = []
+            hooks[event] = groups
+        elif not isinstance(groups, list):
+            continue
         already_present = any(
             handler.get("command") == command
             for group in groups
@@ -746,10 +934,11 @@ def _hub_port(cfg: dict) -> int:
         if HUB_CATALOG_ENABLED
         else os.environ.get("CLAUDE1_HUB_PORT", cfg.get("port"))
     )
-    try:
-        port = int(raw)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"hub 端口无效: {raw!r}") from None
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        raise RuntimeError(f"hub 端口无效: {raw!r}")
+    if isinstance(raw, str) and not raw.strip().isdigit():
+        raise RuntimeError(f"hub 端口无效: {raw!r}")
+    port = int(raw)
     if not 1 <= port <= 65535:
         raise RuntimeError(f"hub 端口超出范围: {port}")
     return port
@@ -850,6 +1039,8 @@ def _hub_start_env(
             hub.usage_path if hub is not None else HUB_USAGE
         ),
         "CLAUDE_HUB_PORT": str(port),
+        "CLAUDE1_ACCOUNT_POOL_CONFIG": str(ACCOUNT_POOL_CONFIG),
+        "CLAUDE1_ACCOUNT_POOL_STATE": str(ACCOUNT_POOL_STATE),
     }
     for key in ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"):
         value = os.environ.get(key)
@@ -873,6 +1064,39 @@ def _hub_start_timeout() -> float:
     if not math.isfinite(timeout) or not 1 <= timeout <= 120:
         raise RuntimeError("CLAUDE1_HUB_START_TIMEOUT 应在 1–120 秒之间")
     return timeout
+
+
+def _reserve_loopback_port(port: int = 0) -> socket.socket:
+    """Own one listening port until the Hub inherits this exact socket."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", port))
+        listener.listen()
+        return listener
+    except OSError:
+        listener.close()
+        raise
+
+
+def _spawn_hub_process(
+    log_path: Path,
+    child_env: dict[str, str],
+    listener: socket.socket,
+) -> subprocess.Popen:
+    """Start the Hub with ownership of an already-listening loopback socket."""
+    listen_fd = listener.fileno()
+    env = {**child_env, HUB_LISTEN_FD_ENV: str(listen_fd)}
+    with _open_private_append(log_path) as log:
+        return subprocess.Popen(
+            [str(HUB_SCRIPT), "serve"],
+            stdout=log,
+            stderr=log,
+            env=env,
+            close_fds=True,
+            pass_fds=(listen_fd,),
+            start_new_session=True,
+        )
 
 
 def _stop_spawned_process(process: subprocess.Popen, timeout: float = 3) -> None:
@@ -907,47 +1131,74 @@ def ensure_hub(
     token_env: str = DEFAULT_HUB_TOKEN_ENV,
     hub: HubRef | None = None,
     instance_id: str | None = None,
-) -> None:
+) -> int:
     """Start the isolated claude-hub process unless its strict health check passes."""
     log_path = hub.log_path if hub is not None else HUB_LOG
     if hub_healthy(port, token, instance_id):
-        return
+        return port
     with _hub_start_lock(hub):
+        if hub is not None:
+            latest = load_hub_config(hub=hub)
+            port = _hub_port(latest)
+            latest_instance = latest.get("instance_id")
+            if isinstance(latest_instance, str):
+                instance_id = latest_instance
         # Another claude1 may have completed startup while this process waited
         # for the inter-process lock.
         if hub_healthy(port, token, instance_id):
-            return
+            return port
         if not HUB_SCRIPT.is_file():
             raise RuntimeError(f"hub 脚本不存在: {HUB_SCRIPT}")
         display_name = hub.name if hub is not None else "claude-hub"
-        print(f"[claude1] {display_name} 未运行，正在启动 ...", file=sys.stderr)
-        with _open_private_append(log_path) as log:
-            process = subprocess.Popen(
-                [str(HUB_SCRIPT), "serve"],
-                stdout=log,
-                stderr=log,
-                env=_hub_start_env(port, token_env=token_env, hub=hub),
-                close_fds=True,
-                start_new_session=True,
-            )
-        # Keep detached children referenced so Popen can reap them without emitting
-        # ResourceWarning; a later start prunes processes that have already exited.
-        _hub_processes[:] = [child for child in _hub_processes if child.poll() is None]
-        _hub_processes.append(process)
-        deadline = time.monotonic() + _hub_start_timeout()
-        while time.monotonic() < deadline:
+        try:
+            listener = _reserve_loopback_port(port)
+        except OSError as exc:
             if hub_healthy(port, token, instance_id):
-                return
-            return_code = process.poll()
-            if return_code is not None:
-                _stop_spawned_process(process)
+                return port
+            if exc.errno != errno.EADDRINUSE:
                 raise RuntimeError(
-                    f"claude-hub 启动进程提前退出（状态 {return_code}），"
-                    f"查看日志: {log_path}"
-                )
-            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-        _stop_spawned_process(process)
-        raise RuntimeError(f"{display_name} 启动失败，查看日志: {log_path}")
+                    f"{display_name} 无法监听 127.0.0.1:{port}: {exc}"
+                ) from exc
+            if hub is None or not HUB_CATALOG_ENABLED:
+                raise RuntimeError(
+                    f"{display_name} 端口 {port} 已被占用"
+                ) from exc
+            previous_port = port
+            port, listener = _reserve_reassigned_hub_port(hub, previous_port)
+            print(
+                f"[claude1] {display_name} 端口 {previous_port} 已被占用，"
+                f"改用 {port}",
+                file=sys.stderr,
+            )
+        print(f"[claude1] {display_name} 未运行，正在启动 ...", file=sys.stderr)
+        with listener:
+            process = _spawn_hub_process(
+                log_path,
+                _hub_start_env(port, token_env=token_env, hub=hub),
+                listener,
+            )
+            # Keep detached children referenced so Popen can reap them without
+            # emitting ResourceWarning; later starts prune completed children.
+            _hub_processes[:] = [
+                child for child in _hub_processes if child.poll() is None
+            ]
+            _hub_processes.append(process)
+            deadline = time.monotonic() + _hub_start_timeout()
+            while time.monotonic() < deadline:
+                if hub_healthy(port, token, instance_id):
+                    return port
+                return_code = process.poll()
+                if return_code is not None:
+                    _stop_spawned_process(process)
+                    raise RuntimeError(
+                        f"claude-hub 启动进程提前退出（状态 {return_code}），"
+                        f"查看日志: {log_path}"
+                    )
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            _stop_spawned_process(process)
+            raise RuntimeError(
+                f"{display_name} 启动失败，查看日志: {log_path}"
+            )
 
 
 def _provider_terms(provider: dict) -> list[str]:
@@ -1099,12 +1350,25 @@ _HUB_FAMILY_COLOR = {
 HUB_CONFIG_VERSION = 2
 HUB_SLOT_ORDER = ("fable", "opus", "sonnet", "haiku")
 HUB_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+_HUB_API_FORMAT_CHOICES = (
+    ("anthropic", "Anthropic Messages", "原生 Claude / Anthropic 兼容接口"),
+    ("openai_chat", "OpenAI Chat Completions", "兼容 /chat/completions"),
+    ("openai_responses", "OpenAI Responses", "兼容 /responses"),
+)
+_HUB_API_FORMAT_SHORTCUTS = {
+    "a": 0,
+    "c": 1,
+    "r": 2,
+}
 HUB_DEFAULT_EFFORTS = {
     "fable": "xhigh",
     "opus": "high",
     "sonnet": "high",
     "haiku": "high",
 }
+HUB_MODEL_SLOT_CAPABILITIES = (
+    "thinking,adaptive_thinking,effort,xhigh_effort"
+)
 
 
 def _legacy_hub_ref() -> HubRef:
@@ -1463,7 +1727,10 @@ def _validate_catalog_path_chain(path: Path) -> None:
 
 
 def _hub_ref_from_catalog(catalog: dict, hub_id: str) -> HubRef:
-    entry = catalog["hubs"][hub_id]
+    hubs = catalog["hubs"]
+    if hub_id not in hubs:
+        raise ValueError(f"Hub {hub_id} 已被移除")
+    entry = hubs[hub_id]
     ref = HubRef(
         hub_id=hub_id,
         name=entry["name"],
@@ -1536,21 +1803,60 @@ def resolve_hub_ref(
 
 
 def _next_hub_port(configs: dict[str, dict], preferred: int) -> int:
+    with _reserve_next_hub_port(configs, preferred) as listener:
+        return int(listener.getsockname()[1])
+
+
+def _reserve_next_hub_port(
+    configs: dict[str, dict],
+    preferred: int,
+) -> socket.socket:
+    """Reserve the next port not claimed by a config or listening process."""
     used = set(hub_catalog.validate_unique_hub_ports(configs).values())
     candidate = preferred if 1 <= preferred <= 65535 else 18787
     for _ in range(65535):
         if candidate not in used:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                probe.bind(("127.0.0.1", candidate))
-            except OSError:
-                pass
-            else:
-                return candidate
-            finally:
-                probe.close()
+                return _reserve_loopback_port(candidate)
+            except OSError as exc:
+                if exc.errno not in {errno.EADDRINUSE, errno.EACCES}:
+                    raise
         candidate = 1024 if candidate >= 65535 else candidate + 1
     raise ValueError("没有可分配的 Hub 端口")
+
+
+def _reserve_reassigned_hub_port(
+    hub: HubRef,
+    expected_port: int,
+) -> tuple[int, socket.socket]:
+    """Persist a replacement named-Hub port while retaining its listener."""
+    with _hub_catalog_lock():
+        catalog = hub_catalog.load_hub_catalog(
+            json.loads(_read_regular_text(HUB_CATALOG, "hub catalog"))
+        )
+        current = _hub_ref_from_catalog(catalog, hub.hub_id)
+        configs = {
+            existing_id: load_hub_config(
+                hub=_hub_ref_from_catalog(catalog, existing_id)
+            )
+            for existing_id in catalog["order"]
+            if existing_id != hub.hub_id
+            and catalog["hubs"][existing_id].get("state", "ready") == "ready"
+        }
+        listener = _reserve_next_hub_port(configs, 18787)
+        replacement = int(listener.getsockname()[1])
+
+        def reassign(config: dict) -> None:
+            if _hub_port(config) != expected_port:
+                raise RuntimeError(f"Hub {hub.name} 的端口配置已变化，请重试")
+            config["port"] = replacement
+
+        try:
+            mutate_hub_config(reassign, hub=current)
+        except BaseException:
+            listener.close()
+            raise
+    return replacement, listener
 
 
 HUB_SETUP_DRAFT_VERSION = 1
@@ -1825,7 +2131,7 @@ class HubModelOption:
     @property
     def status_label(self) -> str:
         if self.is_default:
-            return "默认"
+            return "回退"
         if self.is_1m:
             return "1M"
         if self.via_proxy:
@@ -1863,7 +2169,7 @@ class HubStatus:
         """Main-screen one-liner for the slot-aware Hub entry."""
         return (
             f"{len(HUB_SLOT_ORDER)} 槽 · {self.channel_count} 渠道"
-            f" · 默认 {self.launch_selector} · {self.launch_effort}"
+            f" · 启动 {self.launch_selector} · {self.launch_effort}"
         )
 
 
@@ -1902,6 +2208,7 @@ class NamedHubLauncherState:
     hub: HubRef
     state: HubLauncherState | None
     setup_count: int = 0
+    error: str | None = None
 
 
 def build_hub_workspace(
@@ -2044,17 +2351,19 @@ def _load_named_hub_launcher_states() -> list[NamedHubLauncherState]:
         return []
     states: list[NamedHubLauncherState] = []
     for hub in refs:
-        try:
-            if hub.state == "setup":
+        if hub.state == "setup":
+            try:
                 draft = load_hub_setup_draft(hub)
+            except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
                 states.append(
-                    NamedHubLauncherState(
-                        hub,
-                        None,
-                        len(draft["mappings"]),
-                    )
+                    NamedHubLauncherState(hub, None, error="配置异常")
                 )
-                continue
+            else:
+                states.append(
+                    NamedHubLauncherState(hub, None, len(draft["mappings"]))
+                )
+            continue
+        try:
             config = load_hub_config(migrate=True, hub=hub)
             states.append(
                 NamedHubLauncherState(hub, build_hub_launcher_state(config))
@@ -2290,11 +2599,6 @@ def _init_colors() -> dict:
     if not _logo_pairs:
         _logo_pairs.extend([cyan, magenta])
     return d
-
-
-def _wide_enough(win) -> bool:
-    logo_width = max((_dwidth(line) for line in LOGO), default=0)
-    return win.getmaxyx()[1] >= logo_width + 4
 
 
 def _large_logo_supported(rows: int, cols: int) -> bool:
@@ -2576,13 +2880,15 @@ def _home_hubs_expanded(
 
 def _hub_home_text(named: NamedHubLauncherState, width: int) -> str:
     left = f"◆ {named.hub.name}"
-    if named.state is None:
-        right = f"待配置 · {named.setup_count}/4 映射"
+    if named.error is not None:
+        right = named.error
+    elif named.state is None:
+        right = f"待配置 · {named.setup_count}/{len(HUB_SLOT_ORDER)} 映射"
     else:
         status = named.state.status
         right = (
-            f"4 槽 · {status.channel_count} 渠道"
-            f" · 默认 {status.launch_slot.title()} · {status.launch_effort}"
+            f"{len(HUB_SLOT_ORDER)} 槽 · {status.channel_count} 渠道"
+            f" · 启动 {status.launch_slot.title()} · {status.launch_effort}"
         )
     return _compose_row(left, right, width)
 
@@ -2591,7 +2897,7 @@ _HUB_IDENTITY_COLORS = ("orange", "teal", "violet", "pink", "lime")
 
 
 def _hub_identity_color(index: int) -> str:
-    return _HUB_IDENTITY_COLORS[index]
+    return _HUB_IDENTITY_COLORS[index % len(_HUB_IDENTITY_COLORS)]
 
 
 def _draw_launcher(
@@ -2848,7 +3154,7 @@ def _draw_hub_workspace(
     _addstr(win, 2, 2, badge, badge_attr)
     meta = (
         f"127.0.0.1:{status.port} · {status.channel_count} 渠道"
-        f" · {status.model_count} 模型 · 默认 {status.launch_selector}"
+        f" · {status.model_count} 模型 · 启动 {status.launch_selector}"
         f" · {status.launch_effort}"
     )
     _addstr(win, 2, 4 + _dwidth(badge), meta, C.get("dim", 0))
@@ -2866,19 +3172,23 @@ def _draw_hub_workspace(
             option = item.option
             kind = item.slot.title()
             effort = item.effort
-            state = "默认" if item.slot == status.launch_slot else "已绑定"
+            state = "启动" if item.slot == status.launch_slot else "已绑定"
         elif isinstance(item, HubChannel):
+            is_fallback = (
+                item.alias == status.default_channel
+                and item.models[0] == status.default_model
+            )
             option = HubModelOption(
                 family=_hub_model_family(item.models[0]),
                 channel=item.alias,
                 model=item.models[0],
-                is_default=(item.alias == status.default_channel),
+                is_default=is_fallback,
                 via_proxy=item.via_proxy,
                 is_1m="[1m]" in item.models[0].casefold(),
             )
             kind = "渠道"
             effort = "—"
-            state = "默认" if option.is_default else "可用"
+            state = "回退" if option.is_default else "可用"
         else:
             option = item
             kind = "池"
@@ -3134,35 +3444,57 @@ def _prompt_named_hub(
                 value += char
 
 
+def _navigate_hub_choices(
+    win,
+    option_count: int,
+    render,
+    *,
+    initial_index: int = 0,
+    shortcuts: dict[str, int] | None = None,
+) -> int | None:
+    """Run the shared choice key contract while the caller owns rendering."""
+    idx = initial_index
+    while True:
+        render(idx)
+        win.refresh()
+        ch = win.getch()
+        if ch in (-1, 27):
+            return None
+        if ch in (curses.KEY_UP, ord("k")):
+            idx = (idx - 1) % option_count
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            idx = (idx + 1) % option_count
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return idx
+        elif shortcuts is not None and 0 <= ch <= 0x10FFFF:
+            shortcut_index = shortcuts.get(chr(ch).casefold())
+            if shortcut_index is not None:
+                return shortcut_index
+
+
 def _choose_hub_provider(win, providers: list[dict]) -> dict | None:
     if not providers:
         return None
-    idx = 0
-    while True:
+
+    options = [
+        (
+            str(provider.get("name") or provider.get("id")),
+            str(provider.get("alias") or "CC Switch"),
+        )
+        for provider in providers
+    ]
+
+    def render(idx: int) -> None:
         list_top = _draw_hub_wizard_shell(
             win,
             0,
             "选择 CC Switch 渠道",
             detail="选择凭据与上游配置的来源，不会修改 CC Switch 当前渠道",
         )
-        options = [
-            (
-                str(provider.get("name") or provider.get("id")),
-                str(provider.get("alias") or "CC Switch"),
-            )
-            for provider in providers
-        ]
         _draw_hub_wizard_options(win, options, idx, list_top)
-        win.refresh()
-        ch = win.getch()
-        if ch in (-1, 27):
-            return None
-        if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(providers)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(providers)
-        elif ch in (10, 13, curses.KEY_ENTER):
-            return providers[idx]
+
+    selected = _navigate_hub_choices(win, len(providers), render)
+    return providers[selected] if selected is not None else None
 
 
 def _choose_hub_models(
@@ -3397,19 +3729,6 @@ def _recover_setup_config(
     actual = load_hub_config(hub=hub)
     port = _hub_port(actual)
     expected = _hub_config_from_setup_draft(hub, draft, port)
-    allowed_fields = {
-        "version",
-        "instance_id",
-        "port",
-        "local_token",
-        "default_channel",
-        "channels",
-        "model_slots",
-        "launch_slot",
-        "effort_by_slot",
-    }
-    if set(actual) != allowed_fields:
-        raise ValueError(f"Hub {hub.name} 的恢复配置包含未知字段")
     compared_fields = (
         "version",
         "instance_id",
@@ -3431,13 +3750,11 @@ def _recover_setup_config(
         )
     except ValueError:
         port_available = False
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind(("127.0.0.1", port))
+        with _reserve_loopback_port(port):
+            pass
     except OSError:
         port_available = False
-    finally:
-        probe.close()
     if not port_available:
         actual["port"] = _next_hub_port(ready_configs, 18787)
         actual = normalize_hub_config(actual)
@@ -3530,18 +3847,8 @@ def _infer_hub_provider_api_format(provider: dict) -> str | None:
 
 def _choose_hub_api_format(win, detail: str = "") -> str | None:
     """Ask only when CC Switch metadata cannot determine the upstream protocol."""
-    choices = [
-        ("anthropic", "Anthropic Messages", "原生 Claude / Anthropic 兼容接口"),
-        ("openai_chat", "OpenAI Chat Completions", "兼容 /chat/completions"),
-        ("openai_responses", "OpenAI Responses", "兼容 /responses"),
-    ]
-    shortcuts = {
-        "a": "anthropic",
-        "c": "openai_chat",
-        "r": "openai_responses",
-    }
-    idx = 0
-    while True:
+
+    def render(idx: int) -> None:
         list_top = _draw_hub_wizard_shell(
             win,
             2,
@@ -3551,26 +3858,26 @@ def _choose_hub_api_format(win, detail: str = "") -> str | None:
         )
         _draw_hub_wizard_options(
             win,
-            [(label, description) for _value, label, description in choices],
+            [
+                (label, description)
+                for _value, label, description in _HUB_API_FORMAT_CHOICES
+            ],
             idx,
             list_top,
             color_keys=["orange", "teal", "violet"],
         )
-        win.refresh()
-        ch = win.getch()
-        if ch in (-1, 27):
-            return None
-        if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(choices)
-            continue
-        if ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(choices)
-            continue
-        if ch in (10, 13, curses.KEY_ENTER):
-            return choices[idx][0]
-        choice = shortcuts.get(chr(ch).casefold()) if 0 <= ch <= 0x10FFFF else None
-        if choice is not None:
-            return choice
+
+    selected = _navigate_hub_choices(
+        win,
+        len(_HUB_API_FORMAT_CHOICES),
+        render,
+        shortcuts=_HUB_API_FORMAT_SHORTCUTS,
+    )
+    return (
+        _HUB_API_FORMAT_CHOICES[selected][0]
+        if selected is not None
+        else None
+    )
 
 
 def _draw_hub_setup_choice_shell(
@@ -3600,7 +3907,7 @@ def _draw_hub_setup_choice_shell(
         win,
         progress_row,
         2,
-        f"映射 {slot.title()} · 第 {slot_index}/4 槽",
+        f"映射 {slot.title()} · 第 {slot_index}/{len(HUB_SLOT_ORDER)} 槽",
         C.get(_hub_identity_color(slot_index - 1), 0) | curses.A_BOLD,
     )
     _addstr(win, title_row, 2, title, C.get("lime", 0) | curses.A_BOLD)
@@ -3628,7 +3935,7 @@ def _choose_hub_setup_provider(
 ) -> dict | None:
     if not providers:
         return None
-    idx = next(
+    initial_index = next(
         (
             index
             for index, provider in enumerate(providers)
@@ -3636,7 +3943,15 @@ def _choose_hub_setup_provider(
         ),
         0,
     )
-    while True:
+    options = [
+        (
+            str(provider.get("name") or provider.get("id")),
+            str(provider.get("alias") or "CC Switch"),
+        )
+        for provider in providers
+    ]
+
+    def render(idx: int) -> None:
         list_top = _draw_hub_setup_choice_shell(
             win,
             hub_name,
@@ -3646,26 +3961,18 @@ def _choose_hub_setup_provider(
         )
         _draw_hub_wizard_options(
             win,
-            [
-                (
-                    str(provider.get("name") or provider.get("id")),
-                    str(provider.get("alias") or "CC Switch"),
-                )
-                for provider in providers
-            ],
+            options,
             idx,
             list_top,
         )
-        win.refresh()
-        ch = win.getch()
-        if ch in (-1, 27):
-            return None
-        if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(providers)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(providers)
-        elif ch in (10, 13, curses.KEY_ENTER):
-            return providers[idx]
+
+    selected = _navigate_hub_choices(
+        win,
+        len(providers),
+        render,
+        initial_index=initial_index,
+    )
+    return providers[selected] if selected is not None else None
 
 
 def _prompt_hub_setup_model(
@@ -3675,6 +3982,7 @@ def _prompt_hub_setup_model(
     provider_name: str,
 ) -> str | None:
     value = ""
+    notice: str | None = None
     while True:
         list_top = _draw_hub_setup_choice_shell(
             win,
@@ -3682,8 +3990,12 @@ def _prompt_hub_setup_model(
             slot,
             "手动输入模型 ID",
             detail=f"渠道 · {provider_name}",
-            footer="Esc 返回四槽页 · 输入模型 ID · Backspace 删除 · Enter 继续",
+            footer=(
+                notice
+                or "Esc 返回四槽页 · 输入模型 ID · Backspace 删除 · Enter 继续"
+            ),
         )
+        notice = None
         row_width = max(0, win.getmaxyx()[1] - 4)
         _addstr(
             win,
@@ -3698,7 +4010,11 @@ def _prompt_hub_setup_model(
             return None
         if ch in (10, 13, curses.KEY_ENTER):
             value = value.strip()
-            if value and "," not in value:
+            if not value:
+                notice = "模型 ID 不能为空"
+            elif "," in value:
+                notice = "模型 ID 不能包含逗号"
+            else:
                 return value
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             value = value[:-1]
@@ -3772,37 +4088,41 @@ def _choose_hub_setup_api_format(
     slot: str,
     detail: str,
 ) -> str | None:
-    choices = [
-        ("anthropic", "Anthropic Messages", "原生 Claude / Anthropic 兼容"),
-        ("openai_chat", "OpenAI Chat Completions", "兼容 /chat/completions"),
-        ("openai_responses", "OpenAI Responses", "兼容 /responses"),
-    ]
-    idx = 0
-    while True:
+
+    def render(idx: int) -> None:
         list_top = _draw_hub_setup_choice_shell(
             win,
             hub_name,
             slot,
             "选择上游协议",
             detail=detail,
+            footer=(
+                "Esc 返回四槽页 · ↑↓/jk 选择 · Enter 继续 · "
+                "a/c/r 快捷选择"
+            ),
         )
         _draw_hub_wizard_options(
             win,
-            [(label, description) for _value, label, description in choices],
+            [
+                (label, description)
+                for _value, label, description in _HUB_API_FORMAT_CHOICES
+            ],
             idx,
             list_top,
             color_keys=["orange", "teal", "violet"],
         )
-        win.refresh()
-        ch = win.getch()
-        if ch in (-1, 27):
-            return None
-        if ch in (curses.KEY_UP, ord("k")):
-            idx = (idx - 1) % len(choices)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            idx = (idx + 1) % len(choices)
-        elif ch in (10, 13, curses.KEY_ENTER):
-            return choices[idx][0]
+
+    selected = _navigate_hub_choices(
+        win,
+        len(_HUB_API_FORMAT_CHOICES),
+        render,
+        shortcuts=_HUB_API_FORMAT_SHORTCUTS,
+    )
+    return (
+        _HUB_API_FORMAT_CHOICES[selected][0]
+        if selected is not None
+        else None
+    )
 
 
 def _draw_hub_setup(
@@ -3817,6 +4137,7 @@ def _draw_hub_setup(
     width = max(0, w - 4)
     mappings = draft["mappings"]
     complete_count = len(mappings)
+    slot_count = len(HUB_SLOT_ORDER)
     _addstr(
         win,
         0,
@@ -3832,7 +4153,7 @@ def _draw_hub_setup(
             2,
             _compose_row(
                 "选择四槽映射",
-                f"已完成 {complete_count}/4",
+                f"已完成 {complete_count}/{slot_count}",
                 width,
             ),
             C.get("lime", 0) | curses.A_BOLD,
@@ -3846,7 +4167,7 @@ def _draw_hub_setup(
             2,
             _compose_row(
                 "每个槽位选择一个渠道和模型",
-                f"已完成 {complete_count}/4",
+                f"已完成 {complete_count}/{slot_count}",
                 width,
             ),
             C.get("dim", 0),
@@ -4555,7 +4876,9 @@ def _launcher_main(win, cfg, db_ids):
         elif ch in (10, 13, curses.KEY_ENTER):
             if hub_focus and hubs:
                 named = hubs[hub_idx]
-                if named.state is None:
+                if named.error is not None:
+                    notice = f"{named.hub.name}: {named.error}"
+                elif named.state is None:
                     setup_outcome = _hub_setup_wizard(win, named.hub)
                     if setup_outcome == "quit":
                         return None
@@ -4585,7 +4908,9 @@ def _launcher_main(win, cfg, db_ids):
                 return view[idx]
         elif ch in (ord("\t"), ord("m"), curses.KEY_RIGHT) and hub_focus and hubs:
             named = hubs[hub_idx]
-            if named.state is None:
+            if named.error is not None:
+                notice = f"{named.hub.name}: {named.error}"
+            elif named.state is None:
                 setup_outcome = _hub_setup_wizard(win, named.hub)
                 if setup_outcome == "quit":
                     return None
@@ -4762,6 +5087,7 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
     claude_args: list[str] = []
     first_positional = True
     passthrough = False
+    ambiguous_hub_positional = False
 
     def select_backend(requested: str) -> None:
         nonlocal backend
@@ -4775,6 +5101,12 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
         if passthrough:
             claude_args.append(arg)
             continue
+        if ambiguous_hub_positional:
+            ambiguous_hub_positional = False
+            if not arg.startswith("-"):
+                raise RuntimeError(
+                    "--hub 后的位置参数含义不明确；提示词请放在 -- 后"
+                )
         if arg == "--":
             claude_args.append(arg)
             passthrough = True
@@ -4814,6 +5146,7 @@ def parse_args(argv: list[str]) -> tuple[str | None, str | None, list[str]]:
             if hint is not None:
                 raise RuntimeError("不能同时指定 provider 与 --hub；请二选一")
             select_backend("hub")
+            ambiguous_hub_positional = True
         else:
             claude_args.append(arg)
     return backend, hint, claude_args
@@ -4842,7 +5175,12 @@ def exec_plain_claude(label: str, claude_args: list[str]) -> int:
 
 
 def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
-    """Launch Claude with a private settings file and always remove it."""
+    """Launch Claude with one private settings overlay and a matching child env.
+
+    Claude applies user settings after its inherited process environment, so the
+    selected credential must also remain in this higher-precedence ``--settings``
+    overlay.  Otherwise CC Switch's global current credential can replace it.
+    """
     if TEMP_DIR is not None:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
@@ -4864,12 +5202,6 @@ def launch_with_settings(settings: dict, claude_args: list[str]) -> int:
             os.unlink(tmp_path)
         except OSError:
             pass
-
-
-def _free_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
 
 
 def _provider_models(
@@ -4905,6 +5237,8 @@ def _bridge_child_env(
         "CLAUDE_HUB_LOG": str(log),
         "CLAUDE_HUB_PORT": str(port),
         "CLAUDE_HUB_LOCAL_TOKEN": local_token,
+        "CLAUDE1_ACCOUNT_POOL_CONFIG": str(ACCOUNT_POOL_CONFIG),
+        "CLAUDE1_ACCOUNT_POOL_STATE": str(ACCOUNT_POOL_STATE),
     }
     for key in ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"):
         value = os.environ.get(key)
@@ -4918,8 +5252,10 @@ def launch_with_protocol_bridge(
     settings: dict,
     api_format: str,
     claude_args: list[str],
+    *,
+    transport: dict | None = None,
 ) -> int:
-    """Run one isolated Hub for a non-Anthropic provider, then remove it.
+    """Run one isolated Hub for protocol or transport routing, then remove it.
 
     This preserves claude1's session-isolation contract: the CC Switch current
     provider and its shared proxy are never changed, so concurrent sessions can
@@ -4938,13 +5274,17 @@ def launch_with_protocol_bridge(
         runtime = Path(raw_dir)
         config_path = runtime / "hub.json"
         log_path = runtime / "hub.log"
-        port = _free_loopback_port()
+        listener = _reserve_loopback_port()
+        port = int(listener.getsockname()[1])
         local_token = secrets.token_urlsafe(32)
+        if transport is None:
+            transport = provider_transport_config(provider, settings)
         config = {
             "version": 1,
             "port": port,
             "local_token_env": "CLAUDE_HUB_LOCAL_TOKEN",
             "default_channel": "direct",
+            "transport": transport,
             "channels": {
                 "direct": {
                     "provider": f"id:{provider['id']}",
@@ -4958,48 +5298,53 @@ def launch_with_protocol_bridge(
             json.dumps(config, ensure_ascii=False, separators=(",", ":")),
         )
 
-        with _open_private_append(log_path) as log:
-            process = subprocess.Popen(
-                [str(HUB_SCRIPT), "serve"],
-                stdout=log,
-                stderr=log,
-                env=_bridge_child_env(
+        with listener:
+            process = _spawn_hub_process(
+                log_path,
+                _bridge_child_env(
                     config=config_path,
                     log=log_path,
                     port=port,
                     local_token=local_token,
                 ),
-                close_fds=True,
-                start_new_session=True,
+                listener,
             )
-        try:
-            deadline = time.monotonic() + _hub_start_timeout()
-            while time.monotonic() < deadline:
-                if hub_healthy(port, local_token):
-                    break
-                return_code = process.poll()
-                if return_code is not None:
-                    raise RuntimeError(
-                        f"协议桥提前退出（状态 {return_code}），日志: {log_path}"
+            try:
+                deadline = time.monotonic() + _hub_start_timeout()
+                while time.monotonic() < deadline:
+                    if hub_healthy(port, local_token):
+                        break
+                    return_code = process.poll()
+                    if return_code is not None:
+                        raise RuntimeError(
+                            f"协议桥提前退出（状态 {return_code}），"
+                            f"日志: {log_path}"
+                        )
+                    time.sleep(
+                        min(0.25, max(0.0, deadline - time.monotonic()))
                     )
-                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-            else:
-                raise RuntimeError(f"协议桥启动超时，日志: {log_path}")
+                else:
+                    raise RuntimeError(f"协议桥启动超时，日志: {log_path}")
 
-            bridged = json.loads(json.dumps(settings))
-            env = bridged.setdefault("env", {})
-            env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
-            env["ANTHROPIC_AUTH_TOKEN"] = local_token
-            env.pop("ANTHROPIC_API_KEY", None)
-            env["NO_PROXY"] = "127.0.0.1,localhost"
-            env["no_proxy"] = "127.0.0.1,localhost"
-            print(
-                f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
-                f"(隔离端口 {port})"
-            )
-            return launch_with_settings(bridged, claude_args)
-        finally:
-            _stop_spawned_process(process)
+                # The child now accepts on the inherited descriptor; retaining
+                # the parent duplicate would mask an unexpected child exit.
+                listener.close()
+                bridged = json.loads(json.dumps(settings))
+                env = bridged.setdefault("env", {})
+                env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+                env["ANTHROPIC_AUTH_TOKEN"] = local_token
+                env.pop("ANTHROPIC_API_KEY", None)
+                env["NO_PROXY"] = "127.0.0.1,localhost"
+                env["no_proxy"] = "127.0.0.1,localhost"
+                reason = (
+                    f"协议适配: Anthropic Messages ↔ {api_format}"
+                    if api_format != "anthropic"
+                    else f"传输路由: {transport['mode']}"
+                )
+                print(f"[claude1] {reason} (隔离端口 {port})")
+                return launch_with_settings(bridged, claude_args)
+            finally:
+                _stop_spawned_process(process)
 
 
 def _extract_hub_model(claude_args: list[str]) -> tuple[str | None, list[str]]:
@@ -5013,7 +5358,10 @@ def _extract_hub_model(claude_args: list[str]) -> tuple[str | None, list[str]]:
             forwarded.extend(claude_args[index:])
             break
         if arg == "--model":
-            if index + 1 >= len(claude_args):
+            if (
+                index + 1 >= len(claude_args)
+                or claude_args[index + 1].startswith("-")
+            ):
                 raise RuntimeError("hub --model 后需要 <渠道,模型>")
             value = claude_args[index + 1]
             index += 2
@@ -5041,7 +5389,10 @@ def _extract_hub_slot(claude_args: list[str]) -> tuple[str | None, list[str]]:
             forwarded.extend(claude_args[index:])
             break
         if arg == "--slot":
-            if index + 1 >= len(claude_args):
+            if (
+                index + 1 >= len(claude_args)
+                or claude_args[index + 1].startswith("-")
+            ):
                 raise RuntimeError("hub --slot 后需要 fable、opus、sonnet 或 haiku")
             value = claude_args[index + 1]
             index += 2
@@ -5116,7 +5467,12 @@ def _resume_session_selector(
     last_model: str | None = None
     with transcript.open(encoding="utf-8") as handle:
         for line in handle:
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
             message = entry.get("message") if entry.get("type") == "assistant" else None
             model = message.get("model") if isinstance(message, dict) else None
             if isinstance(model, str) and model:
@@ -5162,20 +5518,6 @@ def _hub_model_slots(
 def _unique_slot_for_selector(selector: str, slot_models: dict[str, str]) -> str | None:
     matches = [slot.casefold() for slot, model in slot_models.items() if model == selector]
     return matches[0] if len(matches) == 1 else None
-
-
-def _hub_effort_capabilities(effort_level: str | None) -> str:
-    """Advertise the thinking features needed for custom Hub model slots.
-
-    Claude Code treats custom model ids conservatively unless their slot's
-    ``SUPPORTED_CAPABILITIES`` explicitly opts in.  Without these flags an
-    xhigh session can still display xhigh while silently omitting or lowering
-    the API-side thinking request.
-    """
-    if effort_level is None:
-        return ""
-    capabilities = ["thinking", "adaptive_thinking", "effort", "xhigh_effort"]
-    return ",".join(capabilities)
 
 
 def exec_hub(
@@ -5246,9 +5588,9 @@ def exec_hub(
     instance_id = hub_cfg.get("instance_id")
     runtime_hub = hub_ref if HUB_CATALOG_ENABLED else None
     if runtime_hub is None and not isinstance(instance_id, str):
-        ensure_hub(port, token=token, token_env=token_env)
+        port = ensure_hub(port, token=token, token_env=token_env)
     else:
-        ensure_hub(
+        port = ensure_hub(
             port,
             token=token,
             token_env=token_env,
@@ -5268,9 +5610,10 @@ def exec_hub(
         settings_env[model_key] = selector
         settings_env[f"{model_key}_NAME"] = upstream_model
         settings_env[f"{model_key}_DESCRIPTION"] = f"Claude-Hub · {alias}"
-        slot_effort = efforts[tier.casefold()]
+        # Capabilities describe what a custom model slot can run. The persisted
+        # effort controls only this session's starting level, not the /model UI.
         settings_env[f"{model_key}_SUPPORTED_CAPABILITIES"] = (
-            _hub_effort_capabilities(slot_effort)
+            HUB_MODEL_SLOT_CAPABILITIES
         )
     _seal_model_slots(settings_env)
     settings = {"env": settings_env}
@@ -5292,6 +5635,7 @@ CLAUDE1_USAGE = f"""claude1 {VERSION} — 为本次 Claude Code 会话选择渠�
   claude1 hub [--slot 槽位 | --model 渠道,模型]
                                        进入可用 /model 热切换的 Hub
   claude1 list [--all]                 查看渠道，不启动 Claude
+  claude1 accounts ...                 将同一上游的多个 CC Switch key 组成账号池
   claude1 doctor [--fix]               检查本机配置；--fix 清理子代理模型固定值
   claude1 usage [--day|--week|--month] 查看 token 用量与缓存命中率曲线
   claude1 use <backend>                显式设置普通 claude 的粘性后端
@@ -5343,6 +5687,223 @@ def cli_list_providers(show_all: bool = False) -> int:
         f"\n共 {len(provider_ids)} 个；运行 `claude1 <名称、别名或 id:ID>` 可直接启动。"
     )
     return 0
+
+
+def _account_provider_by_hint(providers: list[dict], hint: str) -> dict:
+    matches, exact = match_providers(providers, hint)
+    if len(matches) == 1:
+        return matches[0]
+    labels = _provider_labels(providers)
+    if len(matches) > 1:
+        rendered = "、".join(labels[str(provider["id"])] for provider in matches)
+        qualifier = "名称冲突" if exact else "匹配不唯一"
+        raise RuntimeError(f"账号 provider {qualifier}: {rendered}；请使用 id:ID")
+    raise RuntimeError(f"找不到账号 provider: {hint}")
+
+
+def _account_ref_by_hint(
+    providers: list[dict],
+    hint: str,
+) -> tuple[str, dict | None]:
+    """Resolve a live provider, or retain an explicit orphaned stable id."""
+    try:
+        provider = _account_provider_by_hint(providers, hint)
+    except RuntimeError:
+        if (
+            isinstance(hint, str)
+            and hint.startswith("id:")
+            and len(hint) > 3
+            and not any(ord(char) < 32 or ord(char) == 127 for char in hint)
+        ):
+            return hint, None
+        raise
+    return f"id:{provider['id']}", provider
+
+
+def _account_add_options(args: list[str]) -> tuple[str, str, int, int]:
+    if len(args) < 2:
+        raise RuntimeError(
+            "用法: claude1 accounts add <主provider> <账号provider> "
+            "[--weight N] [--priority N]"
+        )
+    primary, member = args[0], args[1]
+    weight, priority = 1, 0
+    index = 2
+    while index < len(args):
+        option = args[index]
+        if option not in ("--weight", "--priority") or index + 1 >= len(args):
+            raise RuntimeError(f"accounts add 不支持参数: {option}")
+        try:
+            value = int(args[index + 1])
+        except ValueError:
+            raise RuntimeError(f"{option} 必须是整数") from None
+        if option == "--weight":
+            weight = value
+        else:
+            priority = value
+        index += 2
+    return primary, member, weight, priority
+
+
+def cli_accounts(args: list[str]) -> int:
+    """Manage non-secret groups of existing CC Switch provider accounts."""
+    action = args[0].casefold() if args else "list"
+    providers = [_provider_from_row(row) for row in db_claude_rows()]
+    by_selector = {f"id:{provider['id']}": provider for provider in providers}
+    labels = _provider_labels(providers)
+    store = PoolConfigStore(ACCOUNT_POOL_CONFIG)
+    scheduler = AccountPool(ACCOUNT_POOL_CONFIG, ACCOUNT_POOL_STATE)
+
+    if action == "list":
+        if len(args) > 2:
+            raise RuntimeError("用法: claude1 accounts list [provider]")
+        definitions = scheduler.definitions()
+        if len(args) == 2:
+            selector, _selected = _account_ref_by_hint(providers, args[1])
+            definitions = {
+                selector: definitions[selector]
+            } if selector in definitions else {}
+        if not definitions:
+            print(
+                "claude1: 尚未配置账号池。先在 CC Switch 为每个 key 建独立 "
+                "provider，再运行 `claude1 accounts add <主provider> <账号provider>`。"
+            )
+            return 0
+        for primary, definition in definitions.items():
+            primary_provider = by_selector.get(primary)
+            title = (
+                labels.get(str(primary_provider["id"]), primary)
+                if primary_provider is not None
+                else primary
+            )
+            print(f"{title}  · {definition.strategy}")
+            try:
+                records, candidates, _credentials = _account_pool_directory(
+                    primary_provider or {"id": primary.removeprefix("id:")},
+                    definition,
+                    providers,
+                )
+                statuses = {
+                    item.member: item
+                    for item in scheduler.inspect(primary, candidates)
+                }
+            except (RuntimeError, AccountPoolError):
+                records, statuses = by_selector, {}
+            for member in definition.members:
+                record = records.get(member.selector)
+                name = (
+                    labels.get(str(record["id"]), member.selector)
+                    if isinstance(record, dict) and "id" in record
+                    else member.selector
+                )
+                state = statuses.get(member.selector)
+                state_text = state.state if state is not None else "配置不可用"
+                if state is not None and state.retry_after is not None:
+                    state_text += f" {state.retry_after}s"
+                print(
+                    f"  - {name} · priority={member.priority} "
+                    f"weight={member.weight} · {state_text}"
+                )
+        return 0
+
+    if action in ("add", "set"):
+        primary_hint, member_hint, weight, priority = _account_add_options(args[1:])
+        primary_provider = _account_provider_by_hint(providers, primary_hint)
+        member_provider = _account_provider_by_hint(providers, member_hint)
+        primary = f"id:{primary_provider['id']}"
+        member = f"id:{member_provider['id']}"
+        if primary == member and action == "add":
+            raise RuntimeError("账号池成员必须是另一个 CC Switch provider")
+        primary_key, primary_token, primary_base = _provider_account_credential(
+            primary_provider
+        )
+        member_key, member_token, member_base = _provider_account_credential(
+            member_provider
+        )
+        if not primary_token or not member_token:
+            raise RuntimeError("主 provider 与账号 provider 都必须有独立凭证")
+        if primary_base != member_base or primary_key != member_key:
+            raise RuntimeError("两个账号必须使用相同上游 URL 和相同凭证类型")
+        member_fingerprint = credential_fingerprint(member_token)
+        definition = scheduler.definition(primary)
+        existing_members = definition.members if definition is not None else ()
+        for existing in existing_members:
+            if not existing.enabled or existing.selector == member:
+                continue
+            existing_provider = by_selector.get(existing.selector)
+            if existing_provider is None:
+                continue
+            _existing_key, existing_token, _existing_base = (
+                _provider_account_credential(existing_provider)
+            )
+            if (
+                existing_token
+                and credential_fingerprint(existing_token) == member_fingerprint
+            ):
+                raise RuntimeError("两个账号 provider 实际使用了同一个凭证")
+        if (
+            definition is None
+            and primary != member
+            and credential_fingerprint(primary_token) == member_fingerprint
+        ):
+            raise RuntimeError("两个账号 provider 实际使用了同一个凭证")
+        store.upsert_member(
+            primary,
+            member,
+            weight=weight,
+            priority=priority,
+        )
+        print(
+            f"[claude1] 已加入账号池: {primary_provider['name']} ← "
+            f"{member_provider['name']} (priority={priority}, weight={weight})"
+        )
+        return 0
+
+    if action == "policy":
+        if len(args) != 3:
+            raise RuntimeError(
+                "用法: claude1 accounts policy <主provider> <round-robin|weighted>"
+            )
+        primary, _primary_provider = _account_ref_by_hint(providers, args[1])
+        strategy = args[2].replace("-", "_").casefold()
+        store.set_strategy(primary, strategy)
+        print(f"[claude1] 账号池策略已设为 {strategy}")
+        return 0
+
+    if action == "remove":
+        if len(args) != 3:
+            raise RuntimeError("用法: claude1 accounts remove <主provider> <账号provider>")
+        primary, _primary_provider = _account_ref_by_hint(providers, args[1])
+        member, member_provider = _account_ref_by_hint(providers, args[2])
+        store.remove_member(primary, member)
+        scheduler.reset(primary, member)
+        member_label = member_provider["name"] if member_provider is not None else member
+        print(f"[claude1] 已从账号池移除: {member_label}")
+        return 0
+
+    if action == "delete":
+        if len(args) != 2:
+            raise RuntimeError("用法: claude1 accounts delete <主provider>")
+        primary, _primary_provider = _account_ref_by_hint(providers, args[1])
+        deleted = store.delete_pool(primary)
+        scheduler.reset(primary)
+        print("[claude1] 账号池已删除" if deleted else "[claude1] 账号池不存在")
+        return 0
+
+    if action == "reset":
+        if len(args) not in (2, 3):
+            raise RuntimeError("用法: claude1 accounts reset <主provider> [账号provider]")
+        primary, _primary_provider = _account_ref_by_hint(providers, args[1])
+        member = None
+        if len(args) == 3:
+            member, _member_provider = _account_ref_by_hint(providers, args[2])
+        changed = scheduler.reset(primary, member)
+        print(f"[claude1] 已重置 {changed} 条账号运行状态")
+        return 0
+
+    raise RuntimeError(
+        "accounts 子命令: list、add、set、policy、remove、delete、reset"
+    )
 
 
 def _usage_window(args: list[str]) -> tuple[str, int] | None:
@@ -5469,6 +6030,11 @@ def _supports_color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
 
+def _scale_chart_index(index: float, count: int, extent: int) -> int:
+    """Map one bucket index onto an inclusive chart coordinate range."""
+    return round(index * (extent - 1) / max(1, count - 1))
+
+
 def _braille_chart(
     series: list[tuple[list[float], str]],
     width: int,
@@ -5484,7 +6050,7 @@ def _braille_chart(
     span = ymax - ymin or 1.0
 
     def to_px(idx: int, v: float) -> tuple[int, int]:
-        x = round(idx * (cols - 1) / max(1, len_vals - 1))
+        x = _scale_chart_index(idx, len_vals, cols)
         frac = (v - ymin) / span
         y = rows_px - 1 - round(frac * (rows_px - 1))
         return x, y
@@ -5603,8 +6169,10 @@ def _ascii_chart(
     marks: list[tuple[int, str]] = []
     for k in range(n_ticks + 1):
         t = start + span * k / n_ticks
-        # 与数据点同一映射：时间 t 落在桶索引 [0, n-1]，再按 per 拉伸到画布列
-        x = round((t - start) / span * (n - 1)) * per
+        bucket_index = (t - start) / span * (n - 1)
+        # Curves use a 2× horizontal Braille grid; map with the same formula,
+        # then select the character that owns that subpixel.
+        x = _scale_chart_index(bucket_index, n, width * 2) // 2
         # day 窗口首尾都是同一时刻（差 24h），用相对标签区分
         if mode == "day" and k == 0:
             lab = "-24h"
@@ -5687,7 +6255,7 @@ def cli_usage(args: list[str]) -> int:
     return 0
 
 
-def fix_subagent_model_overrides() -> tuple[list[str], Path]:
+def fix_subagent_model_overrides() -> tuple[list[str], list[str], Path]:
     """Back up the CC Switch DB, then remove persisted subagent model pins."""
     backup_path = DB_PATH.with_name(
         f"{DB_PATH.name}.bak-doctor-fix-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -5695,6 +6263,7 @@ def fix_subagent_model_overrides() -> tuple[list[str], Path]:
     shutil.copy2(DB_PATH, backup_path)
 
     changed: list[str] = []
+    invalid: list[str] = []
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         with conn:
@@ -5702,9 +6271,18 @@ def fix_subagent_model_overrides() -> tuple[list[str], Path]:
                 "SELECT id, name, settings_config FROM providers ORDER BY app_type, sort_index"
             ).fetchall()
             for provider_id, name, raw_settings in rows:
-                settings = json.loads(raw_settings or "{}")
-                env = settings.get("env") if isinstance(settings, dict) else None
-                if not isinstance(env, dict) or SUBAGENT_MODEL_KEY not in env:
+                provider = {
+                    "id": provider_id,
+                    "name": name,
+                    "settings_config": raw_settings,
+                }
+                try:
+                    settings = _provider_settings(provider)
+                    env = _provider_environment(provider, settings)
+                except RuntimeError:
+                    invalid.append(str(name))
+                    continue
+                if SUBAGENT_MODEL_KEY not in env:
                     continue
                 env.pop(SUBAGENT_MODEL_KEY)
                 conn.execute(
@@ -5714,7 +6292,7 @@ def fix_subagent_model_overrides() -> tuple[list[str], Path]:
                 changed.append(str(name))
     finally:
         conn.close()
-    return changed, backup_path
+    return changed, invalid, backup_path
 
 
 def cli_doctor(*, fix: bool = False) -> int:
@@ -5727,15 +6305,18 @@ def cli_doctor(*, fix: bool = False) -> int:
             failures += 1
         print(f"  {level:<4} {message}")
 
+    invalid_fixed: list[str] = []
     if fix:
-        changed, backup_path = fix_subagent_model_overrides()
+        changed, invalid_fixed, backup_path = fix_subagent_model_overrides()
         print("claude1 doctor --fix（不连接上游）\n")
         print(f"  BACKUP {backup_path}")
         for name in changed:
             print(f"  FIX  {name}: 已移除 {SUBAGENT_MODEL_KEY}")
+        for name in invalid_fixed:
+            report("FAIL", f"{name}: settings_config 无效，已跳过")
         print()
     else:
-        print("claude1 doctor（本机只读，不连接上游）\n")
+        print("claude1 doctor（只读配置与传输检查）\n")
     if sys.version_info >= (3, 11):
         report("OK", f"Python {sys.version_info.major}.{sys.version_info.minor}")
     else:
@@ -5756,7 +6337,10 @@ def cli_doctor(*, fix: bool = False) -> int:
         report("OK", f"CC Switch 数据库只读打开，发现 {len(rows)} 个 Claude 渠道")
         if os.name == "posix" and (DB_PATH.stat().st_mode & 0o077):
             report("FAIL", "CC Switch 数据库含凭证，文件权限应为 0600")
-        overrides = subagent_model_overrides()
+        overrides, invalid_settings = subagent_model_overrides()
+        for name in invalid_settings:
+            if name not in invalid_fixed:
+                report("FAIL", f"{name}: settings_config 无效")
         if overrides:
             report(
                 "INFO",
@@ -5775,6 +6359,43 @@ def cli_doctor(*, fix: bool = False) -> int:
                 "有渠道需要本地网关，但未找到可执行 cliproxyapi；"
                 "请安装它或设置 CLAUDE1_GATEWAY_BIN",
             )
+
+    if not fix:
+        current_row = next(
+            (
+                row
+                for row in rows
+                if "is_current" in row.keys() and bool(row["is_current"])
+            ),
+            None,
+        )
+        if current_row is not None:
+            current = _provider_from_row(current_row)
+            try:
+                settings = _provider_settings(current)
+                env = _provider_environment(current, settings)
+                endpoint = normalize_account_endpoint(
+                    env.get("ANTHROPIC_BASE_URL")
+                )
+                if endpoint:
+                    transport = provider_transport_config(current, settings)
+                    policy = resolve_transport_policy(endpoint, transport)
+                    probes = diagnose_transport_policy(
+                        endpoint,
+                        policy,
+                        timeout=4.0,
+                    )
+                    any_ok = any(probe.ok for probe in probes)
+                    for probe in probes:
+                        level = "OK" if probe.ok else ("INFO" if any_ok else "FAIL")
+                        report(level, f"{probe.identity}: {probe.detail}")
+                    if any_ok:
+                        report("OK", f"当前 provider {current['name']} 至少一条传输可用")
+            except (RuntimeError, TransportConfigError, OSError, ValueError) as exc:
+                report(
+                    "FAIL",
+                    f"当前 provider 传输诊断失败: {type(exc).__name__}: {exc}",
+                )
 
     if CONFIG_PATH.exists():
         try:
@@ -5812,6 +6433,11 @@ def launch_provider(
     backend_kind: str = "provider",
 ) -> int:
     settings = build_settings(selected)
+    api_format = selected_provider_api_format(selected)
+    transport = provider_transport_config(selected, settings)
+    account_label = None
+    if api_format == "anthropic" and transport["mode"] == "direct":
+        settings, account_label = apply_native_account_pool(selected, settings)
     add_anyrouter_observer(settings, selected["name"])
     record_use(str(selected["id"]))
     record_backend(backend_kind, selected["name"])
@@ -5819,13 +6445,15 @@ def launch_provider(
         print(f"[claude1] 本次使用 CC Switch 当前 provider: {selected['name']}")
     else:
         print(f"[claude1] 本次使用 provider: {selected['name']}")
-    api_format = selected_provider_api_format(selected)
-    if api_format != "anthropic":
+    if account_label is not None:
+        print(f"[claude1] 账号池本次选择: {account_label}")
+    if api_format != "anthropic" or transport["mode"] != "direct":
         return launch_with_protocol_bridge(
             selected,
             settings,
             api_format,
             claude_args,
+            transport=transport,
         )
     ensure_local_gateway(settings.get("env", {}).get("ANTHROPIC_BASE_URL", ""))
     return launch_with_settings(settings, claude_args)
@@ -5852,6 +6480,8 @@ def main(argv: list[str]) -> int:
         return cli_doctor(fix=doctor_args == ["--fix"])
     if argv and argv[0] == "usage":
         return cli_usage(argv[1:])
+    if argv and argv[0] == "accounts":
+        return cli_accounts(argv[1:])
     if argv and argv[0] == "use":
         if len(argv) < 2:
             print(
