@@ -54,6 +54,11 @@ credential 指纹、401/403 停用和 429 冷却，不保存 token。
 
 ## 阶段 2：CC Switch provider 快照热路径（下一优先级）
 
+**已落地（2026-08-16）**：实施设计见 `docs/provider-snapshot-cache-design.md`
+（含实施结果基准），任务拆解见 `docs/provider-snapshot-cache-issues.md`。
+命中路径零复制（p50 40.5ms → 0.02ms），权限检查仍在每次调用先执行，
+`reset_caches()` 是测试隔离闸门。以下原文保留作历史记录。
+
 当前 `claude-hub.py` 的每个请求都会执行 `get_providers()`：复制 CC Switch SQLite
 main file 和 WAL 到临时目录，再打开快照并解析所有 Claude provider。这样保证读取
 稳定和权限边界，但把数据库大小直接乘到每个 LLM 请求上。
