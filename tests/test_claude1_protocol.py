@@ -1413,3 +1413,158 @@ class StreamingTransformTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsageReceiptTests(unittest.TestCase):
+    """Usage evidence → canonical usage：complete/stream 共用一套规则。"""
+
+    def test_complete_anthropic_usage_passes_through_unchanged(self) -> None:
+        receipt = protocol.UsageReceipt.from_upstream(
+            {
+                "input_tokens": 120,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 500,
+                "cache_creation_input_tokens": 60,
+            }
+        )
+        self.assertEqual(
+            receipt.as_anthropic(),
+            {
+                "input_tokens": 120,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 500,
+                "cache_creation_input_tokens": 60,
+            },
+        )
+        self.assertEqual(receipt.source, "upstream")
+
+    def test_nested_openai_carrier_proves_inclusive_base(self) -> None:
+        receipt = protocol.UsageReceipt.from_upstream(
+            {
+                "prompt_tokens": 620,
+                "completion_tokens": 34,
+                "prompt_tokens_details": {"cached_tokens": 500},
+            },
+            input_key="prompt_tokens",
+            output_key="completion_tokens",
+        )
+        # 标准 nested carrier 有证据表明 base 已包含 cached tokens，
+        # 转 Anthropic 语义时必须排除。
+        self.assertEqual(receipt.input_tokens, 120)
+        self.assertEqual(receipt.cache_read, 500)
+
+    def test_top_level_compat_cache_field_alone_is_ambiguous(self) -> None:
+        receipt = protocol.UsageReceipt.from_upstream(
+            {
+                "prompt_tokens": 620,
+                "completion_tokens": 34,
+                "cache_read_tokens": 500,
+            },
+            input_key="prompt_tokens",
+            output_key="completion_tokens",
+        )
+        # 顶层兼容字段无法单独证明 base 是 inclusive 还是 split：
+        # 既不从 base 扣减，也不产出 cache-read —— 拒绝猜测。
+        self.assertIsNone(receipt.cache_read)
+        self.assertEqual(receipt.input_tokens, 620)
+
+    def test_complete_conversion_omits_unobserved_usage_counters(self) -> None:
+        body = protocol.transform_response(
+            {
+                "id": "chatcmpl-1",
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            "openai_chat",
+        )
+        # 上游没报 base usage：schema 完整性要求发 0，但 provenance
+        # 降级必须可观测（记账侧据此剥掉这些字段）。
+        self.assertEqual(body["usage"]["input_tokens"], 0)
+        self.assertEqual(body["usage"]["output_tokens"], 0)
+        self.assertIn(
+            "HUB_USAGE_PROVENANCE_UNAVAILABLE",
+            protocol.prepare_response(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                "openai_chat",
+            ).plan.warning_codes,
+        )
+
+    def test_responses_conversion_omits_unobserved_usage_counters(self) -> None:
+        body = protocol.transform_response(
+            {
+                "id": "resp_2",
+                "model": "responses-model",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "answer"}],
+                    }
+                ],
+            },
+            "openai_responses",
+        )
+        # Responses 上游同样：0 + provenance 降级可观测。
+        self.assertEqual(body["usage"]["input_tokens"], 0)
+        self.assertEqual(body["usage"]["output_tokens"], 0)
+
+    def test_conflicting_cache_read_carriers_are_rejected(self) -> None:
+        with self.assertRaises(protocol.ProtocolTransformError) as ctx:
+            protocol.UsageReceipt.from_upstream(
+                {
+                    "prompt_tokens": 620,
+                    "completion_tokens": 34,
+                    "prompt_tokens_details": {"cached_tokens": 500},
+                    "cache_read_input_tokens": 480,
+                },
+                input_key="prompt_tokens",
+                output_key="completion_tokens",
+            )
+        self.assertEqual(
+            ctx.exception.code, "HUB_UPSTREAM_USAGE_INVALID"
+        )
+
+    def test_chat_stream_applies_same_cache_evidence_rule_as_complete(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        bridge.feed(
+            "message",
+            json.dumps({"choices": [{"delta": {"content": "hi"}}]}),
+        )
+        bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                        "prompt_tokens_details": {"cached_tokens": 40},
+                    },
+                }
+            ),
+        )
+        events = [line for line in b"".join(bridge.finish()).splitlines()]
+        delta_usage = None
+        for line in events:
+            if line.startswith(b"data:"):
+                payload = json.loads(line[5:].strip())
+                if payload.get("type") == "message_delta":
+                    delta_usage = payload.get("usage")
+        # complete 转换对同一输入产出 input_tokens=60（nested 证据扣 40），
+        # stream 必须共用同一规则，不能保留 inclusive base 造成双计。
+        self.assertIsNotNone(delta_usage)
+        self.assertEqual(delta_usage.get("input_tokens"), 60)
+        self.assertEqual(delta_usage.get("cache_read_input_tokens"), 40)
