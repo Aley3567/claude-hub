@@ -383,32 +383,6 @@ def record_usage(
         pass
 
 
-def _usage_for_recording(usage: object, plan: object) -> tuple[dict, str]:
-    """Remove schema placeholders that are not observed upstream counters."""
-    observed = dict(usage) if isinstance(usage, dict) else {}
-    decisions = getattr(plan, "decisions", ())
-    unavailable_features = {
-        getattr(decision, "feature", None)
-        for decision in decisions
-        if getattr(decision, "code", None)
-        == "HUB_USAGE_PROVENANCE_UNAVAILABLE"
-    }
-    if "input_usage" in unavailable_features:
-        observed.pop("input_tokens", None)
-    if "output_usage" in unavailable_features:
-        observed.pop("output_tokens", None)
-    usage_fields = {
-        "input_tokens",
-        "output_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-        "cache_creation",
-        "server_tool_use",
-    }
-    source = "upstream" if usage_fields.intersection(observed) else "unavailable"
-    return observed, source
-
-
 def _usage_from_json_bytes(
     raw: bytes | bytearray,
     headers=None,
@@ -2217,7 +2191,7 @@ def _append_bounded_json_buffer(
     return buffer
 
 
-def _synthesize_message_stream(body: dict, plan: object) -> bytes:
+def _synthesize_message_stream(body: dict, usage: dict) -> bytes:
     """Render one complete Anthropic message as a one-shot SSE stream."""
     content = body.get("content")
     if not isinstance(content, list):
@@ -2225,7 +2199,6 @@ def _synthesize_message_stream(body: dict, plan: object) -> bytes:
             "upstream message content must be an array",
             code="HUB_UPSTREAM_RESPONSE_INVALID",
         )
-    usage, _source = _usage_for_recording(body.get("usage"), plan)
     message = {
         "id": body.get("id"),
         "type": "message",
@@ -2236,8 +2209,9 @@ def _synthesize_message_stream(body: dict, plan: object) -> bytes:
         "stop_sequence": None,
     }
     if usage:
-        # Only counters actually observed upstream are emitted; placeholders
-        # without provenance were removed by _usage_for_recording.
+        # Only counters actually observed upstream are emitted; the caller
+        # passes the receipt-derived accounting view, which has no
+        # schema-complete zero placeholders to strip.
         message["usage"] = usage
     events = [
         sse_event("message_start", {"type": "message_start", "message": message})
@@ -2477,18 +2451,18 @@ async def _handle_transformed_messages(
                         (*request_warning_codes, *prepared_response.plan.warning_codes)
                     )
                 )
-                observed_usage, usage_source = _usage_for_recording(
-                    body.get("usage") if isinstance(body, dict) else None,
-                    prepared_response.plan,
-                )
+                # The ledger reads the same receipt the downstream payload
+                # was rendered from, so schema-complete zero placeholders
+                # never reach accounting.
+                usage_view = prepared_response.usage_for_accounting()
                 record_usage(
                     alias,
                     model_out,
                     api_format,
-                    observed_usage,
+                    usage_view,
                     instance_id=cfg.get("instance_id"),
                     account_id=account_attempt.lease.member,
-                    source=usage_source,
+                    source=("upstream" if usage_view else "unavailable"),
                 )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -2512,9 +2486,7 @@ async def _handle_transformed_messages(
                     # Anthropic SSE sequence Claude Code expects.
                     response_headers["cache-control"] = "no-cache"
                     return web.Response(
-                        body=_synthesize_message_stream(
-                            body, prepared_response.plan
-                        ),
+                        body=_synthesize_message_stream(body, usage_view),
                         status=upstream.status,
                         content_type="text/event-stream",
                         headers=response_headers,
@@ -3092,9 +3064,12 @@ async def _forward_to_channel(
                     native_usage,
                     instance_id=cfg.get("instance_id"),
                     account_id=account_attempt.lease.member,
+                    # An empty usage object carries no observed counter, so
+                    # it is not upstream evidence — same rule as the other
+                    # three accounting exits.
                     source=(
                         "upstream"
-                        if native_usage is not None
+                        if native_usage
                         else "unavailable"
                     ),
                 )
