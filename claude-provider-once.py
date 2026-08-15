@@ -466,6 +466,26 @@ def managed_key(key: str) -> bool:
     )
 
 
+# Claude Code only recognizes its own ``claude-*`` model ids; any other name
+# (GLM-5.2, gpt-5.6-sol, Deepseek-v4-flash, ...) triggers a startup warning and
+# forces a 200k auto-compact window that does not match a bridged upstream's
+# real context window. ``claude_child_env`` auto-repairs that case by restoring
+# the wait-for-the-API behavior the warning itself recommends.
+_MODEL_ENV_KEYS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
+def _is_recognized_claude_model(name: str) -> bool:
+    # ``[1m]`` is a client-side context selector, not part of the id.
+    stripped = name.replace("[1m]", "").replace("[1M]", "").strip().lower()
+    return stripped.startswith("claude-")
+
+
 def claude_child_env(settings: dict | None = None) -> dict[str, str]:
     """Build a Claude process environment without inherited routing state."""
     child = {
@@ -483,6 +503,22 @@ def claude_child_env(settings: dict | None = None) -> dict[str, str]:
         for key, value in settings_env.items():
             if isinstance(key, str) and value is not None:
                 child[key] = str(value)
+    # Auto-repair: a bridged/non-Claude model is not one Claude Code recognizes,
+    # so let the upstream API (which knows its own window) decide instead of
+    # forcing a guessed 200k auto-compact. Skip when the caller already pinned a
+    # real window or explicitly chose an enforcement mode.
+    if (
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in child
+        and "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT" not in child
+    ):
+        resolved = [child.get(key) for key in _MODEL_ENV_KEYS]
+        if any(
+            isinstance(model, str)
+            and model
+            and not _is_recognized_claude_model(model)
+            for model in resolved
+        ):
+            child["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
     return child
 
 
@@ -5640,10 +5676,6 @@ def launch_with_protocol_bridge(
                     else f"传输路由: {transport['mode']}"
                 )
                 print(f"[claude1] {reason} (隔离端口 {port})")
-                print(
-                    f"[claude1] 协议适配: Anthropic Messages ↔ {api_format} "
-                    f"(隔离端口 {port})"
-                )
                 # 桥已确认可用、即将真正启动时才计数，失败启动不入账。
                 record_use(str(provider["id"]))
                 record_backend(backend_kind, provider["name"])
