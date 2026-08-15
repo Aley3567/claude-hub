@@ -24,6 +24,8 @@ from socketserver import ThreadingTCPServer
 from types import SimpleNamespace
 from unittest import mock
 
+import claude1_usage_report as usage_report
+
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "claude-provider-once.py"
@@ -1284,7 +1286,7 @@ class LauncherSafetyTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                rows = launcher._load_usage_rows(usage, 50)
+                rows = usage_report._load_usage_rows(usage, 50)
 
         self.assertEqual([row["in"] for row in rows], [1, 2])
 
@@ -1295,13 +1297,13 @@ class LauncherSafetyTests(unittest.TestCase):
             with loaded_launcher(isolated_env(home)) as launcher:
                 usage = home / "usage.jsonl"
                 os.mkfifo(usage)
-                self.assertEqual(launcher._load_usage_rows(usage, 0), [])
+                self.assertEqual(usage_report._load_usage_rows(usage, 0), [])
 
                 usage.unlink()
                 target = home / "other.jsonl"
                 target.write_text(json.dumps({"ts": 100, "in": 9}), encoding="utf-8")
                 usage.symlink_to(target)
-                self.assertEqual(launcher._load_usage_rows(usage, 0), [])
+                self.assertEqual(usage_report._load_usage_rows(usage, 0), [])
 
     def test_claude_interrupt_is_forwarded_to_its_session_without_killing_it(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -1366,8 +1368,8 @@ class LauncherSafetyTests(unittest.TestCase):
                     launcher._hub_identity_color(len(colors)), colors[0]
                 )
                 self.assertEqual(launcher._hub_identity_color(-1), colors[-1])
-                self.assertEqual(launcher._scale_chart_index(0, 7, 28), 0)
-                self.assertEqual(launcher._scale_chart_index(6, 7, 28), 27)
+                self.assertEqual(usage_report._scale_chart_index(0, 7, 28), 0)
+                self.assertEqual(usage_report._scale_chart_index(6, 7, 28), 27)
 
     def test_missing_notion_config_is_not_forwarded_to_claude(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

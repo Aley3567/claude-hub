@@ -27,6 +27,7 @@
     "claude-provider-once.py",
     "claude1_account_pool.py",
     "claude1_transport.py",
+    "claude1_usage_report.py",
     "claude_hub_catalog.py",
     "statusline-model.py",
     "install.sh",

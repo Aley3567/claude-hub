@@ -9,7 +9,7 @@
 2. 发布前自检：
 
    ```bash
-   npm pack --dry-run          # 确认 tarball 包含 bin/、根目录 9 个 Python 模块、
+   npm pack --dry-run          # 确认 tarball 包含 bin/、根目录 10 个 Python 模块、
                                # shell 脚本、examples/ 与 README/LICENSE
    python3 -m unittest discover -s tests -p "test_*.py"
    ```
