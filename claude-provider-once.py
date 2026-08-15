@@ -806,6 +806,11 @@ def build_settings(provider: dict) -> dict:
     if model_override:
         env["ANTHROPIC_MODEL"] = model_override
     _seal_model_slots(env)
+    # 会话自描述：让 Claude Code 会话不用翻日志就能知道自己跑在哪个渠道。
+    # 只写渠道名与来源，绝不写凭证。
+    env["CLAUDE1_PROVIDER_NAME"] = str(provider.get("name") or "unknown")
+    env["CLAUDE1_PROVIDER_ID"] = str(provider.get("id") or "")
+    env["CLAUDE1_SESSION_SOURCE"] = "provider"
     cfg["env"] = env
 
     # Drop the cc-switch-specific top-level "model" alias (e.g. "opus[1m]");
@@ -5901,6 +5906,13 @@ def exec_hub(
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
         "ANTHROPIC_AUTH_TOKEN": token,
         "ANTHROPIC_MODEL": main_model,
+        # Claude Code 2.1.129+ makes gateway /v1/models discovery opt-in.
+        # The Hub endpoint is authenticated with this session's local token.
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+        # 会话自描述：渠道名与网关位置，方便会话内自查（不含凭证）。
+        "CLAUDE1_PROVIDER_NAME": str(hub_ref.name),
+        "CLAUDE1_SESSION_SOURCE": "hub",
+        "CLAUDE1_HUB_PORT": str(port),
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
