@@ -1198,6 +1198,13 @@ class ProviderModelEffortOverrideTests(unittest.TestCase):
                 settings = launcher.build_settings(self._provider())
 
         self.assertEqual(settings["env"]["ANTHROPIC_MODEL"], "fixture-env-model")
+        # 会话自描述只带渠道名，不带凭证。
+        self.assertEqual(
+            settings["env"]["CLAUDE1_SESSION_SOURCE"], "provider"
+        )
+        self.assertEqual(
+            settings["env"]["CLAUDE1_PROVIDER_NAME"], self._provider()["name"]
+        )
         self.assertNotIn("effortLevel", settings)
 
     def test_build_settings_ignores_invalid_override_values(self) -> None:
@@ -3596,9 +3603,22 @@ class LauncherSafetyTests(unittest.TestCase):
                             ],
                             "thinking,adaptive_thinking,effort,xhigh_effort",
                         )
-                    self.assertNotIn(
-                        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-                        settings["env"],
+                    self.assertEqual(
+                        settings["env"][
+                            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+                        ],
+                        "1",
+                    )
+                    # Session self-identification must name the hub without
+                    # ever carrying credentials.
+                    self.assertEqual(
+                        settings["env"]["CLAUDE1_SESSION_SOURCE"], "hub"
+                    )
+                    self.assertEqual(
+                        settings["env"]["CLAUDE1_HUB_PORT"], str(port)
+                    )
+                    self.assertIn(
+                        "CLAUDE1_PROVIDER_NAME", settings["env"]
                     )
                     self.assertEqual(
                         settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"],
