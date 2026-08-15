@@ -1,0 +1,56 @@
+{
+  "name": "@yufeng-dev/model-bridge",
+  "version": "1.0.0",
+  "description": "Multi-model gateway and channel launcher for Claude Code — switch models anytime, keep every channel isolated",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aley3567/claude-hub.git"
+  },
+  "bin": {
+    "model-bridge": "bin/model-bridge.js",
+    "modelbridge": "bin/model-bridge.js"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "claude-hub.py",
+    "claude1_protocol.py",
+    "claude-provider-once.py",
+    "claude1_account_pool.py",
+    "claude1_transport.py",
+    "claude_hub_catalog.py",
+    "statusline-model.py",
+    "install.sh",
+    "probe.sh",
+    "watchd.sh",
+    "observe-claude1.sh",
+    "alert.sh",
+    "zsh-functions.sh",
+    "zsh-sticky-integration.sh",
+    "examples"
+  ],
+  "keywords": [
+    "claude-code",
+    "claude",
+    "anthropic",
+    "llm",
+    "multi-model",
+    "gateway",
+    "router",
+    "model-switching",
+    "bridge",
+    "ai"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -p \"test_*.py\"",
+    "prepack": "rm -rf __pycache__ examples/__pycache__",
+    "prepublishOnly": "python3 scripts/secret_guard.py --working-tree"
+  }
+}
