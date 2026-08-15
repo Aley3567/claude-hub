@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | 原生 Hub 曾把 `messages[].role == "system"` 原样送往严格 Anthropic/SGLang。 | `prepare_request(..., "anthropic")` 会把合法的 Claude Code system-role 扩展提升、合并到顶层 `system`，并记录 `HUB_DEGRADE_SYSTEM_ROLE_PROMOTED`。Hub 的 native `/v1/messages` 路径已调用该 seam。 | `claude1 <native provider>` 的直连 launcher 不经过 Hub；见“Launcher 边界与未覆盖 beta”。包含 message 级额外字段或非 text system block 的提升会拒绝，避免伪造。 |
 | Chat/Responses 上游在干净 EOF 缺 terminal 时可能被补成正常 `message_stop`。 | 协议 bridge 与 Hub 生产流都在 EOF 调用显式 parser/FSM 的 `finish()`；没有有效 terminal、UTF-8 无效、JSON 不完整或 terminal 后继续内容时，已开始的下游传输会中止，而不是补成功。 | 下游可能已经收到有效的前缀字节；这只能通过断开传输表达失败，不能在已提交的 SSE 头后改写为 JSON 4xx。 |
-| 跨协议循环会静默跳过未知块或元数据。 | Chat/Responses 请求 IR 只接受登记的字段、block 与 tool；未知请求字段/已知 block 的未知字段/未知 block 均返回稳定 `HUB_UNSUPPORTED_*` 错误。未知上游 output item/event 也 fail closed。 | 原生 Anthropic 保持透明（除了 system-role 兼容规范化）；它不能替严格上游验证未来原生扩展。 |
+| 跨协议循环会静默跳过未知块或元数据。 | Chat/Responses 请求 IR 对未知顶层扩展在默认 `visible_lossy` 模式下丢弃并记录带 JSON path 的 warning，`strict` 模式拒绝；已知 block 的未知字段、未知 block、危险执行字段和未知上游 output item/event 始终 fail closed。 | 原生 Anthropic 保持透明（除了 system-role 兼容规范化）；它不能替严格上游验证未来原生扩展。 |
 | `content_filter`、thinking signature、citation、cache 用量曾有伪造或静默丢失风险。 | refusal/content filter 统一为 `stop_reason: "refusal"`；signature 仅在上游真实提供时发出；citation 不能无损映射时只记录降级；usage 只复制实际的上游计数。 | 跨协议的 citation/cache-control/server-tool 语义仍不等价，按下表降级或拒绝。 |
 | `/count_tokens` 估算没有 provenance。 | Hub 对估算返回 `source=estimate`、`method=json_utf8_bytes_div_4`、`exact=0`、`error-bound=unbounded`；原生 count endpoint 成功时标记 `source=upstream`、`method=anthropic_count_tokens`、`exact=1`。 | 估算不是模型 tokenizer 的精确结果。 |
 
@@ -60,7 +60,7 @@
 | Hub namespaced reversible Responses redaction carrier 回放 | `exact` | `reject` | `exact` | `reject` |
 | server tool | `exact` | `reject` | `reject` | `reject` |
 | MCP / `mcp_servers` | `exact` | `reject` | `reject` | `reject` |
-| tool search / deferred loading | `exact` | `reject` | `reject` | `reject` |
+| tool search / deferred loading | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | code execution / computer/web server execution | `exact` | `reject` | `reject` | `reject` |
 | request / content `cache_control` | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | `metadata` / `service_tier` | `exact` | `exact` | `exact` | `reject` |
@@ -76,13 +76,14 @@
 | 未知、malformed 或冲突的 usage/cache/server carrier | native passthrough* | `reject` | `reject` | `reject` |
 | `/count_tokens`（标准原生上游 endpoint 可用） | `exact` | `reject` | `reject` | `reject` |
 | `/count_tokens` 本地估算 fallback | `observable degradation` | `observable degradation` | `observable degradation` | `reject` |
-| 未登记的请求字段、内容字段或内容块 | `exact` native passthrough* | `reject` | `reject` | `reject` |
+| 未登记的顶层请求扩展 | `exact` native passthrough* | `observable degradation` | `observable degradation` | `reject` |
+| 未登记的内容字段或内容块 | `exact` native passthrough* | `reject` | `reject` | `reject` |
 
 \* 原生透传的唯一兼容预处理是上表的 system-role normalization；它不把未知原生 block 解释成已支持功能。
 
 ### 请求字段 disposition registry
 
-以下 registry 适用于 Anthropic Messages → Chat/Responses 请求方向。Native Anthropic 除 system-role extension normalization 外保持透明；Chat/Responses 对未列入 `_CROSS_REQUEST_FIELDS` 的字段一律 `HUB_UNSUPPORTED_REQUEST_FIELD`。
+以下 registry 适用于 Anthropic Messages → Chat/Responses 请求方向。Native Anthropic 除 system-role extension normalization 外保持透明；Chat/Responses 对未列入 `_CROSS_REQUEST_FIELDS` 的未知顶层扩展默认丢弃并记录 `HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED@$.<field>`，`strict` 模式返回 `HUB_UNSUPPORTED_REQUEST_FIELD`。该兼容策略不放宽已知结构内部、内容块、工具和响应状态机的校验。
 
 | 请求字段 / union | Chat | Responses | 精确边界或拒绝条件 |
 | --- | --- | --- | --- |
@@ -93,14 +94,18 @@
 | `stop_sequences` | `exact` | `observable degradation` | Responses 默认记录 `HUB_DEGRADE_STOP_SEQUENCES_DROPPED`，strict 拒绝。 |
 | `top_k` | `observable degradation` | `observable degradation` | 目标无等价 carrier；strict 拒绝。 |
 | `tool_choice`、`parallel_tool_calls`、`disable_parallel_tool_use` | `exact`（登记子集） | `exact`（登记子集） | `auto/any/none/tool(name)` 与一致的 parallel 控制可映射；未知 enum、malformed、互相冲突拒绝。 |
-| `tools[].strict`、基础 function schema | `exact` | `exact` | metadata/BatchTool 是 observable degradation；server/MCP/tool-search/code execution/deferred loading 明确拒绝。 |
+| `tools[].strict`、基础 function schema | `exact` | `exact` | metadata/BatchTool 是 observable degradation；server/MCP/code execution 明确拒绝。 |
+| `tools[].defer_loading`、原生 tool-search control | `observable degradation` | `observable degradation` | deferred client tool 改为 eager 普通工具，tool-search control 随后省略；strict 模式拒绝。 |
 | `output_config.format` | `exact`（JSON Schema 子集） | `exact`（JSON Schema 子集） | 只接受 `json_schema`；未知 format/字段拒绝；schema `format: uri` 清理是 observable degradation。 |
 | `output_config.effort` / `thinking` control | `observable degradation` | `observable degradation` | 使用 target reasoning effort carrier；budget/adaptive 映射有稳定 warning，strict 拒绝 lossy 分支。 |
-| `metadata`、`service_tier` | `exact`（adapter payload shape） | `exact`（adapter payload shape） | 仍受 provider/model capability profile 约束；非 object metadata、空 tier 拒绝。 |
+| `metadata` | `observable degradation` | `exact`（adapter payload shape） | Chat-compatible providers 对 metadata 支持不一致，默认删除并记录 `HUB_DEGRADE_METADATA_DROPPED`，strict 拒绝；Responses 保留。非 object metadata 拒绝。 |
+| `service_tier` | `exact`（adapter payload shape） | `exact`（adapter payload shape） | 仍受 provider/model capability profile 约束；空 tier 拒绝。 |
 | `cache_control`（request/system/content/tool） | `observable degradation` | `observable degradation` | 删除并记录稳定 warning；strict 拒绝。 |
 | document/search/citation/nested tool_result/is_error | `observable degradation` | `observable degradation` | 使用可见 provenance text/JSON envelope；无法登记的 source/part/field 拒绝。 |
 | signature / redacted thinking | signature 降级、redaction `reject` | signature 降级；仅 namespaced reversible carrier `exact` replay | 不生成 signature；任意 opaque redaction 不冒充 adapter provenance。 |
-| `container`、`inference_geo`、`mcp_servers` 及未知顶层字段 | `reject` | `reject` | 分别返回稳定 `HUB_UNSUPPORTED_*`。 |
+| `context_management` | `observable degradation` | `observable degradation` | 目标协议没有等价 carrier；默认记录 `HUB_DEGRADE_CONTEXT_MANAGEMENT_DROPPED`，strict 返回 `HUB_UNSUPPORTED_CONTEXT_MANAGEMENT`。 |
+| 其他未知顶层扩展 | `observable degradation` | `observable degradation` | 默认记录通用 warning 和具体 JSON path；strict 返回 `HUB_UNSUPPORTED_REQUEST_FIELD`。 |
+| `container`、`inference_geo`、`mcp_servers` | `reject` | `reject` | 危险执行、位置或外部连接能力在所有模式下返回稳定 `HUB_UNSUPPORTED_*`。 |
 
 ### 非流响应 disposition registry
 
@@ -138,13 +143,13 @@
 
 ### 请求与内容块的具体语义
 
-- **Canonical IR 与 fail-closed。** Chat/Responses 先解析为 `RequestIR`，再由独立 adapter 编码。消息、tool、已知 content block 的额外字段不能绕过 IR；未知类型以 `HUB_UNSUPPORTED_CONTENT_BLOCK`、`HUB_UNSUPPORTED_CONTENT_FIELD`、`HUB_UNSUPPORTED_TOOL_*` 或 `HUB_UNSUPPORTED_REQUEST_FIELD` 拒绝。
+- **Canonical IR、兼容顶层与 fail-closed。** Chat/Responses 先解析为 `RequestIR`，再由独立 adapter 编码。默认模式只对未知顶层扩展做可观察降级；消息、tool、已知 content block 的额外字段不能绕过 IR，未知类型以 `HUB_UNSUPPORTED_CONTENT_BLOCK`、`HUB_UNSUPPORTED_CONTENT_FIELD` 或 `HUB_UNSUPPORTED_TOOL_*` 拒绝。`strict` 模式也会以 `HUB_UNSUPPORTED_REQUEST_FIELD` 拒绝未知顶层扩展。
 - **System normalization。** 合法的 embedded system text block 会按原顺序追加到已有顶层 `system`，保留 block metadata；输入对象不原地修改。native `strict` 模式拒绝此客户端扩展，避免把隐含重写伪装成严格官方 payload。Chat/Responses 本身有 system role carrier，因此该 role 是 exact；但 block metadata 没有等价 carrier，必有可观察降级。
 - **`tool_result`。** tool causality（唯一、此前的 `tool_use`、role 正确）在跨协议前验证；违反时是 request-phase `ProtocolRequestError`（`HUB_INVALID_TOOL_CAUSALITY`,HTTP 400，带 path)，不会冒泡成非结构化 500。嵌套 text/image/document/search_result 与 `is_error=true` 采用明确 JSON envelope：`{"type":"anthropic_tool_result","is_error":...,"content":...}`。该 envelope 保留原始值但不是目标协议的原生 error 字段，故为 observable degradation；不受支持的嵌套 part 直接拒绝。
 - **Document、search 与 citation。** 对 Chat/Responses，文本 document/search context 使用带标题/source 的 provenance text envelope；无法抽取的 document 用明确 placeholder。`document.source.type=content` 与 `search_result.content` 的 nested text block 递归执行 allowlist：citation metadata 记录 `HUB_DEGRADE_CITATION_METADATA_DROPPED`，`cache_control` 记录 `HUB_DEGRADE_CONTENT_METADATA_DROPPED`，strict 均拒绝，未知 nested field fail closed。响应 citation/annotation 不猜测 Anthropic location，也不把上游 URL 伪造进输出；SSE 还要求 metadata event 精确关联开放的 item/output/content part。
-- **Thinking、signature 与 redaction。** thinking text 使用 Chat reasoning carrier 或 Responses reasoning carrier，并记录降级。默认 `visible_lossy` 模式会删除跨协议请求中的 Anthropic signature 并给出 `HUB_DEGRADE_THINKING_SIGNATURE_DROPPED`；`strict` 模式明确拒绝。非流 Chat 上游若给出无法验证的 signature 会拒绝；流中只有真实 `reasoning_signature`/`signature_delta` 才成为 Anthropic `signature_delta`，从不生成假值。无 signature 的 thinking 记录 `HUB_DEGRADE_UNSIGNED_THINKING`。Chat 无安全 redacted carrier 而拒绝；Responses 的 namespaced prefix + Base64 是可逆 carrier，不是 MAC、签名或来源认证，只允许这一登记格式回放，任意其他 opaque `redacted_thinking` 仍拒绝。
+- **Thinking、signature 与 redaction。** thinking text 使用 Chat reasoning carrier 或 Responses reasoning carrier，并记录降级。默认 `visible_lossy` 模式会删除跨协议请求中的真实 Anthropic signature 并给出 `HUB_DEGRADE_THINKING_SIGNATURE_DROPPED`；Claude Code 回放跨协议 thinking 时产生的空字符串 signature 视为“无签名占位符”，记录 `HUB_DEGRADE_EMPTY_THINKING_SIGNATURE_IGNORED` 后忽略。非字符串 signature 仍拒绝，`strict` 模式也拒绝空占位符。非流 Chat 上游若给出无法验证的 signature 会拒绝；流中只有真实 `reasoning_signature`/`signature_delta` 才成为 Anthropic `signature_delta`，从不生成假值。无 signature 的 thinking 记录 `HUB_DEGRADE_UNSIGNED_THINKING`。Chat 无安全 redacted carrier 而拒绝；Responses 的 namespaced prefix + Base64 是可逆 carrier，不是 MAC、签名或来源认证，只允许这一登记格式回放，任意其他 opaque `redacted_thinking` 仍拒绝。
 - **Refusal。** Chat `refusal`、`content_filter` 与 Responses refusal event/output 统一映射为 Anthropic text + `stop_reason: "refusal"`；未知上游 finish/stop reason 拒绝，绝不降格为 `end_turn`。
-- **服务器执行能力。** server tool、MCP、tool search、code execution，以及相应 server result block，在跨协议请求进入上游前按精确错误码拒绝。此拒绝不影响上游已经提供的 `server_tool_use` **usage counter** 的保留；counter 不是 server-tool invocation 的伪造支持。
+- **服务器执行能力。** server tool、MCP、code execution，以及相应 server result block，在跨协议请求进入上游前按精确错误码拒绝。纯 client tool 的 deferred loading 会改成 eager loading 并保留完整 schema；为 deferred loading 服务的原生 tool-search control 随后省略，两者都有稳定 warning，strict 模式仍拒绝。历史消息中已经发生的 server tool/tool-search result 不会伪造转换。此拒绝不影响上游已经提供的 `server_tool_use` **usage counter** 的保留；counter 不是 server-tool invocation 的伪造支持。
 
 ### Usage、cache 与 count-token provenance
 
@@ -174,7 +179,7 @@
 - **严格 Anthropic/SGLang direct provider。** 当前没有 `sglang`/strict-system/upstream capability metadata，也没有经测试的 fixed-selected-credential bridge。因此不得按 URL、模型或 provider 名猜测并自动改路；该 direct 场景是未覆盖 beta，不能以 Hub 修复宣称已解决。
 - **Gemini。** 只有 matrix/profile reserved seam；没有 endpoint、认证、Hub config、request/response/SSE adapter 或真实 provider integration，故仍是未覆盖 beta。
 - **微信 Coding Plan smoke。** 已通过正式透传语法 `launcher.main(["--hub", "--", "-p", "微信 Coding Plan"])` 做隔离 smoke：临时 HOME/0600 SQLite provider、fixture token、fake Claude 与 `127.0.0.1` upstream 实际走过两轮 launcher → Hub → Chat，请求文本和 tool schema，接收 `tool_use`，再回传 nested text/document `tool_result(is_error=true)` 并验证显式 envelope。字面 `claude1 "微信 Coding Plan"` 仍会把首个位置参数解释为 provider hint，不是 prompt 语法；smoke 不使用真实 Claude 二进制或真实 provider token。  <!-- secret-guard: allow private-provider-name 65941246a1 -->
-- **尚未引入的原生 beta 功能。** 跨协议的 server tool/MCP/tool search/code execution、container、inference geo 仍按上表明确拒绝；新未知 native extension 仅在 native passthrough 路径透明，不能被写成已转换支持。
+- **尚未引入的原生 beta 功能。** 跨协议的 server tool/MCP/code execution、container、inference geo 仍按上表明确拒绝；tool search 只支持“client tools 全量 eager + search control 省略”的可观察降级，不代表目标上游拥有原生 tool-search 能力。新未知 native extension 仅在 native passthrough 路径透明，不能被写成已转换支持。
 - **Responses 新 reasoning/content 事件。** 当前稳定覆盖 reasoning summary 与 adapter-tagged encrypted reasoning；非空 `reasoning.content`、`reasoning_text` part/event 及其他未来 content-part union 会以稳定 code 拒绝，尚未建立独立 carrier 与 golden。
 - **Citation location。** 可读正文保留、metadata 降级可观察，但没有跨 Chat/Responses 的 Anthropic page/char/web-search location round-trip，绝不猜测 URL、页码或 offset。
 - **Provider/model capability profile。** 当前 profile 只区分 adapter endpoint/availability；`metadata`、`service_tier`、JSON Schema 子集、reasoning carrier 等仍可能被具体 OpenAI-compatible provider 拒绝。矩阵描述 adapter shape，不是对所有 provider/model 的无条件保证。

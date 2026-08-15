@@ -2410,7 +2410,7 @@ async def _handle_transformed_messages(
     if request_warning_codes:
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"protocol warnings {','.join(request_warning_codes)}"
+            f"protocol warnings {','.join(prepared_request.plan.warning_details)}"
         )
     data = json.dumps(
         upstream_payload,
@@ -2844,7 +2844,7 @@ async def _forward_to_channel(
         if protocol_warning_codes:
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                f"protocol warnings {','.join(protocol_warning_codes)}"
+                f"protocol warnings {','.join(prepared.plan.warning_details)}"
             )
     if is_count and (
         api_format != "anthropic" or provider.get("is_full_url")
