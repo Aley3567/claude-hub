@@ -1,0 +1,3 @@
+# 发布 tarball 中排除 Python 编译缓存（.gitignore 对 npm files 白名单不生效）
+**/__pycache__/
+**/*.pyc
