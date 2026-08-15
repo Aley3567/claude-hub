@@ -2538,6 +2538,123 @@ class ClaudeHubTests(unittest.TestCase):
             providers["Fixture HTTPS"]["base_url"], "https://replaced.invalid"
         )
 
+    def test_provider_snapshot_cache_permission_widening_fails_closed(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        # No reset_caches(): the warm cache must not bypass the permission
+        # check on the hit path.
+        self.db_file.chmod(0o644)
+
+        with self.assertRaisesRegex(hub.ProviderDatabaseError, "exceed 0600"):
+            hub.get_providers()
+
+    def test_provider_snapshot_cache_deleted_database_fails_closed(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        # No reset_caches(): a deleted database must not be served from the
+        # warm cache.
+        self.db_file.unlink()
+
+        with self.assertRaisesRegex(
+            hub.ProviderDatabaseError, "cannot be resolved"
+        ):
+            hub.get_providers()
+
+    def test_provider_snapshot_cache_hit_path_still_checks_permissions(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        # Database untouched, so the fingerprint still matches the warm
+        # entry. If the permission check were ever moved after the cache
+        # lookup, this call would silently return the cached dict instead
+        # of raising.
+        with mock.patch.object(
+            hub,
+            "_require_private_database",
+            side_effect=hub.ProviderDatabaseError("boom"),
+        ):
+            with self.assertRaisesRegex(hub.ProviderDatabaseError, "boom"):
+                hub.get_providers()
+
+    def test_provider_snapshot_cache_refresh_failure_keeps_entry(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        # Force a miss with a fake revision and a failing refresh. The warm
+        # entry must survive: a poisoned entry would serve None, a cleared
+        # entry would re-read and produce a new object below.
+        with mock.patch.object(
+            hub,
+            "_database_snapshot_state",
+            side_effect=lambda path: ((0, 0, 0, 0, 0), None),
+        ), mock.patch.object(
+            hub,
+            "_read_provider_snapshot",
+            side_effect=hub.ProviderDatabaseError("boom"),
+        ):
+            with self.assertRaisesRegex(hub.ProviderDatabaseError, "boom"):
+                hub.get_providers()
+
+        self.assertIs(hub.get_providers(), cached)
+
+    def test_provider_snapshot_cache_error_does_not_poison_or_clear(self):
+        initial = hub.get_providers()
+        self.assertEqual(
+            initial["Fixture HTTPS"]["token"], "fixture-upstream-token"
+        )
+
+        self.db_file.unlink()
+        with self.assertRaises(hub.ProviderDatabaseError):
+            hub.get_providers()
+
+        replacement = self.root / "restored.db"
+        connection = sqlite3.connect(replacement)
+        try:
+            connection.execute(
+                "CREATE TABLE providers "
+                "(name TEXT, app_type TEXT, settings_config TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO providers VALUES (?, 'claude', ?)",
+                (
+                    "Fixture HTTPS",
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "https://restored.invalid/v1",
+                                "ANTHROPIC_AUTH_TOKEN": "restored-token",
+                            }
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        replacement.chmod(0o600)
+        os.replace(replacement, self.db_file)
+
+        real_read = hub._read_provider_snapshot
+        calls = []
+
+        def spy(path):
+            calls.append(path)
+            return real_read(path)
+
+        with mock.patch.object(hub, "_read_provider_snapshot", side_effect=spy):
+            providers = hub.get_providers()
+
+        # Recovery is a fresh read of the restored database, not the
+        # pre-failure cache and not a poisoned entry written by the error.
+        self.assertEqual(len(calls), 1)
+        self.assertIsNot(providers, initial)
+        self.assertEqual(providers["Fixture HTTPS"]["token"], "restored-token")
+        self.assertEqual(
+            providers["Fixture HTTPS"]["base_url"], "https://restored.invalid"
+        )
+
     def test_database_symlink_checks_real_sidecar_permissions(self):
         writer = sqlite3.connect(self.db_file)
         try:
