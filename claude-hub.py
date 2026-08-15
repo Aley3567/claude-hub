@@ -28,6 +28,7 @@ import ssl
 import stat
 import sys
 import tempfile
+import threading
 import time
 import zlib
 from collections.abc import Mapping
@@ -972,8 +973,18 @@ def _database_snapshot_state(path: Path) -> tuple:
     return (_snapshot_fingerprint(path), _snapshot_fingerprint(wal_path))
 
 
-def _read_provider_snapshot(path: Path) -> dict:
-    """Read a stable private main+WAL copy without opening the source SQLite DB."""
+# Single-slot ``(revision, providers)`` entry: one assignment on write, one
+# load on read, so a concurrent refresh can never tear the pair apart.
+_snapshot_entry: tuple | None = None
+_snapshot_lock = threading.Lock()
+
+
+def _read_provider_snapshot(path: Path) -> tuple:
+    """Read a stable private main+WAL copy without opening the source SQLite DB.
+
+    Returns ``(providers, verified_revision)`` where the revision is the
+    ``_database_snapshot_state`` confirmed identical before and after copying.
+    """
     wal_path, _shm_path = _sqlite_sidecars(path)
     last_error = None
     for _attempt in range(DB_SNAPSHOT_RETRIES):
@@ -993,7 +1004,7 @@ def _read_provider_snapshot(path: Path) -> dict:
                 if before != after:
                     continue
                 try:
-                    return _read_provider_rows(snapshot)
+                    return _read_provider_rows(snapshot), before
                 except sqlite3.Error as exc:
                     last_error = exc
         except (FileNotFoundError, OSError) as exc:
@@ -1006,17 +1017,28 @@ def _read_provider_snapshot(path: Path) -> dict:
 
 def get_providers() -> dict:
     """Read current provider data from CC Switch using SQLite ``mode=ro``."""
+    global _snapshot_entry
     path = _resolve_database_path(db_path())
     _require_private_database(path)
-    try:
-        providers = _read_provider_snapshot(path)
-        # Recheck because a writer can create WAL sidecars while the read is open.
-        _require_private_database(path)
+    revision = _database_snapshot_state(path)
+    entry = _snapshot_entry
+    if entry is not None and entry[0] == revision:
+        return entry[1]
+    with _snapshot_lock:
+        entry = _snapshot_entry
+        if entry is not None and entry[0] == revision:
+            return entry[1]
+        try:
+            providers, verified = _read_provider_snapshot(path)
+            # Recheck because a writer can create WAL sidecars while the
+            # read is open.
+            _require_private_database(path)
+        except (sqlite3.Error, OSError) as exc:
+            raise ProviderDatabaseError(
+                "provider database could not be read"
+            ) from exc
+        _snapshot_entry = (verified, providers)
         return providers
-    except (sqlite3.Error, OSError) as exc:
-        raise ProviderDatabaseError(
-            "provider database could not be read"
-        ) from exc
 
 
 def reset_caches() -> None:
@@ -3522,7 +3544,7 @@ def cli_doctor() -> int:
     providers = None
     if provider_path is not None:
         try:
-            providers = _read_provider_snapshot(provider_path)
+            providers, _verified = _read_provider_snapshot(provider_path)
         except (sqlite3.Error, OSError, ProviderDatabaseError):
             report("FAIL", "provider database cannot be read")
         else:

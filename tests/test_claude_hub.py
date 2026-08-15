@@ -11,6 +11,7 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 import unittest
 import zlib
 from contextlib import redirect_stdout
@@ -2451,6 +2452,91 @@ class ClaudeHubTests(unittest.TestCase):
                 self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
         finally:
             writer.close()
+
+    def test_provider_snapshot_cache_hit_does_not_copy(self):
+        first = hub.get_providers()
+        self.assertIn("Fixture HTTPS", first)
+
+        with mock.patch.object(hub.shutil, "copyfile") as copyfile:
+            second = hub.get_providers()
+
+        copyfile.assert_not_called()
+        self.assertIs(second, first)
+
+    def test_provider_snapshot_cache_singleflight(self):
+        real_read = hub._read_provider_snapshot
+        calls = []
+        results = []
+        errors = []
+        barrier = threading.Barrier(8)
+
+        def spy(path):
+            calls.append(path)
+            return real_read(path)
+
+        def worker():
+            try:
+                barrier.wait()
+                results.append(hub.get_providers())
+            except Exception as exc:  # noqa: BLE001 - report, don't hide
+                errors.append(exc)
+
+        with mock.patch.object(hub, "_read_provider_snapshot", side_effect=spy):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(calls), 1)
+        for result in results:
+            self.assertIs(result, results[0])
+
+    def test_provider_snapshot_cache_db_replace_visible_without_reset(self):
+        initial = hub.get_providers()
+        self.assertEqual(
+            initial["Fixture HTTPS"]["token"], "fixture-upstream-token"
+        )
+        original_inode = self.db_file.stat().st_ino
+
+        replacement = self.root / "replacement.db"
+        connection = sqlite3.connect(replacement)
+        try:
+            connection.execute(
+                "CREATE TABLE providers "
+                "(name TEXT, app_type TEXT, settings_config TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO providers VALUES (?, 'claude', ?)",
+                (
+                    "Fixture HTTPS",
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": "https://replaced.invalid/v1",
+                                "ANTHROPIC_AUTH_TOKEN": "replaced-token",
+                            }
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        replacement.chmod(0o600)
+        os.replace(replacement, self.db_file)
+        self.assertNotEqual(self.db_file.stat().st_ino, original_inode)
+
+        # Intentionally no reset_caches(): a replaced DB must be re-read.
+        providers = hub.get_providers()
+
+        self.assertIsNot(providers, initial)
+        self.assertEqual(providers["Fixture HTTPS"]["token"], "replaced-token")
+        self.assertEqual(
+            providers["Fixture HTTPS"]["base_url"], "https://replaced.invalid"
+        )
 
     def test_database_symlink_checks_real_sidecar_permissions(self):
         writer = sqlite3.connect(self.db_file)
