@@ -383,6 +383,7 @@ EOF
 │   ├── claude1_protocol_types.py
 │   ├── claude1_protocol_usage.py
 │   ├── claude1_transport.py
+│   ├── claude1_usage_report.py
 │   └── statusline-model.py
 ├── claude1/
 │   └── zsh-functions.sh
@@ -412,6 +413,7 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `claude1_protocol_types.py` | 协议错误、转换计划和共享 IR 类型 |
 | `claude1_protocol_usage.py` | usage counter、cache usage 和回执归一化 |
 | `claude1_transport.py` | 上游 transport policy、代理选择与请求边界 |
+| `claude1_usage_report.py` | Hub usage 日志读取、汇总和终端图表 |
 | `statusline-model.py` | 自定义 statusline 可复用的实际上游模型解析 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |

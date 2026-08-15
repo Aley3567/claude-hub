@@ -24,6 +24,9 @@ Hub 子进程启动统一经 `_reserve_loopback_port` / `_spawn_hub_process`：�
 
 关键接口：`db_claude_rows` / `list_providers`（日常路径只读取 provider）、`claude_child_env`（子进程环境）、`parse_args` / `main`（CLI：`list` / `accounts` / `doctor [--fix]` / `usage` / `direct` / `current` / `any` / `hub` / `use`；`doctor` 默认只读，`--fix` 是显式维护操作）。
 
+`usage` 子命令只在调用时加载 `claude1_usage_report.py`；该 module 负责安全读取
+usage 日志、统计和终端图表，launcher 只选择当前 Hub 对应的日志路径。
+
 ### `claude-hub.py` — 可选常驻 Anthropic 网关（`uv run --script`，PEP 723 内联依赖 aiohttp）
 
 监听 `127.0.0.1`，让一个长会话用原生 `/model channel,model` 切换渠道 + 模型；请求发生时才从 CC Switch DB 只读取上游与凭证，本文件不含凭证。正常由启动器拉起时通过 `SockSite` 接管继承的监听 FD；直接执行 `serve` 时仍由 `TCPSite` 自行绑定配置端口。

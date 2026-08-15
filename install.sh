@@ -103,6 +103,7 @@ for source_file in \
   "$SCRIPT_DIR/claude1_protocol_types.py" \
   "$SCRIPT_DIR/claude1_protocol_usage.py" \
   "$SCRIPT_DIR/claude1_transport.py" \
+  "$SCRIPT_DIR/claude1_usage_report.py" \
   "$SCRIPT_DIR/statusline-model.py" \
   "$SCRIPT_DIR/zsh-functions.sh"
 do
@@ -128,6 +129,7 @@ if [ -L "$INSTALL_ROOT/scripts/claude-provider-once.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_protocol_types.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_protocol_usage.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_transport.py" ] ||
+  [ -L "$INSTALL_ROOT/scripts/claude1_usage_report.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/statusline-model.py" ] ||
   [ -L "$INSTALL_ROOT/claude1/zsh-functions.sh" ] ||
   { [ "$MANAGE_STICKY" -eq 1 ] &&
@@ -147,6 +149,7 @@ for target_path in \
   "$INSTALL_ROOT/scripts/claude1_protocol_types.py" \
   "$INSTALL_ROOT/scripts/claude1_protocol_usage.py" \
   "$INSTALL_ROOT/scripts/claude1_transport.py" \
+  "$INSTALL_ROOT/scripts/claude1_usage_report.py" \
   "$INSTALL_ROOT/scripts/statusline-model.py" \
   "$INSTALL_ROOT/claude1/zsh-functions.sh"
 do
@@ -188,6 +191,7 @@ PROTOCOL_TARGET="$INSTALL_ROOT/scripts/claude1_protocol.py"
 PROTOCOL_TYPES_TARGET="$INSTALL_ROOT/scripts/claude1_protocol_types.py"
 PROTOCOL_USAGE_TARGET="$INSTALL_ROOT/scripts/claude1_protocol_usage.py"
 TRANSPORT_TARGET="$INSTALL_ROOT/scripts/claude1_transport.py"
+USAGE_REPORT_TARGET="$INSTALL_ROOT/scripts/claude1_usage_report.py"
 STATUSLINE_MODEL_TARGET="$INSTALL_ROOT/scripts/statusline-model.py"
 SHELL_TARGET="$INSTALL_ROOT/claude1/zsh-functions.sh"
 STICKY_TARGET="$INSTALL_ROOT/claude1/zsh-sticky-integration.sh"
@@ -259,6 +263,7 @@ NEED_PROTOCOL=0
 NEED_PROTOCOL_TYPES=0
 NEED_PROTOCOL_USAGE=0
 NEED_TRANSPORT=0
+NEED_USAGE_REPORT=0
 NEED_STATUSLINE_MODEL=0
 NEED_SHELL=0
 NEED_STICKY=0
@@ -279,6 +284,8 @@ needs_install "$SCRIPT_DIR/claude1_protocol_usage.py" "$PROTOCOL_USAGE_TARGET" 6
   NEED_PROTOCOL_USAGE=1
 needs_install "$SCRIPT_DIR/claude1_transport.py" "$TRANSPORT_TARGET" 644 &&
   NEED_TRANSPORT=1
+needs_install "$SCRIPT_DIR/claude1_usage_report.py" "$USAGE_REPORT_TARGET" 644 &&
+  NEED_USAGE_REPORT=1
 needs_install "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755 &&
   NEED_STATUSLINE_MODEL=1
 needs_install "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644 &&
@@ -341,6 +348,9 @@ fi
 if [ "$NEED_TRANSPORT" -eq 1 ]; then
   backup_existing "$TRANSPORT_TARGET" "claude1_transport.py"
 fi
+if [ "$NEED_USAGE_REPORT" -eq 1 ]; then
+  backup_existing "$USAGE_REPORT_TARGET" "claude1_usage_report.py"
+fi
 if [ "$NEED_STATUSLINE_MODEL" -eq 1 ]; then
   backup_existing "$STATUSLINE_MODEL_TARGET" "statusline-model.py"
 fi
@@ -370,6 +380,9 @@ if [ "$NEED_HUB_CATALOG_MODULE" -eq 1 ]; then
 fi
 if [ "$NEED_ACCOUNT_POOL_MODULE" -eq 1 ]; then
   install_file "$SCRIPT_DIR/claude1_account_pool.py" "$ACCOUNT_POOL_MODULE_TARGET" 644
+fi
+if [ "$NEED_USAGE_REPORT" -eq 1 ]; then
+  install_file "$SCRIPT_DIR/claude1_usage_report.py" "$USAGE_REPORT_TARGET" 644
 fi
 if [ "$NEED_HUB" -eq 1 ]; then
   install_file "$SCRIPT_DIR/claude-hub.py" "$HUB_TARGET" 755

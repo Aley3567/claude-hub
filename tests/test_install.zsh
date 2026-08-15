@@ -104,6 +104,9 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude1_transport.py" \
     "$home/install root/scripts/claude1_transport.py" ||
     fail "transport module was not installed"
+  command cmp -s "$REPO_ROOT/claude1_usage_report.py" \
+    "$home/install root/scripts/claude1_usage_report.py" ||
+    fail "usage report module was not installed"
   command cmp -s "$REPO_ROOT/statusline-model.py" \
     "$home/install root/scripts/statusline-model.py" ||
     fail "statusline model resolver was not installed"
@@ -122,6 +125,10 @@ test_first_install_is_safe() {
     "$home/install root/scripts/claude-provider-once.py" --help \
     >/dev/null ||
     fail "installed launcher cannot import the protocol bridge"
+  HOME="$home" "$SYSTEM_PYTHON" \
+    "$home/install root/scripts/claude-provider-once.py" usage --day \
+    >/dev/null ||
+    fail "installed launcher cannot load the usage report"
 
   local shell_output
   shell_output="$(
@@ -216,6 +223,7 @@ test_existing_files_are_backed_up() {
   print -r -- 'old protocol types' > "$home/install root/scripts/claude1_protocol_types.py"
   print -r -- 'old protocol usage' > "$home/install root/scripts/claude1_protocol_usage.py"
   print -r -- 'old transport' > "$home/install root/scripts/claude1_transport.py"
+  print -r -- 'old usage report' > "$home/install root/scripts/claude1_usage_report.py"
   print -r -- 'old statusline model' > "$home/install root/scripts/statusline-model.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
   command mkdir -p -- "$home/dotfiles"
@@ -236,6 +244,7 @@ test_existing_files_are_backed_up() {
   assert_file_content "old protocol types" "$backup/claude1_protocol_types.py"
   assert_file_content "old protocol usage" "$backup/claude1_protocol_usage.py"
   assert_file_content "old transport" "$backup/claude1_transport.py"
+  assert_file_content "old usage report" "$backup/claude1_usage_report.py"
   assert_file_content "old statusline model" "$backup/statusline-model.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
   assert_file_content "old zshrc" "$backup/zshrc"
