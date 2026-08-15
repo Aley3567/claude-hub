@@ -1,5 +1,6 @@
 import asyncio
 import codecs
+import copy
 import gzip
 import hmac
 import importlib.util
@@ -3469,6 +3470,126 @@ class ClaudeHubTests(unittest.TestCase):
             ],
         )
         self.assertEqual(response.headers["x-hub-account"], "id:secondary")
+
+    def test_provider_snapshot_is_read_only_across_request_path(self):
+        self._write_account_pool_db()
+        self._write_account_pool_config()
+        # Give every pooled provider a nested transport dict so the deep
+        # comparison below covers nested mutable values, not just scalars.
+        connection = sqlite3.connect(self.db_file)
+        try:
+            rows = connection.execute(
+                "SELECT id, settings_config FROM providers"
+            ).fetchall()
+            for provider_id, raw_settings in rows:
+                settings = json.loads(raw_settings)
+                settings["transport"] = {
+                    "mode": "proxy",
+                    "proxies": ["http://127.0.0.1:7897"],
+                }
+                # Distinct names so each record is aliased by both its name
+                # and its id key — the shared-identity shape of §2.
+                connection.execute(
+                    "UPDATE providers SET name = ?, settings_config = ? "
+                    "WHERE id = ?",
+                    (
+                        f"Pooled account {provider_id}",
+                        json.dumps(settings),
+                        provider_id,
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        snapshot = hub.get_providers()
+        self.assertIn("id:primary", snapshot)
+        self.assertIn("id:secondary", snapshot)
+        self.assertIs(snapshot["Pooled account primary"], snapshot["id:primary"])
+        self.assertIs(
+            snapshot["Pooled account secondary"], snapshot["id:secondary"]
+        )
+        baseline = copy.deepcopy(snapshot)
+
+        # Successful request: round-robin acquires the primary account.
+        session = _FakeSession(
+            _FakeUpstream(
+                200,
+                {"Content-Type": "application/json"},
+                [b'{"usage":{"input_tokens":1,"output_tokens":1}}'],
+            )
+        )
+        request = self._request(
+            {
+                "model": "fast,pooled-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=session,
+        )
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(
+            session.calls[0][1]["headers"]["x-api-key"],
+            "fixture-primary-account-token",
+        )
+
+        # Failover request: the round-robin cursor advanced by the first
+        # request, so the secondary account 429s first and the hub retries
+        # the primary account within the same request.
+        failover_session = _SequencedFakeSession(
+            [
+                _FakeUpstream(
+                    429,
+                    {
+                        "Content-Type": "application/json",
+                        "Retry-After": "120",
+                    },
+                    [b'{"type":"error"}'],
+                ),
+                _FakeUpstream(
+                    200,
+                    {"Content-Type": "application/json"},
+                    [b'{"usage":{"input_tokens":1,"output_tokens":1}}'],
+                ),
+            ]
+        )
+        failover_request = self._request(
+            {
+                "model": "fast,pooled-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=failover_session,
+        )
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            failover_response = asyncio.run(hub.handle_messages(failover_request))
+        self.assertEqual(failover_response.status, 200)
+        self.assertEqual(
+            [call[1]["headers"]["x-api-key"] for call in failover_session.calls],
+            [
+                "fixture-secondary-account-token",
+                "fixture-primary-account-token",
+            ],
+        )
+        self.assertEqual(
+            failover_response.headers["x-hub-account"], "id:primary"
+        )
+
+        # The full request path (routing, account-pool acquire/failover,
+        # forwarding) must leave the shared snapshot object untouched.
+        self.assertIs(hub.get_providers(), snapshot)
+        self.assertEqual(snapshot, baseline)
+        # Redundant with the deep assertEqual above; kept so a violation
+        # names the exact nested key that was mutated.
+        for selector, record in snapshot.items():
+            self.assertEqual(record["token"], baseline[selector]["token"])
+            self.assertEqual(
+                record["model_map"], baseline[selector]["model_map"]
+            )
+            self.assertEqual(
+                record["transport"], baseline[selector]["transport"]
+            )
 
     def test_transformed_final_429_preserves_retry_after_and_account(self):
         self._write_account_pool_db(api_format="openai_chat")
