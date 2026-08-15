@@ -2759,11 +2759,13 @@ def _validate_upstream_usage_fields(
     allowed_fields = _UPSTREAM_USAGE_FIELDS[api_format]
     unknown_fields = set(raw_usage) - allowed_fields
     if unknown_fields:
-        field_name = sorted(unknown_fields)[0]
-        raise ProtocolTransformError(
-            f"upstream {api_format} usage field {field_name!r} is unsupported",
-            code="HUB_UPSTREAM_USAGE_INVALID",
-            path=f"$.usage.{field_name}",
+        # Extra statistics from a compatible upstream (e.g. WeChat's
+        # top-level reasoning_tokens) are harmless: the adapter copies only
+        # registered counters and never fabricates values, so unknown usage
+        # fields are dropped with a warning instead of aborting a downstream
+        # stream that has already started.
+        degraded_paths.extend(
+            f"$.usage.{field_name}" for field_name in sorted(unknown_fields)
         )
 
     for detail_key, detail_fields in _UPSTREAM_USAGE_DETAIL_FIELDS[
@@ -2780,13 +2782,15 @@ def _validate_upstream_usage_fields(
             )
         unknown_detail_fields = set(detail) - detail_fields
         if unknown_detail_fields:
-            field_name = sorted(unknown_detail_fields)[0]
-            raise ProtocolTransformError(
-                f"upstream usage detail {detail_key}.{field_name} is unsupported",
-                code="HUB_UPSTREAM_USAGE_INVALID",
-                path=f"$.usage.{detail_key}.{field_name}",
+            # Same policy as unknown top-level usage fields: an unregistered
+            # counter inside a detail object is dropped with a warning; only
+            # malformed values of registered counters stay fatal.
+            degraded_paths.extend(
+                f"$.usage.{detail_key}.{field_name}"
+                for field_name in sorted(unknown_detail_fields)
             )
-        for field_name, counter in detail.items():
+        for field_name in sorted(set(detail) & detail_fields):
+            counter = detail[field_name]
             if _token_count(counter, -1) < 0:
                 raise ProtocolTransformError(
                     f"upstream usage counter {detail_key}.{field_name} is invalid",

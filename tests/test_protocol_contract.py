@@ -1941,7 +1941,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertNotIn("cache_creation", without_cache)
         self.assertNotIn("server_tool_use", without_cache)
 
-    def test_usage_top_level_registry_rejects_unknown_fields(self) -> None:
+    def test_usage_top_level_registry_drops_unknown_fields_with_warning(self) -> None:
         cases = (
             (
                 "openai_chat",
@@ -1956,6 +1956,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                         "prompt_tokens": 3,
                         "completion_tokens": 1,
                         "future_usage_counter": 4,
+                        "reasoning_tokens": 0,
                     },
                 },
             ),
@@ -2001,13 +2002,22 @@ class ResponseCapabilityContractTests(unittest.TestCase):
             ),
         )
         for api_format, body in cases:
-            with self.subTest(api_format=api_format):
-                with self.assertRaises(protocol.ProtocolTransformError) as raised:
-                    protocol.prepare_response(body, api_format)
-                self.assertEqual(
-                    raised.exception.code,
-                    "HUB_UPSTREAM_USAGE_INVALID",
+            with self.subTest(api_format=api_format, usage=body["usage"]):
+                expected_dropped = sorted(set(body["usage"]) - {"prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "total_tokens"})[0]
+                prepared = protocol.prepare_response(body, api_format)
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                    prepared.plan.warning_codes,
                 )
+                self.assertIn(
+                    f"HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED@$.usage.{expected_dropped}",
+                    prepared.plan.warning_details,
+                )
+                usage = prepared.payload["usage"]
+                self.assertNotIn("future_usage_counter", usage)
+                self.assertNotIn("reasoning_tokens", usage)
+                self.assertNotIn("input_tokens_details", usage)
+                self.assertNotIn("prompt_tokens_details", usage)
 
     def test_usage_total_tokens_must_be_a_non_negative_counter(self) -> None:
         cases = (
@@ -2165,7 +2175,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "HUB_UPSTREAM_USAGE_INVALID",
                 )
 
-    def test_usage_detail_registries_reject_unknown_nested_fields(self) -> None:
+    def test_usage_detail_registries_drop_unknown_nested_fields(self) -> None:
         cases = (
             (
                 "openai_chat",
@@ -2179,7 +2189,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "usage": {
                         "prompt_tokens": 3,
                         "completion_tokens": 1,
-                        "prompt_tokens_details": {"future_tokens": 1},
+                        "prompt_tokens_details": {"future_tokens": "opaque"},
                     },
                 },
             ),
@@ -2195,7 +2205,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "usage": {
                         "prompt_tokens": 3,
                         "completion_tokens": 1,
-                        "completion_tokens_details": {"future_tokens": 1},
+                        "completion_tokens_details": {"future_tokens": "opaque"},
                     },
                 },
             ),
@@ -2207,7 +2217,7 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "usage": {
                         "input_tokens": 3,
                         "output_tokens": 1,
-                        "input_tokens_details": {"future_tokens": 1},
+                        "input_tokens_details": {"future_tokens": "opaque"},
                     },
                 },
             ),
@@ -2219,19 +2229,25 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "usage": {
                         "input_tokens": 3,
                         "output_tokens": 1,
-                        "output_tokens_details": {"future_tokens": 1},
+                        "output_tokens_details": {"future_tokens": "opaque"},
                     },
                 },
             ),
         )
         for api_format, body in cases:
             with self.subTest(api_format=api_format, usage=body["usage"]):
-                with self.assertRaises(protocol.ProtocolTransformError) as raised:
-                    protocol.prepare_response(body, api_format)
-                self.assertEqual(
-                    raised.exception.code,
-                    "HUB_UPSTREAM_USAGE_INVALID",
+                prepared = protocol.prepare_response(body, api_format)
+                detail_key = next(
+                    key
+                    for key in body["usage"]
+                    if key.endswith("_details")
                 )
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED"
+                    f"@$.usage.{detail_key}.future_tokens",
+                    prepared.plan.warning_details,
+                )
+                self.assertNotIn(detail_key, prepared.payload["usage"])
 
     def test_standard_usage_details_require_non_negative_counters(self) -> None:
         cases = (
