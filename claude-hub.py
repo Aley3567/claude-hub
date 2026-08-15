@@ -1042,8 +1042,14 @@ def get_providers() -> dict:
 
 
 def reset_caches() -> None:
-    """Clear file caches. Primarily useful for isolated diagnostics and tests."""
+    """Clear in-process file and provider snapshot caches.
+
+    Primarily useful for isolated diagnostics and tests.
+    """
+    global _snapshot_entry
     _cfg_cache.update({"path": None, "mtime_ns": None, "size": None, "raw": None})
+    with _snapshot_lock:
+        _snapshot_entry = None
 
 
 # ---------------------------------------------------------------- routing

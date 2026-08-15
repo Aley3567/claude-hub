@@ -2655,6 +2655,69 @@ class ClaudeHubTests(unittest.TestCase):
             providers["Fixture HTTPS"]["base_url"], "https://restored.invalid"
         )
 
+    def test_reset_caches_clears_provider_snapshot(self):
+        first = hub.get_providers()
+        self.assertIn("Fixture HTTPS", first)
+
+        real_read = hub._read_provider_snapshot
+        calls = []
+
+        def spy(path):
+            calls.append(path)
+            return real_read(path)
+
+        with mock.patch.object(hub, "_read_provider_snapshot", side_effect=spy):
+            hub.reset_caches()
+            self.assertIsNone(hub._snapshot_entry)
+            second = hub.get_providers()
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNot(second, first)
+        self.assertIn("Fixture HTTPS", second)
+
+    def test_cli_doctor_reads_source_directly(self):
+        initial = hub.get_providers()
+        self.assertIn("Fixture HTTPS", initial)
+
+        writer = sqlite3.connect(self.db_file)
+        try:
+            self.assertEqual(
+                writer.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+                "wal",
+            )
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            new_env = {
+                "ANTHROPIC_BASE_URL": "https://doctor-wal.invalid/v1",
+                "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+            }
+            writer.execute(
+                "INSERT INTO providers VALUES (?, 'claude', ?)",
+                ("Doctor WAL", json.dumps({"env": new_env})),
+            )
+            writer.commit()
+            sidecars = hub._sqlite_sidecars(self.db_file)
+            for sidecar in sidecars:
+                self.assertTrue(sidecar.exists())
+                sidecar.chmod(0o600)
+
+            # Intentionally no reset_caches(): the doctor path must read the
+            # source directly rather than be masked by the warm cache.
+            providers, _verified = hub._read_provider_snapshot(self.db_file)
+            self.assertIn("Doctor WAL", providers)
+            self.assertEqual(
+                providers["Doctor WAL"]["base_url"],
+                "https://doctor-wal.invalid",
+            )
+
+            # End-to-end: cli_doctor itself must not consult the cache.
+            with mock.patch.object(hub, "get_providers") as cached_read:
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    hub.cli_doctor()
+            cached_read.assert_not_called()
+        finally:
+            writer.close()
+
     def test_database_symlink_checks_real_sidecar_permissions(self):
         writer = sqlite3.connect(self.db_file)
         try:
