@@ -1157,6 +1157,26 @@ def route(
             f"ambiguous model '{model}'; use channel,model",
         )
 
+    # Claude Code treats ``[1m]`` as a client-side context selector and can
+    # strip it from the model field before sending the request.  Match that
+    # bare name back to an explicitly declared 1M model so the gateway can
+    # preserve both the upstream model ID and the required beta header,
+    # instead of 400ing or silently forwarding without the 1M context.
+    context_1m_matches = {
+        (alias, declared_model)
+        for alias, channel in channels.items()
+        for declared_model in channel.get("models", [])
+        if declared_model.casefold().endswith("[1m]")
+        and declared_model[:-4] == model
+    }
+    if len(context_1m_matches) == 1:
+        return next(iter(context_1m_matches))
+    if len(context_1m_matches) > 1:
+        raise RouteError(
+            400,
+            f"ambiguous model '{model}'; use channel,model",
+        )
+
     # Treat an undeclared official-style Claude model ID as a request for the
     # matching claude1 slot.  This keeps generated Workflow code portable while
     # the Hub remains authoritative about the actual upstream model.

@@ -915,6 +915,64 @@ class ClaudeHubTests(unittest.TestCase):
         with self.assertRaisesRegex(hub.RouteError, "unknown model"):
             hub.route("claude-fable-5", cfg, providers)
 
+    def test_bare_model_matches_declared_1m_variant(self):
+        cfg = {
+            "channels": {
+                "fast": {"models": ["claude-fable-5[1M]"]},
+                "local": {"models": ["local-model"]},
+            },
+            "default_channel": "local",
+        }
+
+        self.assertEqual(
+            hub.route("claude-fable-5", cfg),
+            ("fast", "claude-fable-5[1M]"),
+        )
+
+    def test_1m_bare_match_works_for_non_official_model_names(self):
+        cfg = {
+            "channels": {
+                "fast": {"models": ["upstream-sonnet[1m]"]},
+                "local": {"models": ["local-model"]},
+            },
+            "default_channel": "local",
+        }
+
+        self.assertEqual(
+            hub.route("upstream-sonnet", cfg),
+            ("fast", "upstream-sonnet[1m]"),
+        )
+
+    def test_ambiguous_bare_1m_variant_requires_a_channel(self):
+        cfg = {
+            "channels": {
+                "fast": {"models": ["claude-fable-5[1M]"]},
+                "local": {"models": ["claude-fable-5[1m]"]},
+            },
+            "default_channel": "local",
+        }
+
+        with self.assertRaisesRegex(hub.RouteError, "ambiguous model"):
+            hub.route("claude-fable-5", cfg)
+
+    def test_1m_variant_beats_official_slot_fallback(self):
+        # An official-style bare name must still resolve back to the declared
+        # 1M model before the generic official-slot fallback routes it to a
+        # non-1M mapping; otherwise the context is silently dropped.
+        cfg = {
+            "channels": {
+                "fast": {"models": ["claude-fable-5[1M]"]},
+                "local": {"models": ["local-model"]},
+            },
+            "model_slots": {"fable": "local,local-model"},
+            "default_channel": "local",
+        }
+
+        self.assertEqual(
+            hub.route("claude-fable-5", cfg),
+            ("fast", "claude-fable-5[1M]"),
+        )
+
     def test_config_validation_rejects_non_boolean_route_unknown_to_default(self):
         self._write_config(
             default_channel="fast",
