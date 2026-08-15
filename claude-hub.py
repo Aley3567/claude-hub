@@ -2575,21 +2575,9 @@ async def _handle_transformed_messages(
                         f"protocol warnings {','.join(runtime_warning_codes)}"
                     )
                 await response.write_eof()
-                stream_usage = {}
-                if getattr(bridge, "saw_input_usage", True):
-                    stream_usage["input_tokens"] = bridge.input_tokens
-                if getattr(bridge, "saw_output_usage", True):
-                    stream_usage["output_tokens"] = bridge.output_tokens
-                if bridge.cache_read is not None:
-                    stream_usage["cache_read_input_tokens"] = bridge.cache_read
-                if bridge.cache_write is not None:
-                    stream_usage["cache_creation_input_tokens"] = bridge.cache_write
-                cache_creation = getattr(bridge, "cache_creation_detail", None)
-                if cache_creation is not None:
-                    stream_usage["cache_creation"] = cache_creation
-                server_tool_use = getattr(bridge, "server_tool_usage_detail", None)
-                if server_tool_use is not None:
-                    stream_usage["server_tool_use"] = server_tool_use
+                # Same receipt the downstream stream was built from, so the
+                # ledger cannot disagree with what the client was told.
+                stream_usage = bridge.usage_for_accounting()
                 record_usage(
                     alias,
                     model_out,

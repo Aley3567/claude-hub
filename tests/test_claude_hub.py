@@ -1598,6 +1598,54 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertIn("chunks=3", rendered_log)
         self.assertIn("terminal=complete", rendered_log)
 
+    def test_stream_accounting_records_the_downstream_usage_view(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        # nested carrier 证明 prompt_tokens 已含 cached tokens，下游拿到扣减
+        # 后的 60；账本一度直接读 bridge 累计属性记成 100，同一次请求的两个
+        # 出口就此分岔。记账必须来自下游同一张 receipt。
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n',
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":100,"completion_tokens":20,'
+                b'"prompt_tokens_details":{"cached_tokens":40}}}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ), mock.patch.object(hub, "log"), mock.patch.object(
+            hub, "record_usage"
+        ) as record:
+            asyncio.run(hub.handle_messages(request))
+
+        rendered = b"".join(downstream.writes).decode()
+        self.assertIn('"input_tokens":60', rendered)
+        recorded_usage = record.call_args.args[3]
+        self.assertEqual(recorded_usage.get("input_tokens"), 60)
+        self.assertEqual(recorded_usage.get("cache_read_input_tokens"), 40)
+
     def test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed(self):
         self._set_provider_endpoint(
             "Fixture HTTPS",

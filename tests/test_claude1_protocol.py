@@ -1568,3 +1568,68 @@ class UsageReceiptTests(unittest.TestCase):
         self.assertIsNotNone(delta_usage)
         self.assertEqual(delta_usage.get("input_tokens"), 60)
         self.assertEqual(delta_usage.get("cache_read_input_tokens"), 40)
+
+    def _delta_usage(self, chunks) -> dict:
+        """取 message_delta 事件里的 usage。"""
+        usage: dict = {}
+        for line in b"".join(chunks).splitlines():
+            if not line.startswith(b"data:"):
+                continue
+            payload = json.loads(line[5:].strip())
+            if payload.get("type") == "message_delta":
+                usage = payload.get("usage") or {}
+        return usage
+
+    def _finish_chat_stream(self, usage: dict):
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        bridge.feed(
+            "message",
+            json.dumps({"choices": [{"delta": {"content": "hi"}}]}),
+        )
+        bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": usage,
+                }
+            ),
+        )
+        return bridge, self._delta_usage(bridge.finish())
+
+    def test_stream_accounting_view_matches_downstream_usage(self) -> None:
+        bridge, delta_usage = self._finish_chat_stream(
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            }
+        )
+        # 记账必须读下游同一张 receipt。曾经直接读累计属性，于是同一次流
+        # 下游拿到扣减后的 60，账本却记 inclusive 的 100 外加 cache_read 40。
+        self.assertEqual(delta_usage.get("input_tokens"), 60)
+        self.assertEqual(bridge.usage_for_accounting().get("input_tokens"), 60)
+        # 扣减只发生在导出路径，累计属性保持上游原值，不可直接用于记账。
+        self.assertEqual(bridge.input_tokens, 100)
+
+    def test_stream_accounting_view_drops_ambiguous_cache_carrier(self) -> None:
+        bridge, delta_usage = self._finish_chat_stream(
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "cache_read_tokens": 40,
+            }
+        )
+        accounting = bridge.usage_for_accounting()
+        # 顶层兼容字段证明不了 base 是否 inclusive，下游已经拒猜，
+        # 账本同样不能把这 40 记进去。
+        self.assertNotIn("cache_read_input_tokens", delta_usage)
+        self.assertNotIn("cache_read_input_tokens", accounting)
+        self.assertEqual(accounting.get("input_tokens"), 100)
+
+    def test_stream_accounting_view_omits_unobserved_counters(self) -> None:
+        bridge, _ = self._finish_chat_stream({"completion_tokens": 20})
+        accounting = bridge.usage_for_accounting()
+        # 未观测的计数器省略而不是伪造 0，记账侧无需再靠 plan 反查剥零。
+        self.assertNotIn("input_tokens", accounting)
+        self.assertEqual(accounting.get("output_tokens"), 20)
