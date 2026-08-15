@@ -2720,24 +2720,144 @@ def _upstream_usage_total(
     return total_tokens
 
 
-def _usage(
-    input_tokens: object = 0,
-    output_tokens: object = 0,
-    cache_read: object = _MISSING,
-    cache_write: object = _MISSING,
-    cache_creation: object = _MISSING,
-    server_tool_use: object = _MISSING,
+@dataclass(frozen=True)
+class UsageReceipt:
+    """Canonical usage evidence shared by complete and stream conversions.
+
+    One entry point takes whatever usage shape the upstream reported and owns
+    every interpretation rule: which cache-read carriers prove an inclusive
+    base, which are ambiguous compat fields, and which counters were never
+    observed. Callers export either shape below and never fabricate a zero
+    for an unobserved counter.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read: int | None = None
+    cache_write: int | None = None
+
+    @classmethod
+    def from_upstream(
+        cls,
+        raw_usage: object,
+        *,
+        input_key: str = "input_tokens",
+        output_key: str = "output_tokens",
+    ) -> "UsageReceipt":
+        if raw_usage is None:
+            raw_usage = {}
+        if not isinstance(raw_usage, dict):
+            raise ProtocolTransformError(
+                "upstream usage must be an object",
+                code="HUB_UPSTREAM_USAGE_INVALID",
+            )
+        values: dict[str, int | None] = {}
+        for field, key in (
+            ("input_tokens", input_key),
+            ("output_tokens", output_key),
+        ):
+            value = raw_usage.get(key, _MISSING)
+            if value is _MISSING:
+                values[field] = None
+                continue
+            parsed = _token_count(value, -1)
+            if parsed < 0:
+                raise ProtocolTransformError(
+                    f"upstream usage counter {key!r} is invalid",
+                    code="HUB_UPSTREAM_USAGE_INVALID",
+                )
+            values[field] = parsed
+        cache_read = _cache_read(raw_usage)
+        cache_write = _cache_write(raw_usage)
+        return cls.from_evidence(
+            input_tokens=values["input_tokens"],
+            output_tokens=values["output_tokens"],
+            cache_read=cache_read if isinstance(cache_read, int) else None,
+            cache_write=cache_write if isinstance(cache_write, int) else None,
+            nested_cache_evidence=_has_nested_cache_carrier(raw_usage),
+            official_cache_read=_has_official_cache_read(raw_usage),
+        )
+
+    @classmethod
+    def from_evidence(
+        cls,
+        *,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cache_read: int | None,
+        cache_write: int | None,
+        nested_cache_evidence: bool,
+        official_cache_read: bool,
+    ) -> "UsageReceipt":
+        """Apply the shared cache-read evidence rule to aggregated counters.
+
+        The single rule source for complete and stream conversions: a nested
+        carrier proves the base input counter is inclusive of cached tokens;
+        the Anthropic-native key proves exclusive semantics; a bare top-level
+        compat field proves neither and must not be guessed at.
+        """
+        if nested_cache_evidence:
+            if isinstance(cache_read, int) and input_tokens is not None:
+                adjusted = input_tokens - cache_read
+                if adjusted < 0:
+                    raise ProtocolTransformError(
+                        "upstream input usage is smaller than its cache-read counter",
+                        code="HUB_UPSTREAM_USAGE_INVALID",
+                    )
+                input_tokens = adjusted
+        elif not official_cache_read:
+            cache_read = None
+        return cls(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read=cache_read,
+            cache_write=cache_write,
+        )
+
+    @property
+    def source(self) -> str:
+        observed = (
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read,
+            self.cache_write,
+        )
+        return "upstream" if any(v is not None for v in observed) else "unavailable"
+
+    def as_anthropic(self, *, schema_complete: bool = False) -> dict:
+        """Export the Anthropic usage shape.
+
+        ``schema_complete`` covers the complete-response contract: the
+        Anthropic Messages schema requires the base counters, so an
+        unobserved counter is exported as an honest 0 while the provenance
+        degradation stays recorded in the conversion plan (and is stripped
+        again for usage accounting). Stream events omit unobserved counters
+        instead, because no schema forces them to exist mid-stream.
+        """
+        usage: dict = {}
+        if self.input_tokens is not None:
+            usage["input_tokens"] = self.input_tokens
+        elif schema_complete:
+            usage["input_tokens"] = 0
+        if self.output_tokens is not None:
+            usage["output_tokens"] = self.output_tokens
+        elif schema_complete:
+            usage["output_tokens"] = 0
+        if self.cache_read is not None:
+            usage["cache_read_input_tokens"] = self.cache_read
+        if self.cache_write is not None:
+            usage["cache_creation_input_tokens"] = self.cache_write
+        return usage
+
+
+def _usage_with_details(
+    receipt: UsageReceipt,
+    cache_creation_detail: object,
+    server_tool_use: object,
 ) -> dict:
-    usage = {
-        "input_tokens": _token_count(input_tokens),
-        "output_tokens": _token_count(output_tokens),
-    }
-    if cache_read is not _MISSING and cache_read is not None:
-        usage["cache_read_input_tokens"] = _token_count(cache_read)
-    if cache_write is not _MISSING and cache_write is not None:
-        usage["cache_creation_input_tokens"] = _token_count(cache_write)
-    if cache_creation is not _MISSING:
-        usage["cache_creation"] = copy.deepcopy(cache_creation)
+    usage = receipt.as_anthropic(schema_complete=True)
+    if cache_creation_detail is not _MISSING:
+        usage["cache_creation"] = copy.deepcopy(cache_creation_detail)
     if server_tool_use is not _MISSING:
         usage["server_tool_use"] = copy.deepcopy(server_tool_use)
     return usage
@@ -2781,6 +2901,19 @@ def _coalesce_usage_counters(
             code="HUB_UPSTREAM_USAGE_INVALID",
         )
     return normalized[0]
+
+
+def _has_nested_cache_carrier(raw_usage: dict) -> bool:
+    """True only when a standard nested cache-read carrier is present."""
+    return any(
+        isinstance(raw_usage.get(key), dict) and "cached_tokens" in raw_usage[key]
+        for key in ("prompt_tokens_details", "input_tokens_details")
+    )
+
+
+def _has_official_cache_read(raw_usage: dict) -> bool:
+    """True when the Anthropic-native exclusive cache-read key is present."""
+    return "cache_read_input_tokens" in raw_usage
 
 
 def _cache_read(raw_usage: dict) -> object:
@@ -2858,25 +2991,6 @@ def _response_base_usage(
             )
         values.append(parsed)
     return raw, values[0], values[1]
-
-
-def _input_tokens_excluding_cache_read(
-    raw_usage: dict,
-    input_key: str,
-    input_tokens: int,
-    cache_read: object,
-) -> int:
-    """OpenAI base input counters include cached tokens; Anthropic's do not."""
-    if input_key not in raw_usage or not isinstance(cache_read, int):
-        return input_tokens
-    adjusted = input_tokens - cache_read
-    if adjusted < 0:
-        raise ProtocolTransformError(
-            "upstream input usage is smaller than its cache-read counter",
-            code="HUB_UPSTREAM_USAGE_INVALID",
-            path=f"$.usage.{input_key}",
-        )
-    return adjusted
 
 
 def _usage_detail(
@@ -3514,20 +3628,22 @@ def chat_to_anthropic(
             }
         )
         has_tool = True
-    raw_usage, input_tokens, output_tokens = _response_base_usage(
+    raw_usage, _base_input, _base_output = _response_base_usage(
         body,
         api_format="openai_chat",
         input_key="prompt_tokens",
         output_key="completion_tokens",
         plan=plan,
     )
-    cache_read = _cache_read(raw_usage)
-    input_tokens = _input_tokens_excluding_cache_read(
-        raw_usage, "prompt_tokens", input_tokens, cache_read
+    receipt = UsageReceipt.from_upstream(
+        raw_usage,
+        input_key="prompt_tokens",
+        output_key="completion_tokens",
     )
-    cache_write = _cache_write(raw_usage)
     cache_creation_detail = _cache_creation_detail(raw_usage)
-    _validate_cache_creation_consistency(cache_write, cache_creation_detail)
+    _validate_cache_creation_consistency(
+        receipt.cache_write, cache_creation_detail
+    )
     if "model" not in body:
         _record_response_metadata_degradation(plan, "$.model")
     return {
@@ -3542,11 +3658,8 @@ def chat_to_anthropic(
             refused=refused,
         ),
         "stop_sequence": None,
-        "usage": _usage(
-            input_tokens,
-            output_tokens,
-            cache_read,
-            cache_write,
+        "usage": _usage_with_details(
+            receipt,
             cache_creation_detail,
             _server_tool_usage(raw_usage),
         ),
@@ -3859,20 +3972,22 @@ def responses_to_anthropic(
                 f"Responses output item {kind!r} is unsupported",
                 code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
             )
-    raw_usage, input_tokens, output_tokens = _response_base_usage(
+    raw_usage, _base_input, _base_output = _response_base_usage(
         body,
         api_format="openai_responses",
         input_key="input_tokens",
         output_key="output_tokens",
         plan=plan,
     )
-    cache_read = _cache_read(raw_usage)
-    input_tokens = _input_tokens_excluding_cache_read(
-        raw_usage, "input_tokens", input_tokens, cache_read
+    receipt = UsageReceipt.from_upstream(
+        raw_usage,
+        input_key="input_tokens",
+        output_key="output_tokens",
     )
-    cache_write = _cache_write(raw_usage)
     cache_creation_detail = _cache_creation_detail(raw_usage)
-    _validate_cache_creation_consistency(cache_write, cache_creation_detail)
+    _validate_cache_creation_consistency(
+        receipt.cache_write, cache_creation_detail
+    )
     if "model" not in body:
         _record_response_metadata_degradation(plan, "$.model")
     return {
@@ -3887,11 +4002,8 @@ def responses_to_anthropic(
             refused=refused,
         ),
         "stop_sequence": None,
-        "usage": _usage(
-            input_tokens,
-            output_tokens,
-            cache_read,
-            cache_write,
+        "usage": _usage_with_details(
+            receipt,
             cache_creation_detail,
             _server_tool_usage(raw_usage),
         ),
@@ -4397,6 +4509,8 @@ class AnthropicStreamBridge:
     )
     response_text_total_bytes: int = 0
     response_tool_done_snapshots: dict[int, str] = field(default_factory=dict)
+    nested_cache_evidence: bool = False
+    official_cache_read: bool = False
     tool_argument_fragments: dict[int, list[str]] = field(default_factory=dict)
     tool_argument_bytes: dict[int, int] = field(default_factory=dict)
     tool_descriptors: dict[str, tuple[str, str]] = field(default_factory=dict)
@@ -4575,6 +4689,13 @@ class AnthropicStreamBridge:
             self._update_base_usage("input_tokens", raw_usage[input_key])
         if output_key in raw_usage:
             self._update_base_usage("output_tokens", raw_usage[output_key])
+        # Cache-read evidence is observed per upstream usage event and
+        # applied once at emission time via UsageReceipt.from_evidence, so
+        # stream and complete share the same interpretation rule.
+        if _has_nested_cache_carrier(raw_usage):
+            self.nested_cache_evidence = True
+        if _has_official_cache_read(raw_usage):
+            self.official_cache_read = True
         self._update_counter("cache_read", _cache_read(raw_usage))
         self._update_counter("cache_write", _cache_write(raw_usage))
         self._update_usage_detail(
@@ -4603,15 +4724,7 @@ class AnthropicStreamBridge:
         self.started = True
         # Usage fields are only emitted when the upstream actually reported
         # them; a fabricated zero would hide the unobserved state.
-        usage: dict = {}
-        if self.saw_input_usage:
-            usage["input_tokens"] = self.input_tokens
-        if self.saw_output_usage:
-            usage["output_tokens"] = self.output_tokens
-        if self.cache_read is not None:
-            usage["cache_read_input_tokens"] = self.cache_read
-        if self.cache_write is not None:
-            usage["cache_creation_input_tokens"] = self.cache_write
+        receipt = self._usage_receipt()
         return [
             sse_event(
                 "message_start",
@@ -4625,11 +4738,25 @@ class AnthropicStreamBridge:
                         "model": self.model,
                         "stop_reason": None,
                         "stop_sequence": None,
-                        "usage": usage,
+                        "usage": receipt.as_anthropic(),
                     },
                 },
             )
         ]
+
+    def _usage_receipt(self) -> UsageReceipt:
+        """Convert aggregated counters through the shared evidence rule."""
+        saw_input = self.saw_input_usage
+        saw_output = self.saw_output_usage
+        receipt = UsageReceipt.from_evidence(
+            input_tokens=self.input_tokens if saw_input else None,
+            output_tokens=self.output_tokens if saw_output else None,
+            cache_read=self.cache_read,
+            cache_write=self.cache_write,
+            nested_cache_evidence=self.nested_cache_evidence,
+            official_cache_read=self.official_cache_read,
+        )
+        return receipt
 
     def _open(self, kind: str, block: dict, *, key: str | None = None) -> tuple[int, list[bytes]]:
         if key is not None and key in self.tool_indices:
@@ -6934,17 +7061,18 @@ class AnthropicStreamBridge:
         for index in sorted(self.open_indices):
             chunks.extend(self._close(index))
         final_usage: dict = {}
+        receipt = self._usage_receipt()
         if self.saw_output_usage:
-            final_usage["output_tokens"] = self.output_tokens
+            final_usage["output_tokens"] = receipt.output_tokens
         if self.late_input_usage:
             # Input usage arrived after message_start; message_delta can
             # still carry it truthfully, and the late arrival stays
             # observable via HUB_DEGRADE_LATE_INPUT_USAGE.
-            final_usage["input_tokens"] = self.input_tokens
-        if self.cache_read is not None:
-            final_usage["cache_read_input_tokens"] = self.cache_read
-        if self.cache_write is not None:
-            final_usage["cache_creation_input_tokens"] = self.cache_write
+            final_usage["input_tokens"] = receipt.input_tokens
+        if receipt.cache_read is not None:
+            final_usage["cache_read_input_tokens"] = receipt.cache_read
+        if receipt.cache_write is not None:
+            final_usage["cache_creation_input_tokens"] = receipt.cache_write
         if self.cache_creation_detail is not None:
             final_usage["cache_creation"] = copy.deepcopy(
                 self.cache_creation_detail
