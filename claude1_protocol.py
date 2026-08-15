@@ -4724,7 +4724,7 @@ class AnthropicStreamBridge:
         self.started = True
         # Usage fields are only emitted when the upstream actually reported
         # them; a fabricated zero would hide the unobserved state.
-        receipt = self._usage_receipt()
+        receipt = self.usage_receipt()
         return [
             sse_event(
                 "message_start",
@@ -4744,19 +4744,32 @@ class AnthropicStreamBridge:
             )
         ]
 
-    def _usage_receipt(self) -> UsageReceipt:
+    def usage_receipt(self) -> UsageReceipt:
         """Convert aggregated counters through the shared evidence rule."""
-        saw_input = self.saw_input_usage
-        saw_output = self.saw_output_usage
-        receipt = UsageReceipt.from_evidence(
-            input_tokens=self.input_tokens if saw_input else None,
-            output_tokens=self.output_tokens if saw_output else None,
+        return UsageReceipt.from_evidence(
+            input_tokens=self.input_tokens if self.saw_input_usage else None,
+            output_tokens=self.output_tokens if self.saw_output_usage else None,
             cache_read=self.cache_read,
             cache_write=self.cache_write,
             nested_cache_evidence=self.nested_cache_evidence,
             official_cache_read=self.official_cache_read,
         )
-        return receipt
+
+    def usage_for_accounting(self) -> dict:
+        """Export the accounting view of this stream's usage.
+
+        Accounting used to read the aggregated counters directly, which
+        bypassed the cache-read evidence rule and let one stream report a
+        subtracted base downstream while the ledger kept the inclusive one.
+        Both views now derive from the same receipt, so an unobserved
+        counter is omitted here instead of being fabricated as a zero.
+        """
+        usage = self.usage_receipt().as_anthropic()
+        if self.cache_creation_detail is not None:
+            usage["cache_creation"] = copy.deepcopy(self.cache_creation_detail)
+        if self.server_tool_usage_detail is not None:
+            usage["server_tool_use"] = copy.deepcopy(self.server_tool_usage_detail)
+        return usage
 
     def _open(self, kind: str, block: dict, *, key: str | None = None) -> tuple[int, list[bytes]]:
         if key is not None and key in self.tool_indices:
@@ -7061,7 +7074,7 @@ class AnthropicStreamBridge:
         for index in sorted(self.open_indices):
             chunks.extend(self._close(index))
         final_usage: dict = {}
-        receipt = self._usage_receipt()
+        receipt = self.usage_receipt()
         if self.saw_output_usage:
             final_usage["output_tokens"] = receipt.output_tokens
         if self.late_input_usage:
