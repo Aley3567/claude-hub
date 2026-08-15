@@ -1156,6 +1156,20 @@ def route(
         return alias, upstream_model
 
     channels = cfg["channels"]
+    # Hub v2 owns the four native Claude model slots.  Resolve those mappings
+    # before looking for a coincidentally named bare upstream model so callers
+    # such as Workflow ``agent(..., {model: "haiku"})`` get the exact same
+    # route as Claude Code's /model picker and launcher settings.
+    model_slots = cfg.get("model_slots")
+    slot = model.casefold()
+    if slot in HUB_SLOT_ORDER and isinstance(model_slots, dict):
+        selector = model_slots.get(slot)
+        if isinstance(selector, str):
+            slot_alias, separator, slot_model = selector.partition(",")
+            slot_alias, slot_model = slot_alias.strip().lower(), slot_model.strip()
+            if separator and slot_alias in channels and slot_model:
+                return slot_alias, slot_model
+
     aliases = [
         alias
         for alias, channel in channels.items()
@@ -1168,6 +1182,20 @@ def route(
             400,
             f"ambiguous model '{model}'; use channel,model",
         )
+
+    # Treat an undeclared official-style Claude model ID as a request for the
+    # matching claude1 slot.  This keeps generated Workflow code portable while
+    # the Hub remains authoritative about the actual upstream model.
+    official_slot = re.fullmatch(
+        r"claude-(fable|opus|sonnet|haiku)(?:-.+)?",
+        model,
+        re.IGNORECASE,
+    )
+    if official_slot and isinstance(model_slots, dict):
+        selector = model_slots.get(official_slot.group(1).casefold())
+        if isinstance(selector, str):
+            slot_alias, _, slot_model = selector.partition(",")
+            return slot_alias, slot_model
 
     alias = cfg["default_channel"]
     channel = channels.get(alias)
@@ -1186,9 +1214,15 @@ def route(
         # Explicit opt-in for isolated single-channel protocol bridges:
         # unlisted models are forwarded to the default channel unchanged.
         return alias, model
+    available_slots = (
+        ", ".join(slot for slot in HUB_SLOT_ORDER if slot in model_slots)
+        if isinstance(model_slots, dict)
+        else "fable, opus, sonnet, haiku"
+    )
     raise RouteError(
         400,
-        f"unknown model '{model}'; use channel,model or a configured model slot",
+        f"unknown model '{model}'; use channel,model or an available model slot: "
+        f"{available_slots}",
     )
 
 

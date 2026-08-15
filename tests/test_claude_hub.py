@@ -858,7 +858,54 @@ class ClaudeHubTests(unittest.TestCase):
             ("fast", "upstream-fable"),
         )
 
-    def test_unlisted_model_containing_tier_name_fails_clearly(self):
+    def test_hub_v2_bare_slot_uses_the_configured_slot_mapping(self):
+        cfg = hub.get_config()
+        cfg["model_slots"] = {
+            "fable": "fast,claude-opus-4",
+            "opus": "local,local-model",
+            "sonnet": "fast,remote-model",
+            "haiku": "local,remote-model",
+        }
+
+        self.assertEqual(
+            hub.route("haiku", cfg),
+            ("local", "remote-model"),
+        )
+
+    def test_official_style_model_id_uses_the_matching_hub_slot(self):
+        cfg = hub.get_config()
+        cfg["model_slots"] = {
+            "fable": "fast,claude-opus-4",
+            "opus": "local,local-model",
+            "sonnet": "fast,remote-model",
+            "haiku": "local,remote-model",
+        }
+
+        self.assertEqual(
+            hub.route("claude-haiku-4-5-20251001", cfg),
+            ("local", "remote-model"),
+        )
+        self.assertEqual(
+            hub.route("claude-sonnet-5", cfg),
+            ("fast", "remote-model"),
+        )
+
+    def test_unknown_model_error_names_the_available_slots(self):
+        cfg = hub.get_config()
+        cfg["model_slots"] = {
+            "fable": "fast,claude-opus-4",
+            "opus": "local,local-model",
+            "sonnet": "fast,remote-model",
+            "haiku": "local,remote-model",
+        }
+
+        with self.assertRaisesRegex(
+            hub.RouteError,
+            "available model slot: fable, opus, sonnet, haiku",
+        ):
+            hub.route("made-up-model", cfg)
+
+    def test_official_style_id_does_not_alias_without_hub_slots(self):
         cfg = hub.get_config()
         providers = {
             "Fixture HTTPS": {
