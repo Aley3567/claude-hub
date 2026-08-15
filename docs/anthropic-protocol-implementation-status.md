@@ -73,7 +73,8 @@
 | 已登记、合法且一致的 cache usage counter / split detail | `exact` | `exact` | `exact` | `reject` |
 | 已登记且合法的 server-tool usage counter / detail | `exact` | `exact` | `exact` | `reject` |
 | reasoning/audio/prediction usage detail | `exact` | `observable degradation` | `observable degradation` | `reject` |
-| 未知、malformed 或冲突的 usage/cache/server carrier | native passthrough* | `reject` | `reject` | `reject` |
+| 未知的 usage 统计字段（顶层或 detail 内） | native passthrough* | `observable degradation` | `observable degradation` | `reject` |
+| malformed 或冲突的 usage/cache/server carrier | native passthrough* | `reject` | `reject` | `reject` |
 | `/count_tokens`（标准原生上游 endpoint 可用） | `exact` | `reject` | `reject` | `reject` |
 | `/count_tokens` 本地估算 fallback | `observable degradation` | `observable degradation` | `observable degradation` | `reject` |
 | 未登记的顶层请求扩展 | `exact` native passthrough* | `observable degradation` | `observable degradation` | `reject` |
@@ -153,7 +154,7 @@
 
 ### Usage、cache 与 count-token provenance
 
-- cache read/write、`cache_creation` 和 `server_tool_use` 只在上游实际提供、字段已登记、counter 合法且多 carrier 一致时保留。read/write alias、cache total/split detail 冲突，未知 usage/detail 字段或 malformed shape 均为 `HUB_UPSTREAM_USAGE_INVALID`。`cached_tokens` 精确保留；reasoning/audio/prediction detail 逐字段记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`。`cache_creation` split detail 存在而 total counter 缺失同样拒绝，不输出无 total 的半截 cache 结构。
+- cache read/write、`cache_creation` 和 `server_tool_use` 只在上游实际提供、字段已登记、counter 合法且多 carrier 一致时保留。read/write alias、cache total/split detail 冲突或 malformed shape 均为 `HUB_UPSTREAM_USAGE_INVALID`。**未知 usage 统计字段（顶层或 detail 内，含 provider 自定义的非标准 counter，如微信的顶层 `reasoning_tokens`）不在此列**：usage 是统计回执，adapter 只复制登记过的 counter、绝不从未知字段推导数值，因此未知字段按 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED@$.usage.<field>` 降级丢弃，不会把已经开始的下游流判成致命协议错误而掐断；已登记 counter 的值非法（非非负整数、total 与 base 冲突）仍 fail closed。`cached_tokens` 精确保留；reasoning/audio/prediction detail 逐字段记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`。`cache_creation` split detail 存在而 total counter 缺失同样拒绝，不输出无 total 的半截 cache 结构。
 - OpenAI 的 base input 计数（`prompt_tokens`/`input_tokens`）包含 cached tokens，而 Anthropic `input_tokens` 语义不含 cache read；二者同时观测到时输出 `input_tokens = base - cache_read`，差值为负按 `HUB_UPSTREAM_USAGE_INVALID` 拒绝。base counter 缺失时不做减法，走缺失 provenance 分支。
 - 流式 usage 只发出上游实际观测到的字段：`message_start` 不再恒发 `input_tokens: 0`/`output_tokens: 0`，`message_delta` 不再恒发 `output_tokens: 0`，客户端因此能区分真实 0 与未观测；一个计数器都未观测到时（含上游显式发空 `usage={}`），终态 `message_delta` 省略整个 `usage` 键而非携带空对象。terminal 才到达的晚期 input usage 由 `message_delta` 如实携带，并保留 `HUB_DEGRADE_LATE_INPUT_USAGE` 可观测性；`message_start` 已携带的 input usage 不重复。上游 wrapper 缺 `model` 时输出空串并逐响应记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`(`$.model`)，不猜测模型名。
 - `total_tokens` 始终校验为非负 counter；同一 snapshot 的 input/output 两项都存在时必须等于二者之和。缺任一 base 时不反推、不分摊、不伪造，缺项记录 `HUB_USAGE_PROVENANCE_UNAVAILABLE`。对客户端 schema 必须存在的基础计数可使用带 warning 的 `0` 占位，但 usage JSONL 会移除这些占位，只落实际观察到的上游 counter，并将完全不可用的记录标为 `source=unavailable`。

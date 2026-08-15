@@ -3560,7 +3560,7 @@ class StreamStateMachineContractTests(unittest.TestCase):
             {"web_search_requests": 2},
         )
 
-    def test_stream_usage_registries_reject_unknown_fields(self) -> None:
+    def test_stream_usage_registries_drop_unknown_fields_with_warning(self) -> None:
         cases = (
             (
                 "openai_chat",
@@ -3620,12 +3620,56 @@ class StreamStateMachineContractTests(unittest.TestCase):
         for api_format, event, payload in cases:
             with self.subTest(api_format=api_format):
                 bridge = protocol.AnthropicStreamBridge(api_format)
-                with self.assertRaises(protocol.ProtocolTransformError) as raised:
-                    bridge.feed(event, json.dumps(payload))
-                self.assertEqual(
-                    raised.exception.code,
-                    "HUB_UPSTREAM_USAGE_INVALID",
+                bridge.feed(event, json.dumps(payload))
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                    bridge.warning_codes,
                 )
+
+    def test_extra_usage_field_does_not_abort_finished_stream(self) -> None:
+        # 兼容上游的真实序列：finish_reason 之后发一帧
+        # choices=[] 的 usage 事件，其中 usage 带非标准顶层字段
+        # reasoning_tokens。usage 只是统计回执，未知字段必须降级丢弃，
+        # 不得把已经开始的下游流判成致命协议错误而掐断。
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [
+                        {"delta": {"content": "你好"}, "finish_reason": "stop"}
+                    ]
+                }
+            ),
+        )
+        chunks.extend(
+            bridge.feed(
+                "message",
+                json.dumps(
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 16520,
+                            "completion_tokens": 8,
+                            "total_tokens": 16528,
+                            "reasoning_tokens": 0,
+                        },
+                    },
+                ),
+            )
+        )
+        chunks.extend(bridge.feed("message", "[DONE]"))
+        # 不抛异常、正常补齐 terminal 事件，是本回归测试的核心断言。
+        chunks.extend(bridge.finish())
+        events = [
+            json.loads(data)
+            for _, data in protocol.SSEParser().feed(b"".join(chunks))
+        ]
+        self.assertEqual(events[-1]["type"], "message_stop")
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            bridge.warning_codes,
+        )
 
     def test_stream_usage_details_fail_closed_on_malformed_nested_shapes(self) -> None:
         cases = (
@@ -3650,21 +3694,6 @@ class StreamStateMachineContractTests(unittest.TestCase):
                         "prompt_tokens": 3,
                         "completion_tokens": 1,
                         "completion_tokens_details": {"reasoning_tokens": False},
-                    },
-                },
-            ),
-            (
-                "openai_responses",
-                "response.completed",
-                {
-                    "type": "response.completed",
-                    "response": {
-                        "status": "completed",
-                        "usage": {
-                            "input_tokens": 3,
-                            "output_tokens": 1,
-                            "input_tokens_details": {"future_tokens": 1},
-                        },
                     },
                 },
             ),
