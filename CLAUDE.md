@@ -29,7 +29,7 @@ usage 日志、统计和终端图表，launcher 只选择当前 Hub 对应的日
 
 ### `claude-hub.py` — 可选常驻 Anthropic 网关（`uv run --script`，PEP 723 内联依赖 aiohttp）
 
-监听 `127.0.0.1`，让一个长会话用原生 `/model channel,model` 切换渠道 + 模型；请求发生时才从 CC Switch DB 只读取上游与凭证，本文件不含凭证。正常由启动器拉起时通过 `SockSite` 接管继承的监听 FD；直接执行 `serve` 时仍由 `TCPSite` 自行绑定配置端口。
+监听 `127.0.0.1`，让一个长会话用原生 `/model channel,model` 切换渠道 + 模型；请求发生时才从 CC Switch DB 只读取上游与凭证，本文件不含凭证。`get_providers()` 带进程内快照缓存：以主库+WAL 指纹为 revision，命中时零复制（权限检查仍在每次调用先执行，fail closed）；测试隔离用 `reset_caches()`。正常由启动器拉起时通过 `SockSite` 接管继承的监听 FD；直接执行 `serve` 时仍由 `TCPSite` 自行绑定配置端口。
 
 关键接口：`resolve_provider` / `_read_provider_rows`（只读取上游）、`_post_with_account_failover`（只在下游响应开始前处理 `401/403/429`）、`check_local_auth`（本地 token 鉴权 `CLAUDE_HUB_LOCAL_TOKEN`）、`validate_upstream_url`（上游 URL 与地址边界校验）、`create_app`（aiohttp 应用）。CLI：`serve` / `list` / `doctor` / `check` / `logs`。
 
