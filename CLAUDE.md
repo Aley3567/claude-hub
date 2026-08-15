@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 核心架构
 
-六个根目录 Python module 组成启动器、Hub、命名 Hub 目录、账号调度、协议转换和 statusline 解析；主数据流为 `启动器 → 三条启动路径之一 → 上游 provider`。账号池与协议转换各自提供独立 seam，被启动器和 Hub 复用。
+根目录 Python module 组成启动器、Hub、命名 Hub 目录、账号调度、协议转换和 statusline 解析；主数据流为 `启动器 → 三条启动路径之一 → 上游 provider`。账号池与协议转换各自提供独立 seam，被启动器和 Hub 复用。
 
 ### `claude-provider-once.py` — 一次性启动器（curses TUI + CLI）
 
@@ -36,9 +36,13 @@ Hub 子进程启动统一经 `_reserve_loopback_port` / `_spawn_hub_process`：�
 
 主 provider 拥有 endpoint、模型、协议和 proxy，池成员只贡献 credential。Anthropic 原生直连在会话启动时 acquire 一次；Hub 与临时协议桥按请求 acquire，并且响应 prepare 后绝不切 key 或重放。
 
-### `claude1_protocol.py` — 协议转换（零第三方依赖，纯 JSON/SSE 形状转换）
+### `claude1_protocol.py` — 协议转换兼容入口（零第三方依赖，纯 JSON/SSE 形状转换）
 
 三种格式互转 `anthropic` ↔ `openai_chat` ↔ `openai_responses`。**刻意不含 provider 路由与凭证**，只处理协议形状，可独立单测；新上游的兼容分支一律放这里，不要散落进启动器。
+
+共享类型和 usage 规则分别收口在 `claude1_protocol_types.py` 与
+`claude1_protocol_usage.py`。外部调用仍从 `claude1_protocol` 导入；不要把这些
+规则复制回兼容入口，也不要为每个小 helper 新建浅 module。
 
 关键接口：`provider_api_format`（按 CC Switch 优先级解析格式，未知值 fail-closed 回落 anthropic）、`transform_request` / `transform_response` / `transform_error`、`AnthropicStreamBridge` + `SSEParser`（流式）。
 

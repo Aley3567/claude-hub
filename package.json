@@ -22,6 +22,8 @@
     "bin",
     "claude-hub.py",
     "claude1_protocol.py",
+    "claude1_protocol_types.py",
+    "claude1_protocol_usage.py",
     "claude-provider-once.py",
     "claude1_account_pool.py",
     "claude1_transport.py",

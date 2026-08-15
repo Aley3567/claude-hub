@@ -95,6 +95,12 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/claude1_protocol.py" \
     "$home/install root/scripts/claude1_protocol.py" ||
     fail "protocol bridge was not installed"
+  command cmp -s "$REPO_ROOT/claude1_protocol_types.py" \
+    "$home/install root/scripts/claude1_protocol_types.py" ||
+    fail "protocol types module was not installed"
+  command cmp -s "$REPO_ROOT/claude1_protocol_usage.py" \
+    "$home/install root/scripts/claude1_protocol_usage.py" ||
+    fail "protocol usage module was not installed"
   command cmp -s "$REPO_ROOT/claude1_transport.py" \
     "$home/install root/scripts/claude1_transport.py" ||
     fail "transport module was not installed"
@@ -207,6 +213,8 @@ test_existing_files_are_backed_up() {
   print -r -- 'old hub catalog' > "$home/install root/scripts/claude_hub_catalog.py"
   print -r -- 'old account pool' > "$home/install root/scripts/claude1_account_pool.py"
   print -r -- 'old protocol' > "$home/install root/scripts/claude1_protocol.py"
+  print -r -- 'old protocol types' > "$home/install root/scripts/claude1_protocol_types.py"
+  print -r -- 'old protocol usage' > "$home/install root/scripts/claude1_protocol_usage.py"
   print -r -- 'old transport' > "$home/install root/scripts/claude1_transport.py"
   print -r -- 'old statusline model' > "$home/install root/scripts/statusline-model.py"
   print -r -- 'old shell' > "$home/install root/claude1/zsh-functions.sh"
@@ -225,6 +233,8 @@ test_existing_files_are_backed_up() {
   assert_file_content "old hub catalog" "$backup/claude_hub_catalog.py"
   assert_file_content "old account pool" "$backup/claude1_account_pool.py"
   assert_file_content "old protocol" "$backup/claude1_protocol.py"
+  assert_file_content "old protocol types" "$backup/claude1_protocol_types.py"
+  assert_file_content "old protocol usage" "$backup/claude1_protocol_usage.py"
   assert_file_content "old transport" "$backup/claude1_transport.py"
   assert_file_content "old statusline model" "$backup/statusline-model.py"
   assert_file_content "old shell" "$backup/zsh-functions.sh"
