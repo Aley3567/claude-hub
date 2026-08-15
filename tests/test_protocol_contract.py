@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 from pathlib import Path
@@ -93,6 +94,10 @@ class RequestCapabilityContractTests(unittest.TestCase):
             "observable_degradation",
         )
         self.assertEqual(matrix["server_tool"]["openai_responses"], "reject")
+        self.assertEqual(
+            matrix["tool_search"]["openai_responses"],
+            "observable_degradation",
+        )
         self.assertEqual(matrix["client_tool"]["gemini_generate_content"], "reject")
         self.assertEqual(
             matrix["tool_result"]["openai_chat"],
@@ -596,7 +601,6 @@ class RequestCapabilityContractTests(unittest.TestCase):
             "web_search_20250305": "HUB_UNSUPPORTED_SERVER_TOOL",
             "code_execution_20250825": "HUB_UNSUPPORTED_SERVER_TOOL",
             "mcp_toolset": "HUB_UNSUPPORTED_MCP",
-            "tool_search_tool_regex_20251119": "HUB_UNSUPPORTED_TOOL_SEARCH",
             "future_tool_kind": "HUB_UNSUPPORTED_TOOL_TYPE",
         }
         for tool_type, expected_code in cases.items():
@@ -628,6 +632,58 @@ class RequestCapabilityContractTests(unittest.TestCase):
             native_payload,
         )
 
+    def test_deferred_tools_are_eagerly_loaded_and_native_search_control_is_omitted(self) -> None:
+        payload = {
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "name": "deferred_fixture",
+                    "description": "fixture tool",
+                    "input_schema": {"type": "object"},
+                    "defer_loading": True,
+                },
+                {
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search",
+                },
+            ],
+        }
+        expected_warnings = {
+            "HUB_DEGRADE_DEFERRED_TOOL_EAGERLY_LOADED",
+            "HUB_DEGRADE_TOOL_SEARCH_OMITTED",
+        }
+        for api_format in ("openai_chat", "openai_responses"):
+            with self.subTest(api_format=api_format):
+                prepared = protocol.prepare_request(payload, api_format)
+                self.assertTrue(
+                    expected_warnings.issubset(set(prepared.plan.warning_codes))
+                )
+                self.assertEqual(len(prepared.payload["tools"]), 1)
+                self.assertNotIn(
+                    "defer_loading",
+                    json.dumps(prepared.payload["tools"]),
+                )
+                self.assertIn("deferred_fixture", json.dumps(prepared.payload["tools"]))
+                with self.assertRaises(protocol.ProtocolRequestError) as raised:
+                    protocol.prepare_request(
+                        payload,
+                        api_format,
+                        compatibility_mode="strict",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_UNSUPPORTED_TOOL_SEARCH",
+                )
+                self.assertEqual(
+                    raised.exception.path,
+                    "$.tools[0].defer_loading",
+                )
+        self.assertEqual(
+            protocol.prepare_request(payload, "anthropic").payload,
+            payload,
+        )
+
     def test_request_controls_are_mapped_or_visibly_degraded(self) -> None:
         payload = {
             "model": "fixture-model",
@@ -653,7 +709,8 @@ class RequestCapabilityContractTests(unittest.TestCase):
         chat = protocol.prepare_request(payload, "openai_chat")
         responses = protocol.prepare_request(payload, "openai_responses")
 
-        self.assertEqual(chat.payload["metadata"], payload["metadata"])
+        self.assertNotIn("metadata", chat.payload)
+        self.assertIn("HUB_DEGRADE_METADATA_DROPPED", chat.plan.warning_codes)
         self.assertEqual(chat.payload["service_tier"], "auto")
         self.assertEqual(chat.payload["response_format"]["type"], "json_schema")
         self.assertNotIn(
@@ -673,6 +730,19 @@ class RequestCapabilityContractTests(unittest.TestCase):
                     "HUB_DEGRADE_SCHEMA_NORMALIZED",
                 }.issubset(set(prepared.plan.warning_codes))
             )
+
+        with self.assertRaises(protocol.ProtocolRequestError) as raised:
+            protocol.prepare_request(
+                {
+                    "model": "fixture-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "metadata": payload["metadata"],
+                },
+                "openai_chat",
+                compatibility_mode="strict",
+            )
+        self.assertEqual(raised.exception.code, "HUB_UNSUPPORTED_METADATA")
+        self.assertEqual(raised.exception.path, "$.metadata")
 
     def test_tool_strict_parallel_choice_and_thinking_budget_are_explicit(self) -> None:
         payload = {
@@ -747,9 +817,47 @@ class RequestCapabilityContractTests(unittest.TestCase):
             }.issubset(set(responses.plan.warning_codes))
         )
 
-    def test_unknown_and_execution_request_fields_fail_closed_cross_protocol(self) -> None:
+    def test_unknown_top_level_request_fields_degrade_by_default_and_strict_rejects(self) -> None:
         cases = {
-            "future_request_field": "HUB_UNSUPPORTED_REQUEST_FIELD",
+            "future_request_field": (
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_UNSUPPORTED_REQUEST_FIELD",
+            ),
+            "context_management": (
+                "HUB_DEGRADE_CONTEXT_MANAGEMENT_DROPPED",
+                "HUB_UNSUPPORTED_CONTEXT_MANAGEMENT",
+            ),
+        }
+        for field, (warning_code, reject_code) in cases.items():
+            payload = {
+                "model": "fixture-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                field: {"opaque": True},
+            }
+            for api_format in ("openai_chat", "openai_responses"):
+                with self.subTest(field=field, api_format=api_format):
+                    prepared = protocol.prepare_request(payload, api_format)
+                    self.assertIn(warning_code, prepared.plan.warning_codes)
+                    self.assertIn(
+                        f"{warning_code}@$.{field}",
+                        prepared.plan.warning_details,
+                    )
+                    self.assertNotIn(field, prepared.payload)
+                    with self.assertRaises(protocol.ProtocolRequestError) as raised:
+                        protocol.prepare_request(
+                            payload,
+                            api_format,
+                            compatibility_mode="strict",
+                        )
+                    self.assertEqual(raised.exception.code, reject_code)
+                    self.assertEqual(raised.exception.path, f"$.{field}")
+            self.assertEqual(
+                protocol.prepare_request(payload, "anthropic").payload,
+                payload,
+            )
+
+    def test_execution_request_fields_fail_closed_cross_protocol(self) -> None:
+        cases = {
             "container": "HUB_UNSUPPORTED_CONTAINER",
             "inference_geo": "HUB_UNSUPPORTED_INFERENCE_GEO",
             "mcp_servers": "HUB_UNSUPPORTED_MCP",
@@ -761,11 +869,20 @@ class RequestCapabilityContractTests(unittest.TestCase):
                 field: {"opaque": True},
             }
             for api_format in ("openai_chat", "openai_responses"):
-                with self.subTest(field=field, api_format=api_format):
-                    with self.assertRaises(protocol.ProtocolRequestError) as raised:
-                        protocol.prepare_request(payload, api_format)
-                    self.assertEqual(raised.exception.code, expected_code)
-                    self.assertEqual(raised.exception.path, f"$.{field}")
+                for compatibility_mode in ("visible_lossy", "strict"):
+                    with self.subTest(
+                        field=field,
+                        api_format=api_format,
+                        compatibility_mode=compatibility_mode,
+                    ):
+                        with self.assertRaises(protocol.ProtocolRequestError) as raised:
+                            protocol.prepare_request(
+                                payload,
+                                api_format,
+                                compatibility_mode=compatibility_mode,
+                            )
+                        self.assertEqual(raised.exception.code, expected_code)
+                        self.assertEqual(raised.exception.path, f"$.{field}")
             self.assertEqual(
                 protocol.prepare_request(payload, "anthropic").payload,
                 payload,
@@ -819,6 +936,65 @@ class RequestCapabilityContractTests(unittest.TestCase):
                     )
                 self.assertEqual(
                     raised.exception.code, "HUB_UNSUPPORTED_THINKING_SIGNATURE"
+                )
+
+    def test_empty_thinking_signature_placeholder_is_ignored_but_non_string_rejects(self) -> None:
+        payload = {
+            "model": "fixture-model",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "unsigned reasoning",
+                            "signature": "",
+                        }
+                    ],
+                }
+            ],
+        }
+        for api_format in ("openai_chat", "openai_responses"):
+            with self.subTest(api_format=api_format):
+                prepared = protocol.prepare_request(payload, api_format)
+                self.assertIn(
+                    "HUB_DEGRADE_EMPTY_THINKING_SIGNATURE_IGNORED",
+                    prepared.plan.warning_codes,
+                )
+                self.assertIn(
+                    "HUB_DEGRADE_THINKING_TO_REASONING",
+                    prepared.plan.warning_codes,
+                )
+                self.assertNotIn(
+                    "HUB_DEGRADE_THINKING_SIGNATURE_DROPPED",
+                    prepared.plan.warning_codes,
+                )
+                self.assertNotIn('"signature"', json.dumps(prepared.payload))
+                with self.assertRaises(protocol.ProtocolRequestError) as raised:
+                    protocol.prepare_request(
+                        payload,
+                        api_format,
+                        compatibility_mode="strict",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "HUB_UNSUPPORTED_THINKING_SIGNATURE",
+                )
+                self.assertEqual(
+                    raised.exception.path,
+                    "$.messages[0].content[0].signature",
+                )
+
+        malformed = copy.deepcopy(payload)
+        malformed["messages"][0]["content"][0]["signature"] = None
+        for api_format in ("openai_chat", "openai_responses"):
+            with self.subTest(api_format=api_format, signature="non-string"):
+                with self.assertRaises(protocol.ProtocolRequestError) as raised:
+                    protocol.prepare_request(malformed, api_format)
+                self.assertEqual(raised.exception.code, "HUB_INVALID_CONTENT_BLOCK")
+                self.assertEqual(
+                    raised.exception.path,
+                    "$.messages[0].content[0].signature",
                 )
 
     def test_redacted_thinking_roundtrips_only_with_responses_provenance(self) -> None:

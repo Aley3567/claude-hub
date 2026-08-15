@@ -120,6 +120,16 @@ class ConversionPlan:
             )
         )
 
+    @property
+    def warning_details(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                f"{decision.code}@{decision.path}"
+                for decision in self.decisions
+                if decision.disposition is SupportDisposition.DEGRADED
+            )
+        )
+
 
 @dataclass(frozen=True)
 class CapabilityProfile:
@@ -293,14 +303,22 @@ _PROTOCOL_CAPABILITY_MATRIX = {
     ),
     "server_tool": ("exact", "reject", "reject"),
     "mcp": ("exact", "reject", "reject"),
-    "tool_search": ("exact", "reject", "reject"),
+    "tool_search": (
+        "exact",
+        "observable_degradation",
+        "observable_degradation",
+    ),
     "code_execution": ("exact", "reject", "reject"),
     "cache_control": (
         "exact",
         "observable_degradation",
         "observable_degradation",
     ),
-    "metadata": ("exact", "exact", "exact"),
+    "metadata": (
+        "exact",
+        "observable_degradation",
+        "exact",
+    ),
     "service_tier": ("exact", "exact", "exact"),
     "top_k": (
         "exact",
@@ -605,7 +623,18 @@ def _record_thinking_degradation(
     compatibility_mode: str,
     path: str,
 ) -> None:
-    if "signature" in block:
+    signature = block.get("signature")
+    if signature == "":
+        _record_lossy(
+            plan,
+            compatibility_mode=compatibility_mode,
+            code="HUB_DEGRADE_EMPTY_THINKING_SIGNATURE_IGNORED",
+            reject_code="HUB_UNSUPPORTED_THINKING_SIGNATURE",
+            path=f"{path}.signature",
+            feature="anthropic_thinking_signature",
+            message="empty thinking signature is a client placeholder, not a verifiable signature",
+        )
+    elif "signature" in block:
         _record_lossy(
             plan,
             compatibility_mode=compatibility_mode,
@@ -1225,7 +1254,18 @@ def _apply_cross_request_controls(
                 code="HUB_UNSUPPORTED_REQUEST_FIELD",
                 path="$.metadata",
             )
-        result["metadata"] = copy.deepcopy(metadata)
+        if api_format == "openai_responses":
+            result["metadata"] = copy.deepcopy(metadata)
+        else:
+            _record_lossy(
+                plan,
+                compatibility_mode=compatibility_mode,
+                code="HUB_DEGRADE_METADATA_DROPPED",
+                reject_code="HUB_UNSUPPORTED_METADATA",
+                path="$.metadata",
+                feature="metadata",
+                message="request metadata is not portable across Chat-compatible providers",
+            )
     if "service_tier" in payload:
         service_tier = payload["service_tier"]
         if not isinstance(service_tier, str) or not service_tier:
@@ -1758,6 +1798,15 @@ _REJECTED_REQUEST_FIELDS = {
     "mcp_servers": ("HUB_UNSUPPORTED_MCP", "MCP requires a native MCP adapter"),
 }
 
+_DROPPED_REQUEST_FIELDS = {
+    "context_management": (
+        "HUB_DEGRADE_CONTEXT_MANAGEMENT_DROPPED",
+        "HUB_UNSUPPORTED_CONTEXT_MANAGEMENT",
+        "context_management",
+        "context_management has no equivalent target-protocol mapping",
+    ),
+}
+
 _CLIENT_BLOCK_TYPES = {
     "document",
     "image",
@@ -1989,11 +2038,9 @@ def _validate_content_block_details(block: dict, *, path: str) -> None:
                 code="HUB_INVALID_CONTENT_BLOCK",
                 path=f"{path}.thinking",
             )
-        if "signature" in block and (
-            not isinstance(block["signature"], str) or not block["signature"]
-        ):
+        if "signature" in block and not isinstance(block["signature"], str):
             raise ProtocolRequestError(
-                "thinking signatures must be non-empty strings",
+                "thinking signatures must be strings",
                 code="HUB_INVALID_CONTENT_BLOCK",
                 path=f"{path}.signature",
             )
@@ -2155,11 +2202,27 @@ def _parse_request_ir(
         if key in _REJECTED_REQUEST_FIELDS:
             code, message = _REJECTED_REQUEST_FIELDS[key]
             raise ProtocolRequestError(message, code=code, path=f"$.{key}")
-        if key not in _CROSS_REQUEST_FIELDS:
-            raise ProtocolRequestError(
-                f"request field {key!r} is not supported by this adapter",
-                code="HUB_UNSUPPORTED_REQUEST_FIELD",
+        if key in _DROPPED_REQUEST_FIELDS:
+            warning_code, reject_code, feature, message = _DROPPED_REQUEST_FIELDS[key]
+            _record_lossy(
+                plan,
+                compatibility_mode=compatibility_mode,
+                code=warning_code,
+                reject_code=reject_code,
                 path=f"$.{key}",
+                feature=feature,
+                message=message,
+            )
+            continue
+        if key not in _CROSS_REQUEST_FIELDS:
+            _record_lossy(
+                plan,
+                compatibility_mode=compatibility_mode,
+                code="HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                reject_code="HUB_UNSUPPORTED_REQUEST_FIELD",
+                path=f"$.{key}",
+                feature="unknown_request_extension",
+                message=f"request field {key!r} is not supported by this adapter",
             )
     model = payload.get("model")
     if not isinstance(model, str) or not model:
@@ -2427,11 +2490,22 @@ def _parse_request_ir(
                     code="HUB_UNSUPPORTED_TOOL_FIELD",
                     path=f"{tool_path}.strict",
                 )
-            if "defer_loading" in tool and tool.get("defer_loading") is not False:
+            defer_loading = tool.get("defer_loading", False)
+            if not isinstance(defer_loading, bool):
                 raise ProtocolRequestError(
-                    "deferred tools require native tool-search support",
-                    code="HUB_UNSUPPORTED_TOOL_SEARCH",
-                    path=tool_path,
+                    "client tool defer_loading must be a boolean",
+                    code="HUB_UNSUPPORTED_TOOL_FIELD",
+                    path=f"{tool_path}.defer_loading",
+                )
+            if defer_loading:
+                _record_lossy(
+                    plan,
+                    compatibility_mode=compatibility_mode,
+                    code="HUB_DEGRADE_DEFERRED_TOOL_EAGERLY_LOADED",
+                    reject_code="HUB_UNSUPPORTED_TOOL_SEARCH",
+                    path=f"{tool_path}.defer_loading",
+                    feature="tool_search",
+                    message="deferred client tool must be eagerly loaded by this adapter",
                 )
             if "allowed_callers" in tool:
                 raise ProtocolRequestError(
@@ -2450,7 +2524,9 @@ def _parse_request_ir(
                         feature="tool_metadata",
                         message="tool metadata has no exact target-protocol mapping",
                     )
-            canonical_tools.append(copy.deepcopy(tool))
+            canonical_tool = copy.deepcopy(tool)
+            canonical_tool.pop("defer_loading", None)
+            canonical_tools.append(canonical_tool)
             continue
         if tool_type == "BatchTool":
             _record_lossy(
@@ -2468,7 +2544,16 @@ def _parse_request_ir(
         elif "mcp" in tool_type:
             code = "HUB_UNSUPPORTED_MCP"
         elif tool_type.startswith("tool_search"):
-            code = "HUB_UNSUPPORTED_TOOL_SEARCH"
+            _record_lossy(
+                plan,
+                compatibility_mode=compatibility_mode,
+                code="HUB_DEGRADE_TOOL_SEARCH_OMITTED",
+                reject_code="HUB_UNSUPPORTED_TOOL_SEARCH",
+                path=tool_path,
+                feature="tool_search",
+                message="native tool-search control is unnecessary after eager tool loading",
+            )
+            continue
         elif tool_type.startswith(
             (
                 "bash_code_execution",
