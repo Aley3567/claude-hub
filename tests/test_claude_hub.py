@@ -1021,6 +1021,47 @@ class ClaudeHubTests(unittest.TestCase):
         for channel in cfg["channels"].values():
             self.assertIs(channel["route_unknown_to_default"], False)
 
+    def test_route_unknown_to_default_remaps_official_claude_id_to_provider_tier(self):
+        self._write_config(
+            default_channel="direct",
+            channels={
+                "direct": {
+                    "provider": "Fixture HTTPS",
+                    "models": ["GLM-5.2", "Deepseek-v4-flash"],
+                    "route_unknown_to_default": True,
+                }
+            },
+        )
+        hub.reset_caches()
+        cfg = hub.get_config()
+        providers = {
+            "Fixture HTTPS": {
+                "model_map": {
+                    "fable": "Deepseek-v4-flash",
+                    "opus": "GLM-5.2",
+                    "sonnet": "GLM-5.2",
+                    "haiku": "Deepseek-v4-flash",
+                },
+            }
+        }
+
+        # An official Claude ID is remapped to the provider's tier model
+        # instead of being forwarded unchanged (which a name/case-sensitive
+        # upstream rejects with 400 "invalid model").
+        self.assertEqual(
+            hub.route("claude-fable-5", cfg, providers),
+            ("direct", "Deepseek-v4-flash"),
+        )
+        self.assertEqual(
+            hub.route("claude-opus-5", cfg, providers),
+            ("direct", "GLM-5.2"),
+        )
+        # A non-official unlisted model still passes through unchanged.
+        self.assertEqual(
+            hub.route("some-future-model", cfg, providers),
+            ("direct", "some-future-model"),
+        )
+
     def test_local_auth_accepts_bearer_raw_and_api_key(self):
         cfg = hub.get_config()
         accepted = [

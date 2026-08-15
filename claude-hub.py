@@ -1185,11 +1185,35 @@ def route(
         model,
         re.IGNORECASE,
     )
-    if official_slot and isinstance(model_slots, dict):
-        selector = model_slots.get(official_slot.group(1).casefold())
-        if isinstance(selector, str):
-            slot_alias, _, slot_model = selector.partition(",")
-            return slot_alias, slot_model
+    if official_slot:
+        slot_name = official_slot.group(1).casefold()
+        if isinstance(model_slots, dict):
+            selector = model_slots.get(slot_name)
+            if isinstance(selector, str):
+                slot_alias, _, slot_model = selector.partition(",")
+                return slot_alias, slot_model
+        # Isolated v1 protocol bridges carry no model_slots, so an official
+        # Claude model ID would otherwise fall through to
+        # route_unknown_to_default and be forwarded unchanged to a
+        # name/case-sensitive upstream that 400s on "invalid model".  Remap it
+        # to the matched provider tier model, mirroring the bare-slot path.
+        # Scoped to route_unknown_to_default bridges so a configured Hub without
+        # model_slots keeps raising "unknown model" instead of guessing.
+        if providers is None:
+            providers = get_providers()
+        fallback_alias = cfg["default_channel"]
+        fallback_channel = channels.get(fallback_alias)
+        if (
+            fallback_channel is not None
+            and fallback_channel.get("route_unknown_to_default")
+        ):
+            fallback_provider = _match_channel_provider(
+                fallback_channel, providers
+            )
+            if fallback_provider:
+                mapped = fallback_provider["model_map"].get(slot_name)
+                if mapped:
+                    return fallback_alias, mapped
 
     alias = cfg["default_channel"]
     channel = channels.get(alias)
