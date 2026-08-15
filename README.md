@@ -38,8 +38,8 @@ source ~/.zshrc
 
 安装器会把 Python 脚本和安全的 zsh 集成复制到 `~/.claude`，并在
 `~/.zshrc` 添加一条带有 `# claude1 managed source` 标记的 source 行。
-安装器实际复制启动器、Hub、命名 Hub 目录模块、共享协议桥、账号池调度和
-statusline 模型解析器六份 Python 文件。已有目标文件和
+安装器实际复制启动器、Hub、命名 Hub 目录模块、共享协议模块、账号池调度和
+statusline 模型解析器。已有目标文件和
 `~/.zshrc` 会在改写前备份；重复运行不会重复添加 source
 行。安装器只检查 CC Switch 数据库是否存在且可读，不读取或复制其中的配置
 与凭证。
@@ -380,6 +380,9 @@ EOF
 │   ├── claude_hub_catalog.py
 │   ├── claude1_account_pool.py
 │   ├── claude1_protocol.py
+│   ├── claude1_protocol_types.py
+│   ├── claude1_protocol_usage.py
+│   ├── claude1_transport.py
 │   └── statusline-model.py
 ├── claude1/
 │   └── zsh-functions.sh
@@ -405,7 +408,10 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `claude-hub.py` | 可选的本地 Anthropic gateway |
 | `claude_hub_catalog.py` | 命名 Hub 目录、路径与迁移规则 |
 | `claude1_account_pool.py` | 多账号选择、冷却、停用状态与非敏感配置写入 |
-| `claude1_protocol.py` | Anthropic / OpenAI Chat / OpenAI Responses 协议转换 |
+| `claude1_protocol.py` | 协议兼容入口，以及 request / response / stream 编排 |
+| `claude1_protocol_types.py` | 协议错误、转换计划和共享 IR 类型 |
+| `claude1_protocol_usage.py` | usage counter、cache usage 和回执归一化 |
+| `claude1_transport.py` | 上游 transport policy、代理选择与请求边界 |
 | `statusline-model.py` | 自定义 statusline 可复用的实际上游模型解析 |
 | `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
 | `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |

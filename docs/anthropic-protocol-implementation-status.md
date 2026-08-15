@@ -40,6 +40,13 @@
 - 上游 HTTP 错误只向日志和客户端保留经截断、脱敏的 `code/message`；不持久化完整请求 payload 或原始错误 body。
 - 本轮不加入自动探测、自学习路由或 provider 特判。provider capability override、多轮客户端 fixture 和运行中模块版本标识继续作为独立后续项。
 
+## 协议 module 布局（2026-08-15）
+
+- `claude1_protocol.py` 保持现有兼容入口，负责 request / response / stream 的编排并继续导出原有名称，调用方无需改 import。
+- `claude1_protocol_types.py` 集中协议错误、`ConversionPlan`、capability、共享 IR 与 request prepared 类型，不包含 provider 路由或 wire-shape 转换。
+- `claude1_protocol_usage.py` 集中 complete response 与 stream 共用的 usage counter、cache carrier、一致性校验和 `UsageReceipt`。
+- 当前只沿已有稳定 seam 拆分；不引入动态加载、注册框架或按 helper 拆出的浅 module。后续 request / response / stream 拆分应各自独立验证和提交。
+
 ## 适配器支持矩阵
 
 下表是 `protocol_capability_matrix()` 的能力摘要，不单独充当每个 wire field 的完整合同；紧随其后的请求、非流响应和 SSE 三张 disposition registry 才是方向明确的实施边界。`observable degradation` 指默认 `visible_lossy` 模式会记录稳定 warning code；请求阶段 Hub 会将可在响应前得知的 warning 写入 `x-hub-protocol-warnings`，流运行时新增的 warning 写入日志。`strict` 模式会将可降级项转为明确错误，而不是静默继续。
