@@ -4191,18 +4191,72 @@ def transform_response(body: dict, api_format: str) -> dict:
     return prepare_response(body, api_format).payload
 
 
-def transform_error(body: object, status: int) -> dict:
+def upstream_error_evidence(body: object) -> tuple[str | None, str | None]:
+    """Extract sanitized (code, message) evidence from an upstream error body.
+
+    The same rules serve both the downstream Anthropic error shell and the
+    hub's logging/response headers, so no caller re-parses raw upstream
+    bodies. Some OpenAI-compatible gateways JSON-encode their JSON error
+    object a second time; decode that wrapper once so a structured error does
+    not collapse to an opaque status-only fallback. Numeric codes (common for
+    OpenAI-compatible providers) are accepted alongside strings; anything that
+    is not a short identifier becomes None rather than being forwarded.
+    """
+    if isinstance(body, str):
+        try:
+            decoded_body = json.loads(body)
+        except json.JSONDecodeError:
+            decoded_body = None
+        if isinstance(decoded_body, dict):
+            body = decoded_body
     error = body.get("error") if isinstance(body, dict) else None
     source_code = error.get("code") if isinstance(error, dict) else None
+    source_message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(source_message, str):
+        try:
+            nested_body = json.loads(source_message)
+        except json.JSONDecodeError:
+            nested_body = None
+        nested_error = (
+            nested_body.get("error") if isinstance(nested_body, dict) else None
+        )
+        if isinstance(nested_error, dict):
+            nested_code = nested_error.get("code")
+            nested_message = nested_error.get("message")
+            if nested_code not in (None, ""):
+                source_code = nested_code
+            if isinstance(nested_message, str) and nested_message.strip():
+                source_message = nested_message
+    if isinstance(source_code, bool) or not isinstance(source_code, (str, int)):
+        source_code = None
     safe_code = (
-        source_code
-        if isinstance(source_code, str)
-        and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", source_code)
+        str(source_code)
+        if source_code is not None
+        and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(source_code))
         else None
     )
+    safe_message = None
+    if isinstance(source_message, str) and source_message.strip():
+        candidate = source_message.strip()[:512]
+        candidate = re.sub(
+            r"(?i)\bBearer\s+\S+",
+            "Bearer [redacted-token]",
+            candidate,
+        )
+        candidate = re.sub(r"(?i)https?://\S+", "[redacted-url]", candidate)
+        candidate = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()
+        if candidate:
+            safe_message = candidate
+    return safe_code, safe_message
+
+
+def transform_error(body: object, status: int) -> dict:
+    safe_code, safe_message = upstream_error_evidence(body)
     message = f"upstream HTTP {status}"
     if safe_code:
         message += f" ({safe_code})"
+    if safe_message:
+        message += f": {safe_message}"
     if status in {401, 403}:
         kind = "authentication_error" if status == 401 else "permission_error"
     elif status == 429:

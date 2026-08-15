@@ -32,6 +32,14 @@
 | `content_filter`、thinking signature、citation、cache 用量曾有伪造或静默丢失风险。 | refusal/content filter 统一为 `stop_reason: "refusal"`；signature 仅在上游真实提供时发出；citation 不能无损映射时只记录降级；usage 只复制实际的上游计数。 | 跨协议的 citation/cache-control/server-tool 语义仍不等价，按下表降级或拒绝。 |
 | `/count_tokens` 估算没有 provenance。 | Hub 对估算返回 `source=estimate`、`method=json_utf8_bytes_div_4`、`exact=0`、`error-bound=unbounded`；原生 count endpoint 成功时标记 `source=upstream`、`method=anthropic_count_tokens`、`exact=1`。 | 估算不是模型 tokenizer 的精确结果。 |
 
+## 兼容策略决策记录（2026-08-15）
+
+- 入站客户端扩展先规范化为 IR，再由 `ConversionPlan` 决定目标协议的 exact / observable degradation / reject；provider 名称不进入协议逻辑。
+- 未知顶层请求扩展只在默认 `visible_lossy` 模式下丢弃并记录 `code@JSON-path`，`strict` 模式拒绝；内容块、工具字段和执行类能力仍 fail closed。
+- usage 是统计回执：未知 counter 不参与推导，丢弃并告警；已登记 counter 的非法值或冲突继续拒绝。
+- 上游 HTTP 错误只向日志和客户端保留经截断、脱敏的 `code/message`；不持久化完整请求 payload 或原始错误 body。
+- 本轮不加入自动探测、自学习路由或 provider 特判。provider capability override、多轮客户端 fixture 和运行中模块版本标识继续作为独立后续项。
+
 ## 适配器支持矩阵
 
 下表是 `protocol_capability_matrix()` 的能力摘要，不单独充当每个 wire field 的完整合同；紧随其后的请求、非流响应和 SSE 三张 disposition registry 才是方向明确的实施边界。`observable degradation` 指默认 `visible_lossy` 模式会记录稳定 warning code；请求阶段 Hub 会将可在响应前得知的 warning 写入 `x-hub-protocol-warnings`，流运行时新增的 warning 写入日志。`strict` 模式会将可降级项转为明确错误，而不是静默继续。
@@ -63,7 +71,8 @@
 | tool search / deferred loading | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | code execution / computer/web server execution | `exact` | `reject` | `reject` | `reject` |
 | request / content `cache_control` | `exact` | `observable degradation` | `observable degradation` | `reject` |
-| `metadata` / `service_tier` | `exact` | `exact` | `exact` | `reject` |
+| `metadata` | `exact` | `observable degradation` | `exact` | `reject` |
+| `service_tier` | `exact` | `exact` | `exact` | `reject` |
 | `top_k` | `exact` | `observable degradation` | `observable degradation` | `reject` |
 | `stop_sequences` | `exact` | `exact` | `observable degradation` | `reject` |
 | JSON Schema `format: uri` normalization | `exact` | `observable degradation` | `observable degradation` | `reject` |
@@ -140,7 +149,7 @@
 | citation/annotation event | `observable degradation` | 必须关联正确 item/output/content、开放的 output_text part、合法 metadata carrier/index；strict 拒绝。 |
 | sequence/logprobs/obfuscation、known wrapper metadata | `observable degradation` | 稳定 metadata warning；unknown wrapper/event 字段拒绝。 |
 | upstream error detail | sanitized error + `observable degradation` | detail shape 校验，不回传 vendor secret；成功 terminal 携带 error 拒绝。 |
-| usage stream snapshots | 与非流 registry 相同；未观测字段省略不伪造 | counter regression、unknown/malformed/conflict 拒绝；结束时缺 base 标记 provenance unavailable；terminal 才到达的 input usage 由 message_delta 如实携带并记录 `HUB_DEGRADE_LATE_INPUT_USAGE`。 |
+| usage stream snapshots | 与非流 registry 相同；未观测字段省略不伪造 | 未知统计字段降级丢弃；已登记 counter 的 regression/malformed/conflict 拒绝；结束时缺 base 标记 provenance unavailable；terminal 才到达的 input usage 由 message_delta 如实携带并记录 `HUB_DEGRADE_LATE_INPUT_USAGE`。 |
 
 ### 请求与内容块的具体语义
 
