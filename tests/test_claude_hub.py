@@ -2718,6 +2718,96 @@ class ClaudeHubTests(unittest.TestCase):
         finally:
             writer.close()
 
+    def test_provider_snapshot_refresh_logs_sanitized_metrics(self):
+        hub.open_log()
+        hub.get_providers()
+
+        log_text = self.log_file.read_text(encoding="utf-8")
+        snapshot_lines = [
+            line for line in log_text.splitlines() if "provider_snapshot" in line
+        ]
+        self.assertEqual(len(snapshot_lines), 1, log_text)
+        line = snapshot_lines[0]
+
+        fields = {}
+        for token in line.split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+
+        for key in (
+            "refresh_ms",
+            "hits",
+            "misses",
+            "refreshes",
+            "p50_ms",
+            "p95_ms",
+        ):
+            self.assertIn(key, fields, f"missing {key} in: {line}")
+            self.assertTrue(
+                fields[key].lstrip("-").isdigit(),
+                f"{key} is not an integer: {fields[key]}",
+            )
+            self.assertGreaterEqual(
+                int(fields[key]), 0, f"{key} is negative: {fields[key]}"
+            )
+
+        # Sanitization: the line carries exactly the six expected numeric
+        # fields — no room for paths, provider names, tokens, or raw
+        # fingerprint components.
+        self.assertEqual(
+            set(fields),
+            {"refresh_ms", "hits", "misses", "refreshes", "p50_ms", "p95_ms"},
+            line,
+        )
+        self.assertNotIn(str(self.db_file), line)
+        self.assertNotIn("Fixture HTTPS", line)
+        self.assertNotIn("Fixture HTTP", line)
+        self.assertNotIn("Fixture Loopback", line)
+        self.assertNotIn("fixture-upstream-token", line)
+        self.assertNotIn("fixture-local-token", line)
+
+    def test_provider_snapshot_cache_hit_does_not_log(self):
+        hub.open_log()
+        hub.get_providers()
+
+        before = self.log_file.read_text(encoding="utf-8")
+        snapshot_lines_before = [
+            line for line in before.splitlines() if "provider_snapshot" in line
+        ]
+        self.assertEqual(len(snapshot_lines_before), 1)
+
+        hub.get_providers()
+
+        after = self.log_file.read_text(encoding="utf-8")
+        snapshot_lines_after = [
+            line for line in after.splitlines() if "provider_snapshot" in line
+        ]
+        self.assertEqual(len(snapshot_lines_after), 1)
+        self.assertEqual(snapshot_lines_after[0], snapshot_lines_before[0])
+
+    def test_provider_snapshot_reset_caches_clears_metrics(self):
+        hub.open_log()
+        hub.get_providers()
+        hub.get_providers()  # cache hit
+        self.assertEqual(hub._snapshot_refreshes, 1)
+        self.assertEqual(hub._snapshot_hits, 1)
+        self.assertEqual(len(hub._snapshot_refresh_samples), 1)
+
+        hub.reset_caches()
+
+        self.assertEqual(hub._snapshot_hits, 0)
+        self.assertEqual(hub._snapshot_misses, 0)
+        self.assertEqual(hub._snapshot_refreshes, 0)
+        self.assertEqual(len(hub._snapshot_refresh_samples), 0)
+
+    def test_snapshot_percentile_boundaries(self):
+        self.assertEqual(hub._snapshot_percentile([], 50), 0)
+        self.assertEqual(hub._snapshot_percentile([5], 95), 5)
+        self.assertEqual(hub._snapshot_percentile([1, 2], 50), 1)
+        self.assertEqual(hub._snapshot_percentile([1, 2, 3, 4], 50), 2)
+        self.assertEqual(hub._snapshot_percentile([1, 2, 3, 4], 95), 4)
+
     def test_database_symlink_checks_real_sidecar_permissions(self):
         writer = sqlite3.connect(self.db_file)
         try:

@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import zlib
+from collections import deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -978,6 +979,46 @@ def _database_snapshot_state(path: Path) -> tuple:
 _snapshot_entry: tuple | None = None
 _snapshot_lock = threading.Lock()
 
+# Provider-snapshot cache metrics (design doc §7, D5).  Updated under
+# ``_snapshot_metrics_lock`` so the fast hit path stays thread-safe without
+# touching the cache lock.
+_snapshot_metrics_lock = threading.Lock()
+_snapshot_hits = 0
+_snapshot_misses = 0
+_snapshot_refreshes = 0
+_snapshot_refresh_samples: deque[int] = deque(maxlen=64)
+
+
+def _snapshot_percentile(samples: deque[int], pct: float) -> int:
+    """Return the nearest-rank ``pct`` percentile of ``samples`` (0 if empty)."""
+    if not samples:
+        return 0
+    s = sorted(samples)
+    idx = max(0, math.ceil(pct / 100 * len(s)) - 1)
+    return s[idx]
+
+
+def _snapshot_metrics_hit() -> None:
+    global _snapshot_hits
+    with _snapshot_metrics_lock:
+        _snapshot_hits += 1
+
+
+def _snapshot_metrics_refresh(elapsed_ms: int) -> dict:
+    """Record a successful refresh and return the current sanitized snapshot."""
+    global _snapshot_misses, _snapshot_refreshes
+    with _snapshot_metrics_lock:
+        _snapshot_misses += 1
+        _snapshot_refreshes += 1
+        _snapshot_refresh_samples.append(elapsed_ms)
+        return {
+            "hits": _snapshot_hits,
+            "misses": _snapshot_misses,
+            "refreshes": _snapshot_refreshes,
+            "p50_ms": _snapshot_percentile(_snapshot_refresh_samples, 50),
+            "p95_ms": _snapshot_percentile(_snapshot_refresh_samples, 95),
+        }
+
 
 def _read_provider_snapshot(path: Path) -> tuple:
     """Read a stable private main+WAL copy without opening the source SQLite DB.
@@ -1023,13 +1064,17 @@ def get_providers() -> dict:
     revision = _database_snapshot_state(path)
     entry = _snapshot_entry
     if entry is not None and entry[0] == revision:
+        _snapshot_metrics_hit()
         return entry[1]
     with _snapshot_lock:
         entry = _snapshot_entry
         if entry is not None and entry[0] == revision:
+            _snapshot_metrics_hit()
             return entry[1]
         try:
+            started = time.monotonic()
             providers, verified = _read_provider_snapshot(path)
+            elapsed_ms = int(round((time.monotonic() - started) * 1000))
             # Recheck because a writer can create WAL sidecars while the
             # read is open.
             _require_private_database(path)
@@ -1038,6 +1083,16 @@ def get_providers() -> dict:
                 "provider database could not be read"
             ) from exc
         _snapshot_entry = (verified, providers)
+        metrics = _snapshot_metrics_refresh(elapsed_ms)
+        log(
+            f"provider_snapshot "
+            f"refresh_ms={elapsed_ms} "
+            f"hits={metrics['hits']} "
+            f"misses={metrics['misses']} "
+            f"refreshes={metrics['refreshes']} "
+            f"p50_ms={metrics['p50_ms']} "
+            f"p95_ms={metrics['p95_ms']}"
+        )
         return providers
 
 
@@ -1046,10 +1101,15 @@ def reset_caches() -> None:
 
     Primarily useful for isolated diagnostics and tests.
     """
-    global _snapshot_entry
+    global _snapshot_entry, _snapshot_hits, _snapshot_misses, _snapshot_refreshes
     _cfg_cache.update({"path": None, "mtime_ns": None, "size": None, "raw": None})
     with _snapshot_lock:
         _snapshot_entry = None
+    with _snapshot_metrics_lock:
+        _snapshot_hits = 0
+        _snapshot_misses = 0
+        _snapshot_refreshes = 0
+        _snapshot_refresh_samples.clear()
 
 
 # ---------------------------------------------------------------- routing
