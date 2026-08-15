@@ -2933,6 +2933,81 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertNotIn("fixture-secret-token", serialized)
         self.assertNotIn("private-upstream", serialized)
 
+    def test_numeric_upstream_error_code_is_preserved(self) -> None:
+        # OpenAI-compatible providers 常用 JSON 数字 code 表示参数错误
+        # 或限流。数字与字符串走同一条证据通道，
+        # 不因类型差异折叠回 "upstream HTTP N"。
+        transformed = protocol.transform_error(
+            {"error": {"code": 1210, "message": "API 调用参数有误"}},
+            400,
+        )
+        self.assertEqual(
+            transformed["error"]["message"],
+            "upstream HTTP 400 (1210): API 调用参数有误",
+        )
+        code, message = protocol.upstream_error_evidence(
+            {"error": {"code": 1302, "message": "账户达到速率限制"}}
+        )
+        self.assertEqual(code, "1302")
+        self.assertEqual(message, "账户达到速率限制")
+
+    def test_upstream_error_message_survives_without_code(self) -> None:
+        # 无 code 的上游错误同样保留脱敏后的 message：证据通道不依赖
+        # code 存在，只依赖脱敏规则。
+        transformed = protocol.transform_error(
+            {"error": {"message": "usage window exhausted; retry in 5h"}},
+            429,
+        )
+        self.assertEqual(
+            transformed["error"]["message"],
+            "upstream HTTP 429: usage window exhausted; retry in 5h",
+        )
+
+    def test_double_encoded_upstream_error_preserves_safe_code_and_message(self) -> None:
+        transformed = protocol.transform_error(
+            {
+                "error": {
+                    "code": "",
+                    "message": json.dumps(
+                        {
+                            "error": {
+                                "code": "1308",
+                                "message": "usage window exhausted; retry after 19:16:38",
+                            }
+                        }
+                    ),
+                }
+            },
+            429,
+        )
+
+        self.assertEqual(transformed["error"]["type"], "rate_limit_error")
+        self.assertEqual(
+            transformed["error"]["message"],
+            "upstream HTTP 429 (1308): usage window exhausted; retry after 19:16:38",
+        )
+
+    def test_safe_upstream_error_message_is_redacted_before_forwarding(self) -> None:
+        transformed = protocol.transform_error(
+            {
+                "error": {
+                    "code": "rate_limit",
+                    "message": (
+                        "Bearer fixture-secret-token at "
+                        "https://private-upstream.invalid/account"
+                    ),
+                }
+            },
+            429,
+        )
+
+        message = transformed["error"]["message"]
+        self.assertIn("rate_limit", message)
+        self.assertIn("[redacted-token]", message)
+        self.assertIn("[redacted-url]", message)
+        self.assertNotIn("fixture-secret-token", message)
+        self.assertNotIn("private-upstream", message)
+
 
 if __name__ == "__main__":
     unittest.main()

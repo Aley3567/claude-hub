@@ -53,6 +53,7 @@ from claude1_protocol import (
     transform_error,
     transform_request,
     transform_response,
+    upstream_error_evidence,
 )
 from claude1_account_pool import (
     AccountCandidate,
@@ -2460,10 +2461,21 @@ async def _handle_transformed_messages(
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     decoded = raw.decode("utf-8", "replace")
                 if upstream.status >= 400:
+                    # One shared evidence extraction feeds the downstream
+                    # shell, the log line and the response header, so every
+                    # surface shows the same sanitized upstream reason.
+                    evidence_code, evidence_message = upstream_error_evidence(
+                        decoded
+                    )
                     body = transform_error(decoded, upstream.status)
+                    detail = ""
+                    if evidence_code:
+                        detail = f" ({evidence_code})"
+                    if evidence_message:
+                        detail += f": {evidence_message}"
                     log(
                         f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                        f"{api_format} upstream {upstream.status}"
+                        f"{api_format} upstream {upstream.status}{detail}"
                     )
                     error_headers = {
                         "x-hub-channel": alias,
@@ -2472,6 +2484,8 @@ async def _handle_transformed_messages(
                         "x-hub-account": account_attempt.lease.member,
                         **route_headers,
                     }
+                    if evidence_code:
+                        error_headers["x-hub-upstream-code"] = evidence_code
                     if request_warning_codes:
                         error_headers["x-hub-protocol-warnings"] = ",".join(
                             request_warning_codes

@@ -3390,8 +3390,13 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(response.headers["x-hub-channel"], "fast")
         self.assertEqual(response.headers["x-hub-model"], "custom-model")
+        self.assertEqual(response.headers["x-hub-upstream-code"], "rate_limit")
         body = json.loads(response.text)
         self.assertEqual(body["error"]["type"], "rate_limit_error")
+        self.assertEqual(
+            body["error"]["message"],
+            "upstream HTTP 429 (rate_limit): slow down",
+        )
 
     def test_full_url_provider_rejects_request_query_strings(self):
         endpoint = "http://127.0.0.1:19090/v1/messages"
