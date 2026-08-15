@@ -1760,6 +1760,38 @@ class LauncherSafetyTests(unittest.TestCase):
         self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"], "")
         self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"], "")
 
+    def test_claude_child_env_repairs_only_unrecognized_models(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                repaired = launcher.claude_child_env(
+                    {"env": {"ANTHROPIC_MODEL": "fixture-model"}}
+                )
+                recognized = launcher.claude_child_env(
+                    {"env": {"ANTHROPIC_MODEL": "claude-sonnet-4-5[1m]"}}
+                )
+                explicit = launcher.claude_child_env(
+                    {
+                        "env": {
+                            "ANTHROPIC_MODEL": "fixture-model",
+                            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "300000",
+                        }
+                    }
+                )
+
+        self.assertEqual(
+            repaired["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"],
+            "1",
+        )
+        self.assertNotIn(
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+            recognized,
+        )
+        self.assertEqual(explicit["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "300000")
+        self.assertNotIn(
+            "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT",
+            explicit,
+        )
+
     def test_build_settings_seals_provider_without_any_slots(self) -> None:
         provider = {
             "id": "p2",
@@ -2570,7 +2602,8 @@ class LauncherSafetyTests(unittest.TestCase):
                 process = mock.Mock()
                 process.poll.return_value = None
                 process.wait.return_value = 0
-                with mock.patch.object(
+                output = io.StringIO()
+                with redirect_stdout(output), mock.patch.object(
                     launcher, "_atomic_private_write", side_effect=capture
                 ), mock.patch.object(
                     launcher.subprocess, "Popen", return_value=process
@@ -2597,6 +2630,7 @@ class LauncherSafetyTests(unittest.TestCase):
                     spawn.kwargs["env"]["CLAUDE_HUB_LISTEN_FD"],
                     str(inherited_fd),
                 )
+                self.assertEqual(output.getvalue().count("协议适配:"), 1)
 
     def _bridge_fixture(self, raw_home: str):
         env = isolated_env(Path(raw_home))
