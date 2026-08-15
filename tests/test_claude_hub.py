@@ -400,12 +400,14 @@ class ClaudeHubTests(unittest.TestCase):
             },
             "openai_chat",
         )
-        observed, source = hub._usage_for_recording(
-            prepared.payload.get("usage"),
-            prepared.plan,
+        # 下游 payload 仍按 schema 发 0 占位;记账视图直接来自 receipt,
+        # 看不到这些占位,也不再需要靠 plan 反查剥零。
+        self.assertEqual(
+            prepared.payload["usage"],
+            {"input_tokens": 0, "output_tokens": 0},
         )
-        self.assertEqual(observed, {})
-        self.assertEqual(source, "unavailable")
+        self.assertEqual(prepared.usage_for_accounting(), {})
+        self.assertEqual(prepared.receipt.source, "unavailable")
 
         partial = hub.prepare_response(
             {
@@ -415,12 +417,9 @@ class ClaudeHubTests(unittest.TestCase):
             },
             "openai_responses",
         )
-        observed, source = hub._usage_for_recording(
-            partial.payload.get("usage"),
-            partial.plan,
-        )
-        self.assertEqual(observed, {"input_tokens": 9})
-        self.assertEqual(source, "upstream")
+        self.assertEqual(partial.payload["usage"]["output_tokens"], 0)
+        self.assertEqual(partial.usage_for_accounting(), {"input_tokens": 9})
+        self.assertEqual(partial.receipt.source, "upstream")
 
     @unittest.skipUnless(os.name == "posix", "POSIX file safety")
     def test_log_open_tightens_existing_file_and_rejects_special_paths(self):
@@ -1645,6 +1644,149 @@ class ClaudeHubTests(unittest.TestCase):
         recorded_usage = record.call_args.args[3]
         self.assertEqual(recorded_usage.get("input_tokens"), 60)
         self.assertEqual(recorded_usage.get("cache_read_input_tokens"), 40)
+
+    def test_complete_accounting_records_the_downstream_receipt_view(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        # 与流式出口同一规则:nested carrier 证明 prompt_tokens 含 cached,
+        # 下游 payload 与账本都必须拿到扣减后的 60,不能再各算各的。
+        transformed = {
+            "id": "chatcmpl_fixture",
+            "model": "fixture-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fixture"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            },
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(transformed).encode("utf-8")],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(hub, "record_usage") as record:
+            response = asyncio.run(hub.handle_messages(request))
+
+        body = json.loads(response.text)
+        self.assertEqual(body["usage"]["input_tokens"], 60)
+        self.assertEqual(body["usage"]["cache_read_input_tokens"], 40)
+        recorded_usage = record.call_args.args[3]
+        self.assertEqual(recorded_usage.get("input_tokens"), 60)
+        self.assertEqual(recorded_usage.get("cache_read_input_tokens"), 40)
+        self.assertEqual(record.call_args.kwargs["source"], "upstream")
+
+    def test_complete_accounting_without_usage_records_unavailable(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        transformed = {
+            "id": "chatcmpl_fixture",
+            "model": "fixture-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fixture"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(transformed).encode("utf-8")],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(hub, "record_usage") as record:
+            response = asyncio.run(hub.handle_messages(request))
+
+        # 下游 payload 仍携带 schema 要求的 0 占位,账本一个计数器都不落。
+        body = json.loads(response.text)
+        self.assertEqual(
+            body["usage"], {"input_tokens": 0, "output_tokens": 0}
+        )
+        self.assertEqual(record.call_args.args[3], {})
+        self.assertEqual(record.call_args.kwargs["source"], "unavailable")
+
+    def test_native_json_empty_usage_object_is_not_upstream_evidence(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"id":"msg_fixture","type":"message","role":"assistant",'
+             b'"content":[],"model":"fixture-model","usage":{}}'],
+        )
+        request = self._request(
+            {"model": "fast,custom-model", "messages": []},
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", _FakeDownstream
+        ), mock.patch.object(hub, "record_usage") as record:
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        # 空 usage 对象不含任何已观测计数器;这个出口曾经只凭 key 存在就记
+        # upstream,与其余三个记账出口的非空判定分岔。
+        self.assertEqual(record.call_args.args[3], {})
+        self.assertEqual(record.call_args.kwargs["source"], "unavailable")
+
+    def test_native_json_usage_keeps_upstream_source(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"id":"msg_fixture","type":"message","role":"assistant",'
+             b'"content":[],"model":"fixture-model",'
+             b'"usage":{"input_tokens":7,"output_tokens":2}}'],
+        )
+        request = self._request(
+            {"model": "fast,custom-model", "messages": []},
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", _FakeDownstream
+        ), mock.patch.object(hub, "record_usage") as record:
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            record.call_args.args[3],
+            {"input_tokens": 7, "output_tokens": 2},
+        )
+        self.assertEqual(record.call_args.kwargs["source"], "upstream")
 
     def test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed(self):
         self._set_provider_endpoint(

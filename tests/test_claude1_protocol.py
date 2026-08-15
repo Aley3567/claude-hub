@@ -1633,3 +1633,20 @@ class UsageReceiptTests(unittest.TestCase):
         # 未观测的计数器省略而不是伪造 0，记账侧无需再靠 plan 反查剥零。
         self.assertNotIn("input_tokens", accounting)
         self.assertEqual(accounting.get("output_tokens"), 20)
+
+    def test_stream_mixed_cache_evidence_nested_carrier_wins(self) -> None:
+        bridge, delta_usage = self._finish_chat_stream(
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 40},
+                "cache_read_input_tokens": 40,
+            }
+        )
+        # nested carrier 与官方 key 并存且数值一致时按 nested（inclusive）
+        # 解读：base 扣掉 40。complete 路径对同输入产出相同结果（见
+        # test_matching_cache_carriers_are_coalesced_without_fabrication）；
+        # 数值冲突则整体拒转（见 test_conflicting_cache_read_carriers_are_rejected）。
+        self.assertEqual(delta_usage.get("input_tokens"), 60)
+        self.assertEqual(delta_usage.get("cache_read_input_tokens"), 40)
+        self.assertEqual(bridge.usage_for_accounting().get("input_tokens"), 60)

@@ -145,6 +145,28 @@ class OutputIR:
 class PreparedResponse:
     payload: dict
     plan: ConversionPlan
+    # The usage evidence the payload was rendered from. None for the native
+    # pass-through, which never re-interprets the upstream body.
+    receipt: UsageReceipt | None = None
+
+    def usage_for_accounting(self) -> dict:
+        """Export the accounting view of this response's usage.
+
+        Mirrors AnthropicStreamBridge.usage_for_accounting: the ledger reads
+        the same receipt the downstream payload was rendered from, so an
+        unobserved counter is omitted here instead of being read back as the
+        zero the schema-complete payload had to carry.
+        """
+        if self.receipt is None:
+            return {}
+        usage = self.receipt.as_anthropic()
+        payload_usage = self.payload.get("usage")
+        if isinstance(payload_usage, dict):
+            for key in ("cache_creation", "server_tool_use"):
+                detail = payload_usage.get(key)
+                if isinstance(detail, dict):
+                    usage[key] = copy.deepcopy(detail)
+        return usage
 
 
 @dataclass(frozen=True)
@@ -2794,7 +2816,11 @@ class UsageReceipt:
         The single rule source for complete and stream conversions: a nested
         carrier proves the base input counter is inclusive of cached tokens;
         the Anthropic-native key proves exclusive semantics; a bare top-level
-        compat field proves neither and must not be guessed at.
+        compat field proves neither and must not be guessed at. When a nested
+        carrier and the native key coexist, the nested reading wins and the
+        coalesced counter is subtracted from the inclusive base; the carriers
+        must agree on the value first, so this priority never picks between
+        two conflicting truths.
         """
         if nested_cache_evidence:
             if isinstance(cache_read, int) and input_tokens is not None:
@@ -3282,7 +3308,7 @@ def chat_to_anthropic(
     body: dict,
     *,
     plan: ConversionPlan | None = None,
-) -> dict:
+) -> tuple[dict, UsageReceipt]:
     _require_upstream_response_allowlist(
         body,
         {
@@ -3646,7 +3672,7 @@ def chat_to_anthropic(
     )
     if "model" not in body:
         _record_response_metadata_degradation(plan, "$.model")
-    return {
+    payload = {
         "id": body.get("id") or f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": "assistant",
@@ -3664,13 +3690,14 @@ def chat_to_anthropic(
             _server_tool_usage(raw_usage),
         ),
     }
+    return payload, receipt
 
 
 def responses_to_anthropic(
     body: dict,
     *,
     plan: ConversionPlan | None = None,
-) -> dict:
+) -> tuple[dict, UsageReceipt]:
     _require_upstream_response_allowlist(
         body,
         _RESPONSES_STREAM_RESPONSE_FIELDS,
@@ -3990,7 +4017,7 @@ def responses_to_anthropic(
     )
     if "model" not in body:
         _record_response_metadata_degradation(plan, "$.model")
-    return {
+    payload = {
         "id": body.get("id") or f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": "assistant",
@@ -4008,27 +4035,30 @@ def responses_to_anthropic(
             _server_tool_usage(raw_usage),
         ),
     }
+    return payload, receipt
 
 
 class ResponseAdapter:
     api_format: str
 
-    def decode(self, output: OutputIR, plan: ConversionPlan) -> dict:
+    def decode(self, output: OutputIR, plan: ConversionPlan) -> PreparedResponse:
         raise NotImplementedError
 
 
 class ChatResponseAdapter(ResponseAdapter):
     api_format = "openai_chat"
 
-    def decode(self, output: OutputIR, plan: ConversionPlan) -> dict:
-        return chat_to_anthropic(output.source, plan=plan)
+    def decode(self, output: OutputIR, plan: ConversionPlan) -> PreparedResponse:
+        payload, receipt = chat_to_anthropic(output.source, plan=plan)
+        return PreparedResponse(payload, plan, receipt)
 
 
 class ResponsesResponseAdapter(ResponseAdapter):
     api_format = "openai_responses"
 
-    def decode(self, output: OutputIR, plan: ConversionPlan) -> dict:
-        return responses_to_anthropic(output.source, plan=plan)
+    def decode(self, output: OutputIR, plan: ConversionPlan) -> PreparedResponse:
+        payload, receipt = responses_to_anthropic(output.source, plan=plan)
+        return PreparedResponse(payload, plan, receipt)
 
 
 RESPONSE_ADAPTERS: dict[str, ResponseAdapter] = {
@@ -4056,16 +4086,16 @@ def prepare_response(body: dict, api_format: str) -> PreparedResponse:
         )
     plan = ConversionPlan(adapter=profile.name)
     if api_format == "anthropic":
-        payload = copy.deepcopy(body)
-    else:
-        adapter = RESPONSE_ADAPTERS.get(api_format)
-        if adapter is None:
-            raise ProtocolTransformError(
-                f"no response adapter is registered for {api_format!r}",
-                code="HUB_ADAPTER_UNAVAILABLE",
-            )
-        payload = adapter.decode(OutputIR(copy.deepcopy(body), api_format), plan)
-    return PreparedResponse(payload, plan)
+        # Native pass-through stays byte-for-byte: the body is never
+        # re-interpreted here, so there is no receipt to account from.
+        return PreparedResponse(copy.deepcopy(body), plan)
+    adapter = RESPONSE_ADAPTERS.get(api_format)
+    if adapter is None:
+        raise ProtocolTransformError(
+            f"no response adapter is registered for {api_format!r}",
+            code="HUB_ADAPTER_UNAVAILABLE",
+        )
+    return adapter.decode(OutputIR(copy.deepcopy(body), api_format), plan)
 
 
 def transform_response(body: dict, api_format: str) -> dict:
@@ -7094,23 +7124,24 @@ class AnthropicStreamBridge:
             final_usage["server_tool_use"] = copy.deepcopy(
                 self.server_tool_usage_detail
             )
+        message_delta = {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": _stop_reason(
+                    self.stop,
+                    has_tool=self.has_tool,
+                    refused=self.refused,
+                ),
+                "stop_sequence": None,
+            },
+        }
+        if final_usage:
+            # An empty object would read as an observed-but-empty report;
+            # omit the key when no counter was ever observed.
+            message_delta["usage"] = final_usage
         chunks.extend(
             [
-                sse_event(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": _stop_reason(
-                                self.stop,
-                                has_tool=self.has_tool,
-                                refused=self.refused,
-                            ),
-                            "stop_sequence": None,
-                        },
-                        "usage": final_usage,
-                    },
-                ),
+                sse_event("message_delta", message_delta),
                 sse_event("message_stop", {"type": "message_stop"}),
             ]
         )

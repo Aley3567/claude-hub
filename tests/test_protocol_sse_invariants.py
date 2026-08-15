@@ -404,7 +404,7 @@ class SSEParserContractTests(unittest.TestCase):
             if body["type"] == "message_start":
                 start_usage = body["message"]["usage"]
             elif body["type"] == "message_delta":
-                delta_usage = body["usage"]
+                delta_usage = body.get("usage")
         return start_usage, delta_usage
 
     def test_unobserved_stream_usage_is_omitted_not_zeroed(self) -> None:
@@ -419,7 +419,26 @@ class SSEParserContractTests(unittest.TestCase):
 
         start_usage, delta_usage = self._message_usages(chunks)
         self.assertEqual(start_usage, {})
-        self.assertEqual(delta_usage, {})
+        # 一个计数器都没观测到时，终态 message_delta 省略整个 usage 键，
+        # 而不是发一个读作“观测过但为空”的对象。
+        self.assertIsNone(delta_usage)
+
+    def test_empty_upstream_usage_object_stays_unobserved(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            '{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],'
+            '"usage":{}}',
+        )
+        chunks.extend(bridge.feed("message", "[DONE]"))
+        chunks.extend(bridge.finish())
+        # 上游显式发空 usage={} 同样不含任何观测证据：终态事件省略 usage
+        # 键，记账视图也为空。
+        self.assertEqual(bridge.usage_for_accounting(), {})
+
+        start_usage, delta_usage = self._message_usages(chunks)
+        self.assertEqual(start_usage, {})
+        self.assertIsNone(delta_usage)
 
     def test_late_input_usage_is_carried_by_message_delta_observably(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_chat")
