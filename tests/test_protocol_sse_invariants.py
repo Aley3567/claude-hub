@@ -853,7 +853,10 @@ class StreamStateMachineContractTests(unittest.TestCase):
                         "type": "response.failed",
                         "response": {
                             "error": {
-                                "message": "token=secret https://private.invalid/path"
+                                "message": (
+                                    "quota exhausted token=secret "
+                                    "https://private.invalid/path"
+                                )
                             }
                         },
                     }
@@ -862,9 +865,31 @@ class StreamStateMachineContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"secret", rendered)
         self.assertNotIn(b"private.invalid", rendered)
-        self.assertIn(
+        # Sanitized detail is forwarded rather than dropped, so the reason the
+        # upstream gave survives while the credential shapes do not.
+        self.assertIn(b"quota exhausted", rendered)
+        self.assertIn(b"token=[redacted]", rendered)
+        self.assertIn(b"[redacted-url]", rendered)
+        self.assertNotIn(
             "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
             responses.warning_codes,
+        )
+
+        # The degradation code is still the honest signal when an error is
+        # present but yields no forwardable evidence at all.
+        opaque = protocol.AnthropicStreamBridge("openai_responses")
+        opaque.feed(
+            "response.failed",
+            json.dumps(
+                {
+                    "type": "response.failed",
+                    "response": {"error": {"message": "   "}},
+                }
+            ),
+        )
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
+            opaque.warning_codes,
         )
 
         for response in (

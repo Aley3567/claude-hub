@@ -3008,6 +3008,101 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertNotIn("fixture-secret-token", message)
         self.assertNotIn("private-upstream", message)
 
+    def test_relay_error_shapes_without_the_canonical_envelope(self) -> None:
+        # 中转站常省掉 {"error": {...}} 外壳。证据通道对这些形状一律通用，
+        # 不为某个渠道写专用分支。
+        cases = [
+            ({"error": "quota exhausted"}, (None, "quota exhausted")),
+            ({"message": "5 小时限额已到", "code": 429}, ("429", "5 小时限额已到")),
+            ({"detail": "insufficient balance"}, (None, "insufficient balance")),
+            ({"msg": "concurrency limit", "code": "1305"}, ("1305", "concurrency limit")),
+            ('{"detail": "gateway rejected"}', (None, "gateway rejected")),
+            # canonical 外壳存在时优先，不被顶层字段抢走
+            (
+                {"error": {"message": "envelope wins"}, "message": "ignored"},
+                (None, "envelope wins"),
+            ),
+            # 无从取证时 fail-closed 回落 None，而不是转发整个响应体
+            ({"unexpected": {"nested": "shape"}}, (None, None)),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(protocol.upstream_error_evidence(body), expected)
+
+    def test_sanitizer_redacts_assignment_and_key_shapes(self) -> None:
+        # 原来只脱敏 Bearer 与 URL，token=xxx 这类赋值形状会漏。流中错误
+        # 详情要透传，前提就是清洗器先覆盖这些形状。
+        # sk- 形状用拼接构造:仓库里不留完整 key 字面量,否则 secret_guard 会拦。
+        key_shape = "sk-" + "fixtureSECRET0123456789"
+        redacted = protocol.sanitize_error_text(
+            "auth failed token=fixture-secret api_key: fixture-secret "
+            f"key=fixture-secret {key_shape} "
+            "Bearer fixture-secret https://vendor.invalid/x"
+        )
+        self.assertNotIn("fixture-secret", redacted)
+        self.assertNotIn("fixtureSECRET", redacted)
+        self.assertNotIn("vendor.invalid", redacted)
+        self.assertIn("auth failed", redacted)
+        self.assertIn("[redacted-key]", redacted)
+        self.assertIn("[redacted-token]", redacted)
+        self.assertIn("[redacted-url]", redacted)
+
+        # 真实原因本身不含凭证形状时必须原样存活，中文不受影响。
+        self.assertEqual(
+            protocol.sanitize_error_text("您的账户已达到速率限制，请控制请求频率"),
+            "您的账户已达到速率限制，请控制请求频率",
+        )
+        # 长度有界、控制字符剥离、空文本回落 None。
+        self.assertEqual(len(protocol.sanitize_error_text("x" * 900)), 512)
+        self.assertEqual(protocol.sanitize_error_text("a\r\nb"), "a b")
+        self.assertIsNone(protocol.sanitize_error_text("   "))
+
+    def test_chat_stream_error_frame_terminates_with_the_real_reason(self) -> None:
+        # OpenAI 兼容网关在流中报限额时发裸 {"error": ...} 帧。以前它会撞上
+        # 字段白名单炸成 ProtocolTransformError（下游只看到裸断连），
+        # 现在必须变成一个携带真实原因的终态 error 事件。
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        rendered = b"".join(
+            bridge.feed(
+                "message",
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "1302",
+                            "message": "5 小时限额已用完 token=fixture-secret",
+                        }
+                    }
+                ),
+            )
+        )
+
+        self.assertIn(b"event: error", rendered)
+        payload = json.loads(rendered.split(b"data: ", 1)[1].decode("utf-8"))
+        self.assertEqual(payload["error"]["type"], "api_error")
+        self.assertIn("(1302)", payload["error"]["message"])
+        self.assertIn("5 小时限额已用完", payload["error"]["message"])
+        self.assertNotIn("fixture-secret", payload["error"]["message"])
+        self.assertTrue(bridge.upstream_terminal)
+        self.assertNotIn(
+            "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
+            bridge.warning_codes,
+        )
+
+    def test_chat_stream_string_error_frame_is_accepted_and_objects_validated(
+        self,
+    ) -> None:
+        string_frame = protocol.AnthropicStreamBridge("openai_chat")
+        rendered = b"".join(
+            string_frame.feed("message", json.dumps({"error": "upstream overloaded"}))
+        )
+        self.assertIn(b"upstream overloaded", rendered)
+
+        # 非 object/string 的 error 仍然 fail closed，不猜形状。
+        invalid = protocol.AnthropicStreamBridge("openai_chat")
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            invalid.feed("message", json.dumps({"error": [1, 2, 3]}))
+        self.assertEqual(raised.exception.code, "HUB_UPSTREAM_RESPONSE_INVALID")
+
 
 if __name__ == "__main__":
     unittest.main()
