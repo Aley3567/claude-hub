@@ -172,6 +172,7 @@ class RouteGroupTests(unittest.TestCase):
         self.db_file = root / "fixture-routes.db"
         self.log_file = root / "logs" / "hub.log"
         self.usage_file = root / "logs" / "hub-usage.jsonl"
+        self.errors_file = root / "logs" / "hub-errors.jsonl"
         self.account_pool_config = root / "account-pools.json"
         self.account_pool_state = root / "account-state.sqlite3"
         self._write_db()
@@ -183,6 +184,7 @@ class RouteGroupTests(unittest.TestCase):
                 "CLAUDE_HUB_DB": str(self.db_file),
                 "CLAUDE_HUB_LOG": str(self.log_file),
                 "CLAUDE_HUB_USAGE": str(self.usage_file),
+                "CLAUDE_HUB_ERRORS": str(self.errors_file),
                 "CLAUDE_HUB_LOCAL_TOKEN": "fixture-local-token",
                 "CLAUDE1_ACCOUNT_POOL_CONFIG": str(self.account_pool_config),
                 "CLAUDE1_ACCOUNT_POOL_STATE": str(self.account_pool_state),
@@ -709,6 +711,70 @@ class RouteGroupTests(unittest.TestCase):
         self.assertEqual(response.headers["retry-after"], "45")
         self.assertEqual(response.headers["x-hub-route"], "fixture-route")
         self.assertEqual(len(session.calls), 2)
+
+    def test_exhaustion_names_the_last_upstream_reason_without_leaking_secrets(self):
+        # The whole point of the evidence plumbing: a route that burns through
+        # every target must still tell the client what the upstream said, so a
+        # quota message does not die in the hub log.
+        self._route_config(self._fixture_route())
+        session = _SequencedFakeSession(
+            [
+                _json_upstream(429, {"error": {"message": "fixture limited a"}}),
+                _json_upstream(
+                    429,
+                    {
+                        "error": {
+                            "code": "1302",
+                            "message": (
+                                "5 小时限额已用完 token=fixture-secret "
+                                "https://vendor.invalid/quota"
+                            ),
+                        }
+                    },
+                ),
+            ]
+        )
+
+        response = self._run(
+            {"model": "route:fixture-route", "messages": []}, session
+        )
+
+        self.assertEqual(response.status, 429)
+        payload = json.loads(response.text)
+        message = payload["error"]["message"]
+        self.assertIn("exhausted all 2 targets", message)
+        self.assertIn("last 'beta' upstream 429", message)
+        self.assertIn("(1302)", message)
+        self.assertIn("5 小时限额已用完", message)
+        self.assertNotIn("fixture-secret", message)
+        self.assertNotIn("vendor.invalid", message)
+        self.assertNotIn("fixture limited a", message)
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(row["phase"], "route")
+        self.assertEqual(row["channel"], "beta")
+        self.assertEqual((row["status"], row["code"]), (429, "1302"))
+        self.assertEqual(row["route"], "fixture-route")
+        self.assertNotIn("fixture-secret", row["message"])
+
+    def test_pool_exhaustion_reason_survives_into_the_route_error(self):
+        # Local cooldown is also a real reason; it must not collapse to a bare
+        # 429 with no explanation.
+        self._write_pool_db()
+        self._write_pool_config()
+        self._pool_route_config([{"channel": "alpha", "model": "pool-model-a"}])
+        self._seed_pool_cooldown(30)
+        session = _SequencedFakeSession([])
+
+        response = self._run(
+            {"model": "route:fixture-pool-route", "messages": []}, session
+        )
+
+        self.assertEqual(response.status, 429)
+        message = json.loads(response.text)["error"]["message"]
+        self.assertIn("last 'alpha' upstream 429", message)
+        self.assertIn("all provider accounts are unavailable", message)
+        self.assertEqual(len(session.calls), 0)
 
     def test_5xx_does_not_move_to_the_next_target(self):
         self._route_config(self._fixture_route())

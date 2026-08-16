@@ -190,6 +190,7 @@ class ClaudeHubTests(unittest.TestCase):
         self.db_file = root / "fixture ?#%.db"
         self.log_file = root / "logs" / "hub.log"
         self.usage_file = root / "logs" / "hub-usage.jsonl"
+        self.errors_file = root / "logs" / "hub-errors.jsonl"
         self.account_pool_config = root / "account-pools.json"
         self.account_pool_state = root / "account-state.sqlite3"
         self._write_db(
@@ -227,6 +228,7 @@ class ClaudeHubTests(unittest.TestCase):
                 "CLAUDE_HUB_DB": str(self.db_file),
                 "CLAUDE_HUB_LOG": str(self.log_file),
                 "CLAUDE_HUB_USAGE": str(self.usage_file),
+                "CLAUDE_HUB_ERRORS": str(self.errors_file),
                 "CLAUDE_HUB_LOCAL_TOKEN": "fixture-local-token",
                 "CLAUDE1_ACCOUNT_POOL_CONFIG": str(self.account_pool_config),
                 "CLAUDE1_ACCOUNT_POOL_STATE": str(self.account_pool_state),
@@ -389,6 +391,152 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(row["source"], "unavailable")
         self.assertNotIn("in", row)
         self.assertNotIn("out", row)
+
+    def test_error_journal_keeps_only_sanitized_fields_and_stays_private(self):
+        hub.record_error(
+            phase="response",
+            channel="fast",
+            model="fixture-model",
+            api_format="openai_chat",
+            status=429,
+            code="1302",
+            message="5 小时限额已用完",
+            route="fixture-route",
+        )
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "response")
+        self.assertEqual(row["channel"], "fast")
+        self.assertEqual(row["model"], "fixture-model")
+        self.assertEqual(row["format"], "openai_chat")
+        self.assertEqual((row["status"], row["code"]), (429, "1302"))
+        self.assertEqual(row["message"], "5 小时限额已用完")
+        self.assertEqual(row["route"], "fixture-route")
+        self.assertIsInstance(row["ts"], int)
+        # Absent fields are omitted rather than written as null, and request or
+        # response payloads never reach the journal at all.
+        self.assertNotIn("exc", row)
+        self.assertNotIn("payload", row)
+        self.assertNotIn("upstream_body", row)
+        if os.name == "posix":
+            self.assertEqual(self.errors_file.stat().st_mode & 0o777, 0o600)
+
+    def test_error_journal_rotates_after_crossing_its_size_limit(self):
+        with mock.patch.object(hub, "ERRORS_LOG_MAX_BYTES", 1):
+            hub.record_error(phase="stream", channel="fast", exc_type="IncompleteSSE")
+
+        rotated = self.errors_file.with_name(self.errors_file.name + ".1")
+        row = json.loads(rotated.read_text(encoding="utf-8"))
+        self.assertEqual((row["phase"], row["exc"]), ("stream", "IncompleteSSE"))
+        self.assertEqual(self.errors_file.read_text(encoding="utf-8"), "")
+        if os.name == "posix":
+            self.assertEqual(self.errors_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(rotated.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW unavailable")
+    def test_error_journal_does_not_follow_symlinks(self):
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        target = self.root / "must-not-be-written-by-errors"
+        target.write_text("unchanged", encoding="utf-8")
+        self.errors_file.symlink_to(target)
+
+        hub.record_error(phase="route", status=503)
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+        self.assertIsNone(hub._errors_fp)
+
+    def test_error_journal_never_breaks_the_forwarding_path(self):
+        # A journal that cannot be written must not turn into a request-path
+        # failure: the record is dropped, not raised.
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        self.errors_file.mkdir()
+
+        hub.record_error(phase="response", status=500)
+
+        self.assertIsNone(hub._errors_fp)
+
+    def test_errors_path_is_a_sibling_of_the_hub_log_it_belongs_to(self):
+        # Named hubs each get their own journal without the launcher passing a
+        # second environment variable.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_HUB_ERRORS", None)
+            os.environ["CLAUDE_HUB_LOG"] = str(self.root / "logs" / "hubs" / "kimi.log")
+            self.assertEqual(
+                hub.errors_path(),
+                self.root / "logs" / "hubs" / "kimi-errors.jsonl",
+            )
+
+    def test_cli_errors_renders_reasons_and_skips_stale_debug_rows(self):
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        self.errors_file.write_text(
+            "\n".join(
+                [
+                    # Pre-journal debug shape: no phase, and it carried payloads.
+                    json.dumps(
+                        {
+                            "ts": "2026-08-15T19:58:13",
+                            "channel": "legacy",
+                            "payload": {"messages": [{"role": "user"}]},
+                        }
+                    ),
+                    "not-json",
+                    json.dumps(
+                        {
+                            "ts": 1755000000,
+                            "phase": "response",
+                            "channel": "fast",
+                            "model": "fixture-model",
+                            "format": "openai_chat",
+                            "status": 429,
+                            "code": "1302",
+                            "message": "5 小时限额已用完",
+                            "route": "fixture-route",
+                        }
+                    ),
+                    json.dumps(
+                        {"ts": 1755000100, "phase": "stream", "exc": "IncompleteSSE"}
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.errors_file.chmod(0o600)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            hub.cli_errors([])
+        rendered = buffer.getvalue()
+
+        self.assertIn("5 小时限额已用完", rendered)
+        self.assertIn("fast/fixture-model (openai_chat)", rendered)
+        self.assertIn("429", rendered)
+        self.assertIn("[route fixture-route]", rendered)
+        self.assertIn("IncompleteSSE", rendered)
+        self.assertNotIn("legacy", rendered)
+        self.assertNotIn("messages", rendered)
+        self.assertIn("2 stale record(s) skipped", rendered)
+
+        tail = io.StringIO()
+        with redirect_stdout(tail):
+            hub.cli_errors(["-n", "1"])
+        self.assertIn("IncompleteSSE", tail.getvalue())
+        self.assertNotIn("5 小时限额已用完", tail.getvalue())
+
+        with self.assertRaises(SystemExit):
+            hub.cli_errors(["-n", "zero"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permissions only")
+    def test_cli_errors_warns_while_the_journal_is_still_world_readable(self):
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        self.errors_file.write_text("", encoding="utf-8")
+        self.errors_file.chmod(0o644)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            hub.cli_errors([])
+
+        self.assertIn("group/other-readable", buffer.getvalue())
 
     def test_transformed_usage_log_filters_schema_only_zero_placeholders(self):
         prepared = hub.prepare_response(
@@ -3399,6 +3547,70 @@ class ClaudeHubTests(unittest.TestCase):
             "fixture-secondary-account-token",
         )
 
+    def test_native_json_error_body_is_journaled_with_its_real_reason(self):
+        # 原生路径是字节透传,错误体以前不进缓冲,于是"用户额度不足"只出现在
+        # 上游响应里,事后无处可查。现在它必须落进 journal。
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        upstream = _FakeUpstream(
+            403,
+            {"Content-Type": "application/json"},
+            [
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "",
+                            "message": "用户额度不足",
+                            "type": "insufficient_quota",
+                        }
+                    }
+                ).encode("utf-8")
+            ],
+        )
+        request = self._request(
+            {"model": "fast,custom-model", "messages": []},
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 403)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual((row["phase"], row["status"]), ("response", 403))
+        self.assertEqual(row["channel"], "fast")
+        self.assertEqual(row["message"], "用户额度不足")
+        # 空 code 不是证据,不该写进 journal 冒充上游代码。
+        self.assertNotIn("code", row)
+
+    def test_stream_abort_is_journaled_so_mid_response_stays_findable(self):
+        # 用户看到的 "mid-response" 就是这条路径:下游已提交,只能 abort。
+        # 至少要在 journal 里留下是哪个渠道、哪种异常。
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [b'event: message_start\ndata: {"type":"message_start"}\n\n'],
+            fail_after=True,
+        )
+        request = self._request(
+            {"model": "fast,custom-model", "stream": True, "messages": []},
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            with self.assertRaises(hub.UpstreamStreamAborted):
+                asyncio.run(hub.handle_messages(request))
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(row["phase"], "stream")
+        self.assertEqual(row["channel"], "fast")
+        self.assertEqual(row["format"], "anthropic")
+        self.assertEqual(row["exc"], "ClientPayloadError")
+
     def test_account_pool_never_retries_a_stream_after_downstream_commit(self):
         self._write_account_pool_db()
         self._write_account_pool_config()
@@ -3874,6 +4086,11 @@ class ClaudeHubTests(unittest.TestCase):
             body["error"]["message"],
             "upstream HTTP 429 (rate_limit): slow down",
         )
+        # 同一份证据同时进 journal,事后 `claude-hub errors` 才查得到。
+        row = json.loads(self.errors_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual((row["phase"], row["status"]), ("response", 429))
+        self.assertEqual(row["format"], "openai_chat")
+        self.assertEqual((row["code"], row["message"]), ("rate_limit", "slow down"))
 
     def test_full_url_provider_rejects_request_query_strings(self):
         endpoint = "http://127.0.0.1:19090/v1/messages"
