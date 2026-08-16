@@ -51,6 +51,7 @@ from claude1_protocol import (
     prepare_response,
     protocol_capability_matrix,
     provider_api_format,
+    sanitize_error_text,
     sse_event,
     transform_error,
     transform_request,
@@ -91,6 +92,7 @@ DEFAULT_CONFIG_PATH = HOME / ".cc-switch" / "claude-hub.json"
 DEFAULT_DB_PATH = HOME / ".cc-switch" / "cc-switch.db"
 DEFAULT_LOG_PATH = HOME / ".cc-switch" / "logs" / "claude-hub.log"
 DEFAULT_USAGE_PATH = HOME / ".cc-switch" / "logs" / "claude-hub-usage.jsonl"
+DEFAULT_ERRORS_PATH = HOME / ".cc-switch" / "logs" / "claude-hub-errors.jsonl"
 DEFAULT_ACCOUNT_POOL_CONFIG_PATH = (
     HOME / ".cc-switch" / "claude1-account-pools.json"
 )
@@ -102,6 +104,7 @@ ENV_CONFIG = "CLAUDE_HUB_CONFIG"
 ENV_DB = "CLAUDE_HUB_DB"
 ENV_LOG = "CLAUDE_HUB_LOG"
 ENV_USAGE = "CLAUDE_HUB_USAGE"
+ENV_ERRORS = "CLAUDE_HUB_ERRORS"
 ENV_PORT = "CLAUDE_HUB_PORT"
 ENV_LOCAL_TOKEN = "CLAUDE_HUB_LOCAL_TOKEN"
 ENV_LISTEN_FD = "CLAUDE_HUB_LISTEN_FD"
@@ -110,6 +113,7 @@ ENV_ACCOUNT_POOL_STATE = "CLAUDE1_ACCOUNT_POOL_STATE"
 
 LOG_MAX_BYTES = 10 * 1024 * 1024
 USAGE_LOG_MAX_BYTES = 10 * 1024 * 1024
+ERRORS_LOG_MAX_BYTES = 5 * 1024 * 1024
 MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024
 UPSTREAM_KEEPALIVE_IDLE_SECONDS = 30
 UPSTREAM_KEEPALIVE_INTERVAL_SECONDS = 15
@@ -159,6 +163,7 @@ RESP_STRIP = HOP_BY_HOP | {"content-length"}
 _log_fp = None
 _log_stderr = False
 _usage_fp = None
+_errors_fp = None
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -180,6 +185,21 @@ def log_path() -> Path:
 
 def usage_path() -> Path:
     return _env_path(ENV_USAGE, DEFAULT_USAGE_PATH)
+
+
+def errors_path() -> Path:
+    """Error-journal path: env override, else derived from the hub's log path.
+
+    Deriving from ``log_path()`` keeps named hubs' journals separate without
+    each launcher having to pass one more environment variable.
+    """
+    value = os.environ.get(ENV_ERRORS)
+    if value:
+        return Path(value).expanduser()
+    base = log_path()
+    if base == DEFAULT_LOG_PATH:
+        return DEFAULT_ERRORS_PATH
+    return base.with_name(base.stem + "-errors.jsonl")
 
 
 def account_pool_config_path() -> Path:
@@ -280,7 +300,15 @@ def _usage_int(value: object) -> int | None:
 
 def _open_usage_log():
     """Open the usage JSONL privately, rotating one bounded backup if needed."""
-    path = usage_path()
+    return _open_rotating_jsonl(usage_path(), USAGE_LOG_MAX_BYTES, "usage")
+
+
+def _open_errors_log():
+    """Open the error-journal JSONL privately, rotating one bounded backup."""
+    return _open_rotating_jsonl(errors_path(), ERRORS_LOG_MAX_BYTES, "errors")
+
+
+def _open_rotating_jsonl(path: Path, max_bytes: int, label: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         current = path.lstat()
@@ -289,8 +317,8 @@ def _open_usage_log():
     expected_current = current
     if current is not None:
         if not stat.S_ISREG(current.st_mode):
-            raise RuntimeError("usage path is not a regular file")
-        if current.st_size > USAGE_LOG_MAX_BYTES:
+            raise RuntimeError(f"{label} path is not a regular file")
+        if current.st_size > max_bytes:
             rotated = path.with_name(path.name + ".1")
             path.replace(rotated)
             expected_current = None
@@ -300,7 +328,7 @@ def _open_usage_log():
             rotated_fd = os.open(rotated, rotated_flags)
             try:
                 if not stat.S_ISREG(os.fstat(rotated_fd).st_mode):
-                    raise RuntimeError("rotated usage path is not a regular file")
+                    raise RuntimeError(f"rotated {label} path is not a regular file")
                 if os.name == "posix":
                     os.fchmod(rotated_fd, 0o600)
             finally:
@@ -313,7 +341,7 @@ def _open_usage_log():
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
-            raise RuntimeError("usage path is not a regular file")
+            raise RuntimeError(f"{label} path is not a regular file")
         if expected_current is not None and (
             opened.st_dev,
             opened.st_ino,
@@ -321,7 +349,7 @@ def _open_usage_log():
             expected_current.st_dev,
             expected_current.st_ino,
         ):
-            raise RuntimeError("usage path changed while it was being opened")
+            raise RuntimeError(f"{label} path changed while it was being opened")
         if os.name == "posix":
             os.fchmod(fd, 0o600)
         return os.fdopen(fd, "a", encoding="utf-8")
@@ -382,6 +410,50 @@ def record_usage(
             _usage_fp.close()
             _usage_fp = None
             _usage_fp = _open_usage_log()
+    except Exception:
+        pass
+
+
+def record_error(
+    *,
+    phase: str,
+    channel: str | None = None,
+    model: str | None = None,
+    api_format: str | None = None,
+    status: int | None = None,
+    code: str | None = None,
+    message: str | None = None,
+    exc_type: str | None = None,
+    route: str | None = None,
+) -> None:
+    """把一条已脱敏的错误事件追加到 JSONL。绝不能搞挂转发主路径，全部异常静默。
+
+    ``code``/``message`` 只接受 ``upstream_error_evidence`` /
+    ``sanitize_error_text`` 清洗过的文本；请求或响应 payload 一律不落盘。
+    """
+    try:
+        row: dict = {"ts": int(time.time()), "phase": phase}
+        for key, value in (
+            ("channel", channel),
+            ("model", model),
+            ("format", api_format),
+            ("status", status),
+            ("code", code),
+            ("message", message),
+            ("exc", exc_type),
+            ("route", route),
+        ):
+            if value is not None:
+                row[key] = value
+        global _errors_fp
+        if _errors_fp is None:
+            _errors_fp = _open_errors_log()
+        _errors_fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+        _errors_fp.flush()
+        if os.fstat(_errors_fp.fileno()).st_size > ERRORS_LOG_MAX_BYTES:
+            _errors_fp.close()
+            _errors_fp = None
+            _errors_fp = _open_errors_log()
     except Exception:
         pass
 
@@ -1102,6 +1174,7 @@ def reset_caches() -> None:
     Primarily useful for isolated diagnostics and tests.
     """
     global _snapshot_entry, _snapshot_hits, _snapshot_misses, _snapshot_refreshes
+    global _errors_fp
     _cfg_cache.update({"path": None, "mtime_ns": None, "size": None, "raw": None})
     with _snapshot_lock:
         _snapshot_entry = None
@@ -1110,6 +1183,12 @@ def reset_caches() -> None:
         _snapshot_misses = 0
         _snapshot_refreshes = 0
         _snapshot_refresh_samples.clear()
+    if _errors_fp is not None:
+        try:
+            _errors_fp.close()
+        except Exception:
+            pass
+        _errors_fp = None
 
 
 # ---------------------------------------------------------------- routing
@@ -1127,12 +1206,54 @@ class RouteTargetExhausted(Exception):
 
     Raised only before any downstream byte was prepared, so the request may
     still be replayed against the next route target (design doc section 4).
+    Carries the sanitized upstream evidence of the rejection so the final
+    route-exhausted error can name the real reason instead of only a status.
     """
 
-    def __init__(self, status: int, retry_after: str | None = None):
+    def __init__(
+        self,
+        status: int,
+        retry_after: str | None = None,
+        *,
+        alias: str | None = None,
+        evidence_code: str | None = None,
+        evidence_message: str | None = None,
+    ):
         super().__init__(f"route target exhausted after upstream {status}")
         self.status = status
         self.retry_after = retry_after
+        self.alias = alias
+        self.evidence_code = evidence_code
+        self.evidence_message = evidence_message
+
+
+async def _route_target_exhausted(
+    upstream, alias: str
+) -> RouteTargetExhausted:
+    """Build a RouteTargetExhausted carrying sanitized upstream evidence.
+
+    The rejected body is safe to consume here: this target is done and the
+    buffered request body is what gets replayed, not the response.  Any
+    failure while reading evidence degrades to a status-only exception.
+    """
+    evidence_code = None
+    evidence_message = None
+    try:
+        raw = await _read_decoded_upstream_body(upstream)
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = raw.decode("utf-8", "replace")
+        evidence_code, evidence_message = upstream_error_evidence(decoded)
+    except Exception:
+        pass
+    return RouteTargetExhausted(
+        upstream.status,
+        upstream.headers.get("retry-after"),
+        alias=alias,
+        evidence_code=evidence_code,
+        evidence_message=evidence_message,
+    )
 
 
 def route_group_name(model_in: str, cfg: dict) -> str | None:
@@ -2534,10 +2655,7 @@ async def _handle_transformed_messages(
                 # Every account and transport of this target rejected the
                 # request before any content was generated; the body is still
                 # safely replayable against the next route target.
-                raise RouteTargetExhausted(
-                    upstream.status,
-                    upstream.headers.get("retry-after"),
-                )
+                raise await _route_target_exhausted(upstream, alias)
             content_type = (
                 upstream.headers.get("content-type", "")
                 .split(";", 1)[0]
@@ -2571,6 +2689,16 @@ async def _handle_transformed_messages(
                     log(
                         f"{request.path} '{model_in}' -> {alias}/{model_out} "
                         f"{api_format} upstream {upstream.status}{detail}"
+                    )
+                    record_error(
+                        phase="response",
+                        channel=alias,
+                        model=model_out,
+                        api_format=api_format,
+                        status=upstream.status,
+                        code=evidence_code,
+                        message=evidence_message,
+                        route=route_name,
                     )
                     error_headers = {
                         "x-hub-channel": alias,
@@ -2738,6 +2866,19 @@ async def _handle_transformed_messages(
                         downstream_bytes=byte_count,
                     )
                 )
+                record_error(
+                    phase="stream",
+                    channel=alias,
+                    model=model_out,
+                    api_format=api_format,
+                    code=(
+                        exc.code
+                        if isinstance(exc, ProtocolTransformError)
+                        else None
+                    ),
+                    exc_type=type(exc).__name__,
+                    route=route_name,
+                )
                 transport = request.transport
                 if transport is not None:
                     transport.abort()
@@ -2767,6 +2908,8 @@ async def _handle_transformed_messages(
             raise RouteTargetExhausted(
                 429 if exc.reason == "cooldown" else 503,
                 str(exc.retry_after) if exc.retry_after is not None else None,
+                alias=alias,
+                evidence_message=sanitize_error_text(str(exc)),
             ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -2887,9 +3030,30 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             403: "permission_error",
             429: "rate_limit_error",
         }.get(status, "api_error")
+        message = f"hub: route '{route_name}' exhausted all {len(targets)} targets"
+        # Name the last rejection's real reason so quota/rate-limit text from
+        # the upstream survives route failover instead of dying in the log.
+        detail = ""
+        if last_exhausted.evidence_code:
+            detail += f" ({last_exhausted.evidence_code})"
+        if last_exhausted.evidence_message:
+            detail += f": {last_exhausted.evidence_message}"
+        if detail:
+            source = (
+                f"'{last_exhausted.alias}'" if last_exhausted.alias else "target"
+            )
+            message += f"; last {source} upstream {status}{detail}"
+        record_error(
+            phase="route",
+            channel=last_exhausted.alias,
+            status=status,
+            code=last_exhausted.evidence_code,
+            message=last_exhausted.evidence_message,
+            route=route_name,
+        )
         response = anthropic_error(
             status,
-            f"hub: route '{route_name}' exhausted all {len(targets)} targets",
+            message,
             error_type,
         )
         if route_name is not None:
@@ -3038,10 +3202,7 @@ async def _forward_to_channel(
                 # Every account and transport of this target rejected the
                 # request before any content was generated; the buffered body
                 # is still safely replayable against the next route target.
-                raise RouteTargetExhausted(
-                    upstream.status,
-                    upstream.headers.get("retry-after"),
-                )
+                raise await _route_target_exhausted(upstream, alias)
             if is_count and upstream.status in (404, 405, 501):
                 estimate = _estimated_input_tokens(payload)
                 log(
@@ -3125,7 +3286,9 @@ async def _forward_to_channel(
             stream_telemetry = StreamTelemetry(started_at=started)
             sse_tracker = _SSETerminalTracker() if streamed else None
             usage_tracker = _SSEUsageTracker() if streamed else None
-            json_buf = bytearray() if not streamed and upstream.status == 200 else None
+            # Error bodies are buffered too, so the journal can name the
+            # real upstream reason even on the byte-transparent native path.
+            json_buf = bytearray() if not streamed else None
             try:
                 async for chunk in upstream.content.iter_any():
                     stream_telemetry.observe(chunk)
@@ -3166,6 +3329,19 @@ async def _forward_to_channel(
                         downstream_bytes=byte_count,
                     )
                 )
+                record_error(
+                    phase="stream",
+                    channel=alias,
+                    model=model_out,
+                    api_format="anthropic",
+                    code=(
+                        exc.code
+                        if isinstance(exc, ProtocolTransformError)
+                        else None
+                    ),
+                    exc_type=type(exc).__name__,
+                    route=route_name,
+                )
                 transport = request.transport
                 if transport is not None:
                     transport.abort()
@@ -3183,6 +3359,14 @@ async def _forward_to_channel(
                         terminal="missing",
                         downstream_bytes=byte_count,
                     )
+                )
+                record_error(
+                    phase="stream",
+                    channel=alias,
+                    model=model_out,
+                    api_format="anthropic",
+                    exc_type="IncompleteSSE",
+                    route=route_name,
                 )
                 transport = request.transport
                 if transport is not None:
@@ -3229,6 +3413,27 @@ async def _forward_to_channel(
                         else "unavailable"
                     ),
                 )
+            elif not streamed and upstream.status >= 400:
+                evidence_code = None
+                evidence_message = None
+                if json_buf is not None:
+                    try:
+                        decoded = json.loads(bytes(json_buf).decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        decoded = bytes(json_buf).decode("utf-8", "replace")
+                    evidence_code, evidence_message = upstream_error_evidence(
+                        decoded
+                    )
+                record_error(
+                    phase="response",
+                    channel=alias,
+                    model=model_out,
+                    api_format="anthropic",
+                    status=upstream.status,
+                    code=evidence_code,
+                    message=evidence_message,
+                    route=route_name,
+                )
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
                 f"{upstream.status} {'stream' if streamed else 'json'} "
@@ -3255,6 +3460,8 @@ async def _forward_to_channel(
             raise RouteTargetExhausted(
                 429 if exc.reason == "cooldown" else 503,
                 str(exc.retry_after) if exc.retry_after is not None else None,
+                alias=alias,
+                evidence_message=sanitize_error_text(str(exc)),
             ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -3752,6 +3959,141 @@ def cli_logs(args: list[str]) -> None:
     os.execvp("tail", ["tail", "-n", lines, str(path)])
 
 
+def _load_error_rows(path: Path, limit: int) -> tuple[list[dict], int]:
+    """Read the newest journal rows without following special paths.
+
+    Returns ``(rows, skipped)``. Rows lacking a string ``phase`` come from an
+    earlier debug build that also stored request payloads; they are counted and
+    dropped so stale entries never reach the terminal.
+    """
+    rows: list[dict] = []
+    skipped = 0
+    for candidate in (path.with_name(path.name + ".1"), path):
+        fd: int | None = None
+        try:
+            expected = candidate.lstat()
+            if not stat.S_ISREG(expected.st_mode):
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(candidate, flags)
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or (
+                opened.st_dev,
+                opened.st_ino,
+            ) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                continue
+            with os.fdopen(fd, encoding="utf-8") as fp:
+                fd = None
+                for line in fp:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeError):
+                        skipped += 1
+                        continue
+                    if not isinstance(row, dict) or not isinstance(
+                        row.get("phase"), str
+                    ):
+                        skipped += 1
+                        continue
+                    rows.append(row)
+        except (OSError, UnicodeError):
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return rows[-limit:], skipped
+
+
+def _format_error_row(row: dict, phase_width: int) -> str:
+    """Render one journal row; every field is optional and already sanitized."""
+    stamp = "?"
+    ts = row.get("ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except (OSError, OverflowError, ValueError):
+            stamp = "?"
+    phase = row.get("phase")
+    target = row.get("channel") if isinstance(row.get("channel"), str) else "-"
+    model = row.get("model")
+    if isinstance(model, str) and model:
+        target = f"{target}/{model}"
+    api_format = row.get("format")
+    if isinstance(api_format, str) and api_format and api_format != "anthropic":
+        target = f"{target} ({api_format})"
+    parts = [stamp, f"{phase:<{phase_width}}", target]
+    status = row.get("status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(str(status))
+    labels = [
+        value
+        for value in (row.get("code"), row.get("exc"))
+        if isinstance(value, str) and value
+    ]
+    if labels:
+        parts.append("/".join(labels))
+    message = row.get("message")
+    if isinstance(message, str) and message:
+        parts.append(message)
+    route = row.get("route")
+    if isinstance(route, str) and route:
+        parts.append(f"[route {route}]")
+    return "  ".join(parts)
+
+
+def cli_errors(args: list[str]) -> None:
+    """Show the sanitized error journal so past upstream failures stay findable.
+
+    This is the read side of ``record_error``: the reason an upstream gave for
+    a rejection survives the request that hit it, which is the whole point of
+    the journal.
+    """
+    limit = 20
+    if "-n" in args:
+        try:
+            limit = int(args[args.index("-n") + 1])
+        except (IndexError, ValueError):
+            limit = 0
+        if limit < 1:
+            print(
+                "claude-hub errors: -n needs a positive integer",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    path = errors_path()
+    rows, skipped = _load_error_rows(path, limit)
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        mode = 0
+    if mode and stat.S_ISREG(mode) and mode & 0o077:
+        print(
+            f"warning: {path} is group/other-readable; "
+            "the hub tightens it to 0600 on its next error write"
+        )
+    if not rows:
+        print(f"no error records yet: {path}")
+    else:
+        phase_width = max(len(str(row.get("phase"))) for row in rows)
+        for row in rows:
+            print(_format_error_row(row, phase_width))
+    if skipped:
+        print(
+            f"\n{skipped} stale record(s) skipped (pre-journal debug format, "
+            f"may contain request payloads); remove with: rm {path}"
+        )
+
+
 USAGE = """claude-hub — local multi-channel Anthropic gateway
 
 Usage:
@@ -3760,11 +4102,13 @@ Usage:
   claude-hub doctor           run local read-only readiness checks
   claude-hub check [alias]    make a real one-token connectivity check
   claude-hub logs [-n N|-f]   show routing logs
+  claude-hub errors [-n N]    show sanitized upstream failure reasons
 
 Environment:
   CLAUDE_HUB_CONFIG           config JSON path
   CLAUDE_HUB_DB               CC Switch SQLite path
   CLAUDE_HUB_LOG              log path
+  CLAUDE_HUB_ERRORS           error-journal path
   CLAUDE_HUB_PORT             listen-port override
   CLAUDE_HUB_LOCAL_TOKEN      local auth-token override
 """
@@ -3786,6 +4130,8 @@ def main() -> None:
             asyncio.run(cli_check(args[1] if len(args) > 1 else None))
         elif command == "logs":
             cli_logs(args[1:])
+        elif command == "errors":
+            cli_errors(args[1:])
         else:
             print(USAGE)
             raise SystemExit(
