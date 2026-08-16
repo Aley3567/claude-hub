@@ -31,7 +31,12 @@ usage 日志、统计和终端图表，launcher 只选择当前 Hub 对应的日
 
 监听 `127.0.0.1`，让一个长会话用原生 `/model channel,model` 切换渠道 + 模型；请求发生时才从 CC Switch DB 只读取上游与凭证，本文件不含凭证。`get_providers()` 带进程内快照缓存：以主库+WAL 指纹为 revision，命中时零复制（权限检查仍在每次调用先执行，fail closed）；测试隔离用 `reset_caches()`。正常由启动器拉起时通过 `SockSite` 接管继承的监听 FD；直接执行 `serve` 时仍由 `TCPSite` 自行绑定配置端口。
 
-关键接口：`resolve_provider` / `_read_provider_rows`（只读取上游）、`_post_with_account_failover`（只在下游响应开始前处理 `401/403/429`）、`check_local_auth`（本地 token 鉴权 `CLAUDE_HUB_LOCAL_TOKEN`）、`validate_upstream_url`（上游 URL 与地址边界校验）、`create_app`（aiohttp 应用）。CLI：`serve` / `list` / `doctor` / `check` / `logs`。
+关键接口：`resolve_provider` / `_read_provider_rows`（只读取上游）、`_post_with_account_failover`（只在下游响应开始前处理 `401/403/429`）、`check_local_auth`（本地 token 鉴权 `CLAUDE_HUB_LOCAL_TOKEN`）、`validate_upstream_url`（上游 URL 与地址边界校验）、`create_app`（aiohttp 应用）。CLI：`serve` / `list` / `doctor` / `check` / `logs` / `errors`。
+
+上游报错原因既进下游响应也进脱敏 journal：`record_error` 追加到
+`errors_path()`（`0600`、单份轮转、异常静默、绝不写 payload），`cli_errors`
+是唯一读取入口并过滤掉缺 `phase` 的历史调试行。`RouteTargetExhausted` 携带
+上游证据，让路由耗尽的报错能点名最后一个目标的真实原因。
 
 ### `claude1_account_pool.py` — 多账号调度（零第三方依赖）
 
@@ -47,7 +52,7 @@ usage 日志、统计和终端图表，launcher 只选择当前 Hub 对应的日
 `claude1_protocol_usage.py`。外部调用仍从 `claude1_protocol` 导入；不要把这些
 规则复制回兼容入口，也不要为每个小 helper 新建浅 module。
 
-关键接口：`provider_api_format`（按 CC Switch 优先级解析格式，未知值 fail-closed 回落 anthropic）、`transform_request` / `transform_response` / `transform_error`、`AnthropicStreamBridge` + `SSEParser`（流式）。
+关键接口：`provider_api_format`（按 CC Switch 优先级解析格式，未知值 fail-closed 回落 anthropic）、`transform_request` / `transform_response` / `transform_error`、`AnthropicStreamBridge` + `SSEParser`（流式）、`upstream_error_evidence` + `sanitize_error_text`（上游报错取证与脱敏，预流与流中两条路径共用同一套规则）。
 
 ## 关键边界
 
