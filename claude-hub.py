@@ -1772,6 +1772,13 @@ def ensure_1m_beta(headers, model_out: str) -> None:
     headers["anthropic-beta"] = ",".join(unique_values)
 
 
+def upstream_model_id(model_out: str) -> str:
+    """Remove Claude Code's client-side 1M selector from the wire model ID."""
+    if model_out.casefold().endswith("[1m]"):
+        return model_out[:-4]
+    return model_out
+
+
 def upstream_headers(request: web.Request, token: str) -> CIMultiDict:
     strip = REQ_STRIP | _connection_header_tokens(request.headers)
     headers = CIMultiDict()
@@ -2924,7 +2931,10 @@ async def _forward_to_channel(
     account_pool = _RequestAccountPool(provider, providers)
     route_headers = {"x-hub-route": route_name} if route_name else {}
 
-    payload["model"] = model_out
+    # ``[1m]`` selects Claude Code's 1M context mode; it is not part of the
+    # provider's model ID.  Keep ``model_out`` for routing/telemetry and beta
+    # header selection, but never send the selector in the JSON model field.
+    payload["model"] = upstream_model_id(model_out)
     api_format = provider.get("api_format", "anthropic")
     if provider.get("is_full_url") and request.query_string:
         return anthropic_error(
