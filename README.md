@@ -368,6 +368,32 @@ print("导入", len(seen), "条")
 EOF
 ```
 
+## 可选：查看上游真实报错原因
+
+渠道出问题时，客户端往往只看到一个干巴巴的 `400` 或响应中途断开，而上游其实
+说清了原因（例如「5 小时限额已用完」「用户额度不足」）。Hub 会把这类原因在两
+个地方保留下来：
+
+- **实时**：非流式错误的原因写进下游 error 消息与 `x-hub-upstream-code` 响应
+  头；流式错误改为发一个终态 `error` 事件而不是静默断连；路由耗尽的报错会点
+  名最后一个目标的真实原因。
+- **事后**：追加一行到 `~/.cc-switch/logs/claude-hub-errors.jsonl`（权限
+  `0600`，单份轮转，只存脱敏后的 code / message 与渠道、模型、状态码，**不存
+  任何请求或响应 payload**）。命名 hub 各自写 `<hub>-errors.jsonl`。
+
+```bash
+~/.claude/scripts/claude-hub.py errors          # 最近 20 条
+~/.claude/scripts/claude-hub.py errors -n 100   # 最近 100 条
+```
+
+输出每行是「时间 / 阶段（response·stream·route）/ 渠道·模型 / 状态码 /
+code / 原因」。转发路径上的任何 journal 写入失败都被静默吞掉，不会影响请求
+本身。
+
+消息在写入和转发前都会过一遍脱敏：`Bearer` token、URL、`token=` / `api_key:`
+这类赋值形状、`sk-` 前缀的 key 一律替换为占位符，长度截断到 512 字节。中文原
+因不受影响。
+
 ## 安装位置与备份
 
 默认位置：
