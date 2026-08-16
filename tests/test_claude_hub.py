@@ -3258,7 +3258,7 @@ class ClaudeHubTests(unittest.TestCase):
             "context-1m-2025-08-07",
         )
         forwarded = json.loads(kwargs["data"])
-        self.assertEqual(forwarded["model"], "upstream-sonnet[1m]")
+        self.assertEqual(forwarded["model"], "upstream-sonnet")
 
         rejected_session = FakeSession()
         rejected = FakeRequest(rejected_session, "wrong-token")
