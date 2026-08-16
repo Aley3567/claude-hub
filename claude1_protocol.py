@@ -3672,6 +3672,35 @@ def transform_response(body: dict, api_format: str) -> dict:
     return prepare_response(body, api_format).payload
 
 
+# Credential-shaped fragments must never survive into downstream error text,
+# because these messages travel through mid-stream SSE and response bodies
+# that clients may echo into logs or UIs.
+_ERROR_TEXT_ASSIGNMENT = re.compile(
+    r"(?i)\b("
+    r"token|secret|password|passwd|authorization|credential"
+    r"|api[-_]?key|access[-_]?token|refresh[-_]?token|key"
+    r")\s*[=:]\s*\S+"
+)
+_ERROR_TEXT_KEY_SHAPE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
+
+
+def sanitize_error_text(text: str) -> str | None:
+    """Bound and redact one line of upstream error text for downstream reuse."""
+    candidate = text.strip()[:512]
+    candidate = re.sub(
+        r"(?i)\bBearer\s+\S+",
+        "Bearer [redacted-token]",
+        candidate,
+    )
+    candidate = re.sub(r"(?i)https?://\S+", "[redacted-url]", candidate)
+    candidate = _ERROR_TEXT_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=[redacted]", candidate
+    )
+    candidate = _ERROR_TEXT_KEY_SHAPE.sub("[redacted-key]", candidate)
+    candidate = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()
+    return candidate or None
+
+
 def upstream_error_evidence(body: object) -> tuple[str | None, str | None]:
     """Extract sanitized (code, message) evidence from an upstream error body.
 
@@ -3682,6 +3711,9 @@ def upstream_error_evidence(body: object) -> tuple[str | None, str | None]:
     not collapse to an opaque status-only fallback. Numeric codes (common for
     OpenAI-compatible providers) are accepted alongside strings; anything that
     is not a short identifier becomes None rather than being forwarded.
+    Besides the canonical ``{"error": {...}}`` envelope, common relay shapes
+    (top-level ``message``/``detail``/``msg``, string ``error``) are accepted
+    so gateways that skip the envelope still surface their real reason.
     """
     if isinstance(body, str):
         try:
@@ -3693,6 +3725,17 @@ def upstream_error_evidence(body: object) -> tuple[str | None, str | None]:
     error = body.get("error") if isinstance(body, dict) else None
     source_code = error.get("code") if isinstance(error, dict) else None
     source_message = error.get("message") if isinstance(error, dict) else None
+    if source_message is None and isinstance(body, dict):
+        if isinstance(error, str) and error.strip():
+            source_message = error
+        else:
+            for field in ("message", "detail", "msg"):
+                value = body.get(field)
+                if isinstance(value, str) and value.strip():
+                    source_message = value
+                    break
+        if source_message is not None and source_code is None:
+            source_code = body.get("code")
     if isinstance(source_message, str):
         try:
             nested_body = json.loads(source_message)
@@ -3718,16 +3761,7 @@ def upstream_error_evidence(body: object) -> tuple[str | None, str | None]:
     )
     safe_message = None
     if isinstance(source_message, str) and source_message.strip():
-        candidate = source_message.strip()[:512]
-        candidate = re.sub(
-            r"(?i)\bBearer\s+\S+",
-            "Bearer [redacted-token]",
-            candidate,
-        )
-        candidate = re.sub(r"(?i)https?://\S+", "[redacted-url]", candidate)
-        candidate = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()
-        if candidate:
-            safe_message = candidate
+        safe_message = sanitize_error_text(source_message)
     return safe_code, safe_message
 
 
@@ -6108,6 +6142,46 @@ class AnthropicStreamBridge:
         )
 
     def _feed_chat(self, payload: dict) -> list[bytes]:
+        if payload.get("error") is not None:
+            # OpenAI-compatible chat gateways surface quota/rate failures as a
+            # bare {"error": ...} SSE frame; treat it as the terminal event and
+            # forward the sanitized reason instead of failing the transform.
+            error_value = payload["error"]
+            if not isinstance(error_value, (dict, str)):
+                raise ProtocolTransformError(
+                    "OpenAI Chat stream error must be an object or string",
+                    code="HUB_UPSTREAM_RESPONSE_INVALID",
+                    path="$.error",
+                )
+            evidence_code, evidence_message = upstream_error_evidence(
+                {"error": error_value}
+            )
+            if not evidence_code and not evidence_message:
+                self._observe_stream_degradation(
+                    "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
+                    "upstream error detail has no exact Anthropic streaming carrier",
+                )
+            downstream_message = "upstream request failed"
+            if evidence_code:
+                downstream_message += f" ({evidence_code})"
+            if evidence_message:
+                downstream_message += f": {evidence_message}"
+            self.fsm.mark_error()
+            self.fsm.close_stream()
+            self.upstream_terminal = True
+            self.stopped = True
+            return [
+                sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": downstream_message,
+                        },
+                    },
+                )
+            ]
         allowed_payload_fields = {
             "id",
             "object",
@@ -6659,11 +6733,30 @@ class AnthropicStreamBridge:
                         code="HUB_UPSTREAM_RESPONSE_INVALID",
                         path=error_path,
                     )
-            if any(error_value is not None for _, error_value in error_values):
+            evidence_code = None
+            evidence_message = None
+            for _error_path, error_value in error_values:
+                if not isinstance(error_value, dict):
+                    continue
+                evidence_code, evidence_message = upstream_error_evidence(
+                    {"error": error_value}
+                )
+                if evidence_code or evidence_message:
+                    break
+            if (
+                not evidence_code
+                and not evidence_message
+                and any(error_value is not None for _, error_value in error_values)
+            ):
                 self._observe_stream_degradation(
                     "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
                     "upstream error detail has no exact Anthropic streaming carrier",
                 )
+            downstream_message = "upstream request failed"
+            if evidence_code:
+                downstream_message += f" ({evidence_code})"
+            if evidence_message:
+                downstream_message += f": {evidence_message}"
             self.fsm.mark_error()
             self.fsm.close_stream()
             self.upstream_terminal = True
@@ -6675,7 +6768,7 @@ class AnthropicStreamBridge:
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": "upstream request failed",
+                            "message": downstream_message,
                         },
                     },
                 )
