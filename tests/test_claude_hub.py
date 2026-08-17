@@ -1754,7 +1754,7 @@ class ClaudeHubTests(unittest.TestCase):
             bytearray(b"ab"),
         )
 
-    def test_transformed_stream_type_errors_abort_the_started_response(self):
+    def test_transformed_stream_type_errors_return_a_terminal_sse_error(self):
         upstream = _FakeUpstream(
             200,
             {"Content-Type": "text/event-stream"},
@@ -1783,11 +1783,105 @@ class ClaudeHubTests(unittest.TestCase):
             "api_format": "openai_chat",
             "base_url": "https://upstream.invalid/v1",
             "token": "fixture-upstream-token",
+            "name": "Fixture HTTPS",
         }
         with mock.patch.object(hub, "AnthropicStreamBridge", TypeFailingBridge), mock.patch.object(
             hub.web, "StreamResponse", return_value=downstream
         ), mock.patch.object(hub, "log") as write_log:
-            with self.assertRaises(hub.UpstreamStreamAborted):
+            response = asyncio.run(
+                hub._handle_transformed_messages(
+                    request,
+                    cfg=hub.get_config(),
+                    provider=provider,
+                    payload={"model": "model", "messages": [], "stream": True},
+                    alias="fast",
+                    model_in="fast,model",
+                    model_out="model",
+                    started=0,
+                )
+            )
+        self.assertIs(response, downstream)
+        self.assertFalse(request.transport.aborted)
+        self.assertTrue(downstream.eof)
+        self.assertEqual(len(session.calls), 1)
+        rendered = b"".join(downstream.writes)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        self.assertIn(
+            "HUB_STREAM_TRANSLATION_FAILED",
+            error_payload["error"]["message"],
+        )
+        self.assertIn("TypeError", error_payload["error"]["message"])
+        rendered_log = "\n".join(
+            call.args[0] for call in write_log.call_args_list
+        )
+        self.assertIn("first_chunk_ms=", rendered_log)
+        self.assertIn("max_gap_ms=", rendered_log)
+        self.assertIn("chunks=1", rendered_log)
+        self.assertIn("upstream_bytes=15", rendered_log)
+        self.assertIn("downstream_bytes=0", rendered_log)
+        self.assertIn("terminal=error", rendered_log)
+        self.assertIn("error=TypeError", rendered_log)
+
+    def test_translated_stream_error_keeps_code_after_long_provider_name(self):
+        exc = hub.ProtocolTransformError(
+            "upstream usage conflicts with its base counters",
+            code="HUB_UPSTREAM_USAGE_INVALID",
+            path="$.usage.total_tokens",
+        )
+
+        code, message = hub.translated_stream_error_evidence(
+            exc,
+            provider_name="provider-" + ("x" * 900),
+            api_format="openai_chat",
+        )
+
+        self.assertEqual(code, "HUB_UPSTREAM_USAGE_INVALID")
+        self.assertIn("HUB_UPSTREAM_USAGE_INVALID", message)
+        self.assertIn("$.usage.total_tokens", message)
+        self.assertLessEqual(len(message), 512)
+
+    def test_transformed_stream_aborts_only_if_terminal_error_cannot_be_written(self):
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [b"data: fixture\n\n"],
+        )
+        request = self._request(
+            {"model": "fast,model", "messages": [], "stream": True},
+            session=_FakeSession(upstream),
+        )
+
+        class TypeFailingBridge:
+            def __init__(self, _api_format):
+                pass
+
+            def feed(self, _event, _data):
+                raise TypeError("invalid upstream usage")
+
+        class ErrorWriteFailingDownstream(_FakeDownstream):
+            async def write(self, chunk):
+                if chunk.startswith(b"event: error\n"):
+                    raise aiohttp.ClientConnectionError("downstream closed")
+                await super().write(chunk)
+
+        downstream = ErrorWriteFailingDownstream(200)
+        provider = {
+            "api_format": "openai_chat",
+            "base_url": "https://upstream.invalid/v1",
+            "token": "fixture-upstream-token",
+            "name": "Fixture HTTPS",
+        }
+        with mock.patch.object(
+            hub, "AnthropicStreamBridge", TypeFailingBridge
+        ), mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            with self.assertRaisesRegex(
+                hub.UpstreamStreamAborted,
+                "downstream closed while receiving a protocol error",
+            ):
                 asyncio.run(
                     hub._handle_transformed_messages(
                         request,
@@ -1800,18 +1894,381 @@ class ClaudeHubTests(unittest.TestCase):
                         started=0,
                     )
                 )
+
         self.assertTrue(request.transport.aborted)
-        self.assertEqual(len(session.calls), 1)
-        rendered_log = "\n".join(
-            call.args[0] for call in write_log.call_args_list
+        self.assertFalse(downstream.eof)
+
+    def test_transformed_protocol_error_is_returned_as_terminal_sse_error(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
         )
-        self.assertIn("first_chunk_ms=", rendered_log)
-        self.assertIn("max_gap_ms=", rendered_log)
-        self.assertIn("chunks=1", rendered_log)
-        self.assertIn("upstream_bytes=15", rendered_log)
-        self.assertIn("downstream_bytes=0", rendered_log)
-        self.assertIn("terminal=error", rendered_log)
-        self.assertIn("error=TypeError", rendered_log)
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":3,'
+                b'"completion_tokens":1,"total_tokens":5}}\n\n',
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b'"text":"partial"', rendered)
+        self.assertIn(b"event: error\n", rendered)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        message = error_payload["error"]["message"]
+        self.assertEqual(error_payload["type"], "error")
+        self.assertEqual(error_payload["error"]["type"], "api_error")
+        self.assertIn("Fixture HTTPS", message)
+        self.assertIn("HUB_UPSTREAM_USAGE_INVALID", message)
+        self.assertIn("$.usage.total_tokens", message)
+        self.assertIn("conflicts with its base usage counters", message)
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "stream")
+        self.assertEqual(row["format"], "openai_chat")
+        self.assertEqual(row["code"], "HUB_UPSTREAM_USAGE_INVALID")
+        self.assertIn("Fixture HTTPS", row["message"])
+        self.assertIn("$.usage.total_tokens", row["message"])
+
+    def test_responses_output_error_is_returned_as_terminal_sse_error(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/responses",
+            "openai_responses",
+        )
+        events = [
+            (
+                "response.created",
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_fixture", "model": "fixture-model"},
+                },
+            ),
+            (
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "partial",
+                },
+            ),
+            (
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
+                        "type": "message",
+                        "id": 7,
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                },
+            ),
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                hub.sse_event(event, payload)
+                for event, payload in events
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b'"text":"partial"', rendered)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        message = error_payload["error"]["message"]
+        self.assertIn("Fixture HTTPS", message)
+        self.assertIn("openai_responses", message)
+        self.assertIn("HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED", message)
+        self.assertIn("$.item.id", message)
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["format"], "openai_responses")
+        self.assertEqual(row["code"], "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED")
+        self.assertIn("$.item.id", row["message"])
+
+    def test_translated_error_event_is_journaled_as_failure_not_usage(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [b'data: {"error":{"vendor_detail":"opaque"}}\n\n'],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b"event: error\n", rendered)
+        self.assertTrue(downstream.eof)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertIn("HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED", row["deg"])
+        self.assertIn("HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED", row["deg"])
+        self.assertFalse(self.usage_file.exists())
+
+    def test_trailing_done_keeps_the_success_turn_and_its_usage(self):
+        """A relay's repeated [DONE] must not turn a good turn into an error.
+
+        Regression for R1: the second [DONE] used to raise HUB_SSE_LATE_EVENT,
+        which skipped the accounting exit entirely (usage lost) and appended a
+        second terminal after the client had already received message_stop.
+        """
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":11,"completion_tokens":3}}\n\n',
+                b"data: [DONE]\n\n",
+                b"data: [DONE]\n\n",
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b"event: message_stop\n", rendered)
+        self.assertNotIn(b"event: error\n", rendered)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(self.errors_file.exists())
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["in"], 11)
+        self.assertIn("HUB_DEGRADE_DUPLICATE_TERMINAL_SKIPPED", row["deg"])
+
+    def test_trailing_done_after_error_frame_keeps_the_upstream_reason(self):
+        """The most common relay order must not destroy the real reason.
+
+        Regression for R2: {"error": ...} then [DONE] used to journal
+        HUB_SSE_LATE_EVENT instead of the upstream's own quota reason, and sent
+        the client two terminals.
+        """
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+                b'data: {"error":{"type":"rate_limit_error",'
+                b'"message":"quota exhausted for org",'
+                b'"code":"insufficient_quota"}}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered = b"".join(downstream.writes)
+        self.assertEqual(rendered.count(b"event: error\n"), 1)
+        self.assertNotIn(b"event: message_stop\n", rendered)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertNotEqual(row.get("code"), "HUB_SSE_LATE_EVENT")
+        self.assertIn("quota exhausted for org", row["message"])
+        self.assertIn("HUB_DEGRADE_DUPLICATE_TERMINAL_SKIPPED", row["deg"])
+        self.assertFalse(self.usage_file.exists())
+
+    def test_translated_error_event_preserves_safe_error_evidence_without_usage(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"error":{"code":"quota_exhausted",'
+                b'"message":"fixture quota exhausted"}}\n\n'
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b"event: error\n", rendered)
+        self.assertIn(b"quota_exhausted", rendered)
+        self.assertIn(b"fixture quota exhausted", rendered)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["code"], "quota_exhausted")
+        self.assertEqual(row["message"], "fixture quota exhausted")
+        self.assertIn("HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED", row["deg"])
+        self.assertFalse(self.usage_file.exists())
+
+    def test_transformed_upstream_disconnect_is_returned_as_terminal_sse_error(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b'data: {"id":"chatcmpl_fixture","model":"fixture-model",'
+                b'"choices":[{"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n'
+            ],
+            fail_after=True,
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web,
+            "StreamResponse",
+            return_value=downstream,
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b'"text":"partial"', rendered)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        message = error_payload["error"]["message"]
+        self.assertIn("Fixture HTTPS", message)
+        self.assertIn("HUB_UPSTREAM_STREAM_INTERRUPTED", message)
+        self.assertIn("ClientPayloadError", message)
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["code"], "HUB_UPSTREAM_STREAM_INTERRUPTED")
+        self.assertEqual(row["exc"], "ClientPayloadError")
+        self.assertIn("Fixture HTTPS", row["message"])
 
     def test_transformed_stream_clean_eof_emits_anthropic_terminal_events(self):
         self._set_provider_endpoint(

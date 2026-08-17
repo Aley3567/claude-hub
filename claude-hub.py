@@ -1336,6 +1336,49 @@ def protocol_request_error(exc: ProtocolRequestError) -> web.Response:
     return response
 
 
+def translated_stream_error_evidence(
+    exc: Exception,
+    *,
+    provider_name: object,
+    api_format: str,
+) -> tuple[str, str]:
+    """Return a safe code/message for an OpenAI stream that cannot continue."""
+    safe_provider = sanitize_error_text(str(provider_name or "unknown provider"))
+    # Keep the diagnostic code/path visible within sanitize_error_text's
+    # bounded 512-character envelope even if a provider has a pathological
+    # display name.
+    safe_provider = (safe_provider or "unknown provider")[:80]
+    if isinstance(exc, ProtocolTransformError):
+        code = exc.code
+        location = f" at {exc.path}" if exc.path else ""
+        detail = sanitize_error_text(str(exc)) or (
+            "upstream response could not be translated safely"
+        )
+    elif isinstance(
+        exc,
+        (aiohttp.ClientError, asyncio.TimeoutError, OSError),
+    ):
+        code = "HUB_UPSTREAM_STREAM_INTERRUPTED"
+        location = ""
+        detail = f"upstream stream ended unexpectedly ({type(exc).__name__})"
+    elif isinstance(exc, (UnicodeDecodeError, ValueError, zlib.error)):
+        code = "HUB_UPSTREAM_STREAM_INVALID"
+        location = ""
+        detail = f"upstream stream could not be decoded safely ({type(exc).__name__})"
+    else:
+        code = "HUB_STREAM_TRANSLATION_FAILED"
+        location = ""
+        detail = f"local stream translation failed ({type(exc).__name__})"
+    message = (
+        f"{safe_provider} ({api_format}) "
+        f"{code}{location}: {detail}"
+    )
+    safe_message = sanitize_error_text(message) or (
+        f"upstream stream failed: {code}{location}"
+    )
+    return code, safe_message
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
@@ -2058,6 +2101,7 @@ class _SSETerminalTracker:
         self._line = bytearray()
         self._discarding_line = False
         self._event_type: bytes | None = None
+        self.terminal_kind: str | None = None
         self._event_has_data = False
         self._skip_leading_lf = False
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(
@@ -2163,6 +2207,7 @@ class _SSETerminalTracker:
                 and self._event_type in (b"message_stop", b"error")
             ):
                 self.terminal = True
+                self.terminal_kind = self._event_type.decode("ascii")
             self._event_type = None
             self._event_has_data = False
             return
@@ -2902,15 +2947,28 @@ async def _handle_transformed_messages(
                 ValueError,
                 zlib.error,
             ) as exc:
-                protocol_code = (
-                    f" {exc.code} {exc.path or '$'}"
+                runtime_warning_codes = tuple(
+                    getattr(bridge, "warning_codes", ())
+                )
+                warning_codes = tuple(
+                    dict.fromkeys(
+                        (*request_warning_codes, *runtime_warning_codes)
+                    )
+                )
+                error_code, message = translated_stream_error_evidence(
+                    exc,
+                    provider_name=account_attempt.provider.get("name") or alias,
+                    api_format=api_format,
+                )
+                error_path = (
+                    exc.path
                     if isinstance(exc, ProtocolTransformError)
-                    else ""
+                    else None
                 )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                    f"{api_format} stream failed after {byte_count}B: "
-                    f"{type(exc).__name__}{protocol_code} "
+                    f"{api_format} stream rejected after {byte_count}B: "
+                    f"{error_code} {error_path or '$'} "
                     + stream_telemetry_fields(
                         stream_telemetry,
                         terminal="error",
@@ -2923,27 +2981,53 @@ async def _handle_transformed_messages(
                     channel=alias,
                     model=model_out,
                     api_format=api_format,
-                    code=(
-                        exc.code
-                        if isinstance(exc, ProtocolTransformError)
-                        else None
-                    ),
+                    code=error_code,
+                    message=message,
                     exc_type=type(exc).__name__,
                     route=route_name,
+                    degrade_codes=warning_codes,
                 )
-                transport = request.transport
-                if transport is not None:
-                    transport.abort()
-                raise UpstreamStreamAborted(
-                    "translated upstream stream ended after response started"
-                ) from exc
+                if getattr(bridge, "stopped", False):
+                    # The client already received the upstream's real terminal,
+                    # so emitting another one here would fabricate a terminal
+                    # the upstream never sent. The failure is journaled above;
+                    # close the body without inventing a second terminal.
+                    try:
+                        await response.write_eof()
+                    except (aiohttp.ClientError, OSError):
+                        transport = request.transport
+                        if transport is not None:
+                            transport.abort()
+                    return response
+                terminal_error = sse_event(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": message,
+                        },
+                    },
+                )
+                try:
+                    await response.write(terminal_error)
+                    byte_count += len(terminal_error)
+                    await response.write_eof()
+                except (aiohttp.ClientError, OSError) as downstream_exc:
+                    transport = request.transport
+                    if transport is not None:
+                        transport.abort()
+                    raise UpstreamStreamAborted(
+                        "downstream closed while receiving a protocol error"
+                    ) from downstream_exc
+                return response
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
                 f"{api_format} 200 stream {time.monotonic() - started:.1f}s "
                 f"{byte_count}B "
                 + stream_telemetry_fields(
                     stream_telemetry,
-                    terminal="complete",
+                    terminal=("error" if bridge.error_terminal else "complete"),
                     downstream_bytes=byte_count,
                 )
             )
