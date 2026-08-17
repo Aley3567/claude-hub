@@ -4215,6 +4215,9 @@ class AnthropicStreamBridge:
     cache_write: int | None = None
     cache_creation_detail: dict[str, int] | None = None
     server_tool_usage_detail: dict[str, int] | None = None
+    error_terminal: bool = False
+    terminal_error_code: str | None = None
+    terminal_error_message: str | None = None
     thinking_signature: str | None = None
     thinking_has_delta: bool = False
     observations: list[str] = field(default_factory=list)
