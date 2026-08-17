@@ -218,6 +218,75 @@ class LauncherTuiLogicTests(unittest.TestCase):
                 self.assertFalse(changed)
                 self.assertIn("命令参数", message)
 
+    def test_fuzzy_provider_matching_never_searches_opaque_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                providers = [
+                    {
+                        "id": "id-containing-ca-but-unrelated",
+                        "name": "Unrelated Gateway One",
+                    },
+                    {"id": "another-ca-id", "name": "Unrelated Gateway Two"},
+                    {"id": "stable-target-id", "name": "Cascade Gateway"},
+                ]
+
+                matches, exact = launcher.match_providers(providers, "ca")
+
+                self.assertFalse(exact)
+                self.assertEqual(
+                    [provider["name"] for provider in matches],
+                    ["Cascade Gateway"],
+                )
+                self.assertEqual(
+                    launcher.choose(providers, "ca")["name"],
+                    "Cascade Gateway",
+                )
+                selected, exact = launcher.match_providers(
+                    providers, "id:id-containing-ca-but-unrelated"
+                )
+                self.assertTrue(exact)
+                self.assertEqual(selected[0]["name"], "Unrelated Gateway One")
+
+    def test_session_identity_is_model_visible_and_contains_no_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                settings = {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://private.invalid/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "fixture-secret-token",
+                        "ANTHROPIC_MODEL": "claude-opus-5[1m]",
+                        "CLAUDE1_PROVIDER_NAME": "Fixture Gateway",
+                        "CLAUDE1_PROVIDER_ID": "private-provider-id",
+                        "CLAUDE1_SESSION_SOURCE": "provider",
+                        "CLAUDE1_API_FORMAT": "openai_chat",
+                    }
+                }
+
+                args = launcher._claude_args_with_session_identity(
+                    settings,
+                    [
+                        "--append-system-prompt",
+                        "caller instructions",
+                        "-p",
+                        "--",
+                        "which channel?",
+                    ],
+                )
+
+                self.assertEqual(args[0], "--append-system-prompt")
+                prompt = args[1]
+                self.assertIn("caller instructions", prompt)
+                self.assertIn("Fixture Gateway", prompt)
+                self.assertIn("openai_chat", prompt)
+                self.assertIn("claude-opus-5[1m]", prompt)
+                self.assertIn("未经验证的隐藏上游", prompt)
+                self.assertNotIn("fixture-secret-token", prompt)
+                self.assertNotIn("private.invalid", prompt)
+                self.assertNotIn("private-provider-id", prompt)
+                self.assertEqual(args[2:], ["-p", "--", "which channel?"])
+
     def test_duplicate_names_migrate_to_stable_ids_without_collapsing(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -1207,6 +1276,7 @@ class ProviderModelEffortOverrideTests(unittest.TestCase):
         self.assertEqual(
             settings["env"]["CLAUDE1_PROVIDER_NAME"], self._provider()["name"]
         )
+        self.assertEqual(settings["env"]["CLAUDE1_API_FORMAT"], "anthropic")
         self.assertNotIn("effortLevel", settings)
 
     def test_build_settings_ignores_invalid_override_values(self) -> None:
@@ -1819,6 +1889,42 @@ class LauncherSafetyTests(unittest.TestCase):
                     self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL"], "")
                     self.assertEqual(env[f"ANTHROPIC_DEFAULT_{tier}_MODEL_NAME"], "")
                 self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "")
+
+    def test_build_settings_seals_main_model_for_a_slots_only_provider(self) -> None:
+        # A provider that configures slots but no bare ANTHROPIC_MODEL used to
+        # inherit that key from ~/.claude/settings.json, where CC Switch syncs
+        # its current provider. That key outranks every slot, so the session
+        # was pinned to a foreign model and /model could not override it.
+        provider = {
+            "id": "slots-only",
+            "name": "Fixture Slots Only",
+            "settings_config": json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://api.example.com",
+                        "ANTHROPIC_AUTH_TOKEN": "tok",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5[1M]",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "claude-opus-5",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-5[1M]",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "claude-opus-5",
+                        "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5[1M]",
+                    }
+                }
+            ),
+            "meta": "{}",
+            "provider_type": None,
+        }
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                env = launcher.build_settings(provider)["env"]
+
+        # Sealed, not absent: an absent key falls through from user settings.
+        self.assertIn("ANTHROPIC_MODEL", env)
+        self.assertEqual(env["ANTHROPIC_MODEL"], "")
+        # The provider's own slots still decide which models the session sees.
+        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5[1M]")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-opus-5[1M]")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "")
 
     def test_explicit_proxy_removes_the_api_host_from_no_proxy_case_insensitively(self) -> None:
         provider = {
@@ -2711,6 +2817,36 @@ class LauncherSafetyTests(unittest.TestCase):
                 self.assertIn("fatal upstream auth error", message)
                 # 日志尾部有界 4 KiB：更靠前的填充内容不得进入错误消息。
                 self.assertNotIn("x" * 5000, message)
+
+    def test_protocol_bridge_errors_journal_outlives_the_temp_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(self._bridge_fixture(raw_home)) as launcher:
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                with mock.patch.object(
+                    launcher.subprocess, "Popen", return_value=process
+                ) as popen, mock.patch.object(
+                    launcher, "hub_healthy", return_value=True
+                ), mock.patch.object(
+                    launcher, "launch_with_settings", return_value=0
+                ):
+                    result = launcher.launch_with_protocol_bridge(
+                        {"id": "chat-provider", "name": "Chat Provider"},
+                        {"env": {}},
+                        "openai_chat",
+                        [],
+                    )
+
+                self.assertEqual(result, 0)
+                env = popen.call_args.kwargs["env"]
+                log_file = Path(env["CLAUDE_HUB_LOG"])
+                errors_file = Path(env["CLAUDE_HUB_ERRORS"])
+                # hub.log 随临时目录销毁；errors journal 必须落在目录外的
+                # 持久位置，否则桥路径的上游错误随会话退出被抹掉，
+                # `claude-hub errors` 永远读不到。
+                self.assertEqual(errors_file, launcher.BRIDGE_ERRORS_PATH)
+                self.assertFalse(errors_file.is_relative_to(log_file.parent))
 
     def test_protocol_bridge_ensures_the_local_gateway_for_the_original_url(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
@@ -3990,6 +4126,7 @@ class HubWorkspaceTests(unittest.TestCase):
                     Path("hub.json"),
                     Path("hub.log"),
                     Path("usage.jsonl"),
+                    Path("hub-errors.jsonl"),
                 )
                 status = launcher.HubStatus(
                     port=18787,
@@ -4385,6 +4522,115 @@ class HubWorkspaceTests(unittest.TestCase):
 
             self.assertIn("请求数        2", output.getvalue())
             self.assertIn("输入 token    20  (20)", output.getvalue())
+
+    def test_usage_counts_degrade_codes_and_accepts_legacy_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            now = time.time()
+            with loaded_launcher(env) as launcher:
+                hubs = launcher.list_hub_refs()
+                hubs[0].usage_path.parent.mkdir(parents=True, exist_ok=True)
+                hubs[0].usage_path.write_text(
+                    json.dumps({"ts": now, "in": 3}) + "\n",
+                    encoding="utf-8",
+                )
+                hubs[1].usage_path.parent.mkdir(parents=True, exist_ok=True)
+                hubs[1].usage_path.write_text(
+                    json.dumps(
+                        {
+                            "ts": now,
+                            "in": 5,
+                            "deg": [
+                                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"
+                            ],
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(launcher.cli_usage(["--day"]), 0)
+
+            rendered = output.getvalue()
+            self.assertIn("协议降级", rendered)
+            self.assertIn(
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED  1",
+                rendered,
+            )
+            self.assertIn("请求数        2", rendered)
+
+    def _mock_hub_errors_renderer(self):
+        """Return a fake hub module whose cli_errors can be asserted on."""
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake_cli_errors(args: list[str]) -> None:
+            calls.append((list(args), os.environ.get("CLAUDE_HUB_ERRORS")))
+
+        fake_module = SimpleNamespace(cli_errors=fake_cli_errors, calls=calls)
+        spec = mock.Mock()
+        spec.loader = mock.Mock()
+        spec.loader.exec_module = lambda _module: None
+        patcher_spec = mock.patch(
+            "importlib.util.spec_from_file_location", return_value=spec
+        )
+        patcher_module = mock.patch(
+            "importlib.util.module_from_spec", return_value=fake_module
+        )
+        return fake_module, patcher_spec, patcher_module
+
+    def test_errors_uses_legacy_hub_errors_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                fake_module, patcher_spec, patcher_module = (
+                    self._mock_hub_errors_renderer()
+                )
+                with patcher_spec, patcher_module:
+                    self.assertEqual(launcher.cli_errors([]), 0)
+
+                expected = Path(env["CLAUDE1_HUB_LOG"]).with_name(
+                    Path(env["CLAUDE1_HUB_LOG"]).stem + "-errors.jsonl"
+                )
+                self.assertEqual(fake_module.calls, [([], str(expected))])
+
+    def test_errors_uses_current_named_hub_errors_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = self._multi_hub_env(Path(raw_home))
+            with loaded_launcher(env) as launcher:
+                refs = launcher.list_hub_refs()
+                default_hub = refs[0]
+                fake_module, patcher_spec, patcher_module = (
+                    self._mock_hub_errors_renderer()
+                )
+                with patcher_spec, patcher_module:
+                    self.assertEqual(launcher.cli_errors(["-n", "5"]), 0)
+
+                self.assertEqual(
+                    default_hub.errors_path,
+                    default_hub.log_path.with_name(
+                        default_hub.log_path.stem + "-errors.jsonl"
+                    ),
+                )
+                self.assertEqual(
+                    fake_module.calls,
+                    [(["-n", "5"], str(default_hub.errors_path))],
+                )
+
+    def test_errors_restores_prior_claude_hub_errors_env(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            env = isolated_env(Path(raw_home))
+            env["CLAUDE_HUB_ERRORS"] = "/prior/errors.jsonl"
+            with loaded_launcher(env) as launcher:
+                fake_module, patcher_spec, patcher_module = (
+                    self._mock_hub_errors_renderer()
+                )
+                with patcher_spec, patcher_module:
+                    self.assertEqual(launcher.cli_errors([]), 0)
+
+                self.assertEqual(
+                    os.environ.get("CLAUDE_HUB_ERRORS"), "/prior/errors.jsonl"
+                )
 
     def test_exec_hub_model_inherits_unique_slot_effort_and_forwards_cli_effort(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

@@ -782,6 +782,9 @@ class StreamingTransformTests(unittest.TestCase):
             [chunk.decode().splitlines()[0] for chunk in chunks],
             ["event: error"],
         )
+        self.assertTrue(bridge.error_terminal)
+        self.assertIsNone(bridge.terminal_error_code)
+        self.assertEqual(bridge.terminal_error_message, "boom")
 
     def test_duplicate_responses_done_is_idempotent(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")
