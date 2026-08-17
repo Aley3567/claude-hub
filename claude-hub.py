@@ -240,6 +240,33 @@ def _rotate_open_log_if_needed() -> None:
         pass
 
 
+def _format_protocol_warnings(details) -> str:
+    """Aggregate protocol warning details by code: ``CODE xN (first: sample)``.
+
+    Each turn re-includes every earlier degraded message, so a raw
+    ``CODE@path`` list grows quadratically over a conversation.  The
+    aggregated form keeps the log line bounded while preserving which codes
+    fired, how often, and one locating sample each.
+    """
+    counts: dict[str, int] = {}
+    first_sample: dict[str, str] = {}
+    for detail in details:
+        code, _, path = str(detail).partition("@")
+        counts[code] = counts.get(code, 0) + 1
+        if path and code not in first_sample:
+            first_sample[code] = path
+    parts = []
+    for code, count in counts.items():
+        sample = first_sample.get(code)
+        if count == 1:
+            parts.append(f"{code}@{sample}" if sample else code)
+        elif sample:
+            parts.append(f"{code} x{count} (first: {sample})")
+        else:
+            parts.append(f"{code} x{count}")
+    return ",".join(parts)
+
+
 def open_log() -> None:
     global _log_fp
     path = log_path()
@@ -367,6 +394,7 @@ def record_usage(
     instance_id: str | None = None,
     account_id: str | None = None,
     source: str = "upstream",
+    degrade_codes: tuple[str, ...] = (),
 ) -> None:
     """把一条请求的 token 用量追加到 JSONL。统计绝不能搞挂转发主路径，全部异常静默。"""
     try:
@@ -401,6 +429,8 @@ def record_usage(
             row["hub"] = instance_id
         if account_id is not None:
             row["account"] = account_id
+        if degrade_codes:
+            row["deg"] = list(dict.fromkeys(degrade_codes))
         global _usage_fp
         if _usage_fp is None:
             _usage_fp = _open_usage_log()
@@ -425,6 +455,7 @@ def record_error(
     message: str | None = None,
     exc_type: str | None = None,
     route: str | None = None,
+    degrade_codes: tuple[str, ...] = (),
 ) -> None:
     """把一条已脱敏的错误事件追加到 JSONL。绝不能搞挂转发主路径，全部异常静默。
 
@@ -445,6 +476,8 @@ def record_error(
         ):
             if value is not None:
                 row[key] = value
+        if degrade_codes:
+            row["deg"] = list(dict.fromkeys(degrade_codes))
         global _errors_fp
         if _errors_fp is None:
             _errors_fp = _open_errors_log()
@@ -1058,6 +1091,7 @@ _snapshot_metrics_lock = threading.Lock()
 _snapshot_hits = 0
 _snapshot_misses = 0
 _snapshot_refreshes = 0
+_snapshot_refresh_failures = 0
 _snapshot_refresh_samples: deque[int] = deque(maxlen=64)
 
 
@@ -1266,10 +1300,11 @@ class RouteTargetExhausted(Exception):
         self.alias = alias
         self.evidence_code = evidence_code
         self.evidence_message = evidence_message
+        self.degrade_codes = tuple(degrade_codes)
 
 
 async def _route_target_exhausted(
-    upstream, alias: str
+    upstream, alias: str, *, degrade_codes: tuple[str, ...] = ()
 ) -> RouteTargetExhausted:
     """Build a RouteTargetExhausted carrying sanitized upstream evidence.
 
@@ -1294,6 +1329,7 @@ async def _route_target_exhausted(
         alias=alias,
         evidence_code=evidence_code,
         evidence_message=evidence_message,
+        degrade_codes=degrade_codes,
     )
 
 
@@ -2724,7 +2760,8 @@ async def _handle_transformed_messages(
     if request_warning_codes:
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
-            f"protocol warnings {','.join(prepared_request.plan.warning_details)}"
+            f"protocol warnings "
+            f"{_format_protocol_warnings(prepared_request.plan.warning_details)}"
         )
     data = json.dumps(
         upstream_payload,
@@ -2752,7 +2789,11 @@ async def _handle_transformed_messages(
                 # Every account and transport of this target rejected the
                 # request before any content was generated; the body is still
                 # safely replayable against the next route target.
-                raise await _route_target_exhausted(upstream, alias)
+                raise await _route_target_exhausted(
+                    upstream,
+                    alias,
+                    degrade_codes=request_warning_codes,
+                )
             content_type = (
                 upstream.headers.get("content-type", "")
                 .split(";", 1)[0]
@@ -2796,6 +2837,7 @@ async def _handle_transformed_messages(
                         code=evidence_code,
                         message=evidence_message,
                         route=route_name,
+                        degrade_codes=request_warning_codes,
                     )
                     error_headers = {
                         "x-hub-channel": alias,
@@ -2841,6 +2883,7 @@ async def _handle_transformed_messages(
                     instance_id=cfg.get("instance_id"),
                     account_id=account_attempt.lease.member,
                     source=("upstream" if usage_view else "unavailable"),
+                    degrade_codes=warning_codes,
                 )
                 log(
                     f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -2919,24 +2962,44 @@ async def _handle_transformed_messages(
                 runtime_warning_codes = tuple(
                     getattr(bridge, "warning_codes", ())
                 )
+                warning_codes = tuple(
+                    dict.fromkeys(
+                        (*request_warning_codes, *runtime_warning_codes)
+                    )
+                )
                 if runtime_warning_codes:
                     log(
                         f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                        f"protocol warnings {','.join(runtime_warning_codes)}"
+                        f"protocol warnings "
+                        f"{_format_protocol_warnings(runtime_warning_codes)}"
                     )
                 await response.write_eof()
-                # Same receipt the downstream stream was built from, so the
-                # ledger cannot disagree with what the client was told.
-                stream_usage = bridge.usage_for_accounting()
-                record_usage(
-                    alias,
-                    model_out,
-                    api_format,
-                    stream_usage,
-                    instance_id=cfg.get("instance_id"),
-                    account_id=account_attempt.lease.member,
-                    source=("upstream" if stream_usage else "unavailable"),
-                )
+                if bridge.error_terminal:
+                    record_error(
+                        phase="stream",
+                        channel=alias,
+                        model=model_out,
+                        api_format=api_format,
+                        code=bridge.terminal_error_code,
+                        message=bridge.terminal_error_message,
+                        exc_type="UpstreamSSEError",
+                        route=route_name,
+                        degrade_codes=warning_codes,
+                    )
+                else:
+                    # Same receipt the downstream stream was built from, so
+                    # the ledger cannot disagree with what the client was told.
+                    stream_usage = bridge.usage_for_accounting()
+                    record_usage(
+                        alias,
+                        model_out,
+                        api_format,
+                        stream_usage,
+                        instance_id=cfg.get("instance_id"),
+                        account_id=account_attempt.lease.member,
+                        source=("upstream" if stream_usage else "unavailable"),
+                        degrade_codes=warning_codes,
+                    )
             except (
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
@@ -3046,6 +3109,7 @@ async def _handle_transformed_messages(
                 str(exc.retry_after) if exc.retry_after is not None else None,
                 alias=alias,
                 evidence_message=sanitize_error_text(str(exc)),
+                degrade_codes=request_warning_codes,
             ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -3057,6 +3121,18 @@ async def _handle_transformed_messages(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
             f"{api_format} TRANSFORM FAIL {exc.code} {exc.path or '$'}"
         )
+        record_error(
+            phase="response",
+            channel=alias,
+            model=model_out,
+            api_format=api_format,
+            code=exc.code,
+            message=sanitize_error_text(
+                f"protocol transform failed at {exc.path or '$'}"
+            ),
+            route=route_name,
+            degrade_codes=request_warning_codes,
+        )
         return anthropic_error(
             502,
             f"hub: channel '{alias}' returned an incompatible {api_format} response",
@@ -3066,6 +3142,15 @@ async def _handle_transformed_messages(
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
             f"{api_format} CONNECT FAIL: {type(exc).__name__}"
+        )
+        record_error(
+            phase="response",
+            channel=alias,
+            model=model_out,
+            api_format=api_format,
+            exc_type=type(exc).__name__,
+            route=route_name,
+            degrade_codes=request_warning_codes,
         )
         return anthropic_error(
             502,
@@ -3186,6 +3271,7 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
             code=last_exhausted.evidence_code,
             message=last_exhausted.evidence_message,
             route=route_name,
+            degrade_codes=last_exhausted.degrade_codes,
         )
         response = anthropic_error(
             status,
@@ -3258,7 +3344,8 @@ async def _forward_to_channel(
         if protocol_warning_codes:
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
-                f"protocol warnings {','.join(prepared.plan.warning_details)}"
+                f"protocol warnings "
+            f"{_format_protocol_warnings(prepared.plan.warning_details)}"
             )
     if is_count and (
         api_format != "anthropic" or provider.get("is_full_url")
@@ -3340,7 +3427,14 @@ async def _forward_to_channel(
                 # Every account and transport of this target rejected the
                 # request before any content was generated; the buffered body
                 # is still safely replayable against the next route target.
-                raise await _route_target_exhausted(upstream, alias)
+                raise await _route_target_exhausted(
+                    upstream,
+                    alias,
+                    # A journal row attributes one failure, it never feeds a
+                    # per-turn counter, so count probes keep their degrade
+                    # codes here even though they no longer record usage.
+                    degrade_codes=protocol_warning_codes,
+                )
             if is_count and upstream.status in (404, 405, 501):
                 estimate = _estimated_input_tokens(payload)
                 log(
@@ -3479,6 +3573,7 @@ async def _forward_to_channel(
                     ),
                     exc_type=type(exc).__name__,
                     route=route_name,
+                    degrade_codes=protocol_warning_codes,
                 )
                 transport = request.transport
                 if transport is not None:
@@ -3505,6 +3600,7 @@ async def _forward_to_channel(
                     api_format="anthropic",
                     exc_type="IncompleteSSE",
                     route=route_name,
+                    degrade_codes=protocol_warning_codes,
                 )
                 transport = request.transport
                 if transport is not None:
@@ -3514,7 +3610,20 @@ async def _forward_to_channel(
                 )
 
             await response.write_eof()
-            if usage_tracker is not None:
+            if usage_tracker is not None and sse_tracker.terminal_kind == "error":
+                record_error(
+                    phase="stream",
+                    channel=alias,
+                    model=model_out,
+                    api_format="anthropic",
+                    exc_type="UpstreamSSEError",
+                    route=route_name,
+                    degrade_codes=protocol_warning_codes,
+                )
+            elif usage_tracker is not None and not is_count:
+                # count_tokens is a pre-flight probe even when an upstream
+                # dialect returns it as SSE; do not turn its usage frame into
+                # a real message-turn journal row.
                 native_stream_usage = usage_tracker.usage
                 record_usage(
                     alias,
@@ -3528,8 +3637,14 @@ async def _forward_to_channel(
                         if native_stream_usage
                         else "unavailable"
                     ),
+                    degrade_codes=protocol_warning_codes,
                 )
-            elif not streamed and upstream.status == 200:
+            elif not streamed and upstream.status == 200 and not is_count:
+                # count_tokens is a pre-flight probe, not a message turn: its
+                # body carries `input_tokens` rather than a `usage` object, so
+                # the row would hold zero counters while still inflating both
+                # the request total and every per-turn degrade count. The two
+                # estimating count exits never reach record_usage either.
                 native_usage = (
                     _usage_from_json_bytes(json_buf, upstream.headers)
                     if json_buf is not None
@@ -3550,6 +3665,7 @@ async def _forward_to_channel(
                         if native_usage
                         else "unavailable"
                     ),
+                    degrade_codes=protocol_warning_codes,
                 )
             elif not streamed and upstream.status >= 400:
                 evidence_code = None
@@ -3571,6 +3687,7 @@ async def _forward_to_channel(
                     code=evidence_code,
                     message=evidence_message,
                     route=route_name,
+                    degrade_codes=protocol_warning_codes,
                 )
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -3580,7 +3697,12 @@ async def _forward_to_channel(
                     " "
                     + stream_telemetry_fields(
                         stream_telemetry,
-                        terminal="complete",
+                        terminal=(
+                            "error"
+                            if sse_tracker is not None
+                            and sse_tracker.terminal_kind == "error"
+                            else "complete"
+                        ),
                         downstream_bytes=byte_count,
                     )
                     if streamed
@@ -3600,6 +3722,7 @@ async def _forward_to_channel(
                 str(exc.retry_after) if exc.retry_after is not None else None,
                 alias=alias,
                 evidence_message=sanitize_error_text(str(exc)),
+                degrade_codes=protocol_warning_codes,
             ) from exc
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -3610,6 +3733,15 @@ async def _forward_to_channel(
         log(
             f"{request.path} '{model_in}' -> {alias}/{model_out} "
             f"CONNECT FAIL: {type(exc).__name__}"
+        )
+        record_error(
+            phase="response",
+            channel=alias,
+            model=model_out,
+            api_format=api_format,
+            exc_type=type(exc).__name__,
+            route=route_name,
+            degrade_codes=protocol_warning_codes,
         )
         return anthropic_error(
             502,
@@ -4127,7 +4259,16 @@ def _load_error_rows(path: Path, limit: int) -> tuple[list[dict], int]:
                 expected.st_ino,
             ):
                 continue
-            with os.fdopen(fd, encoding="utf-8") as fp:
+            # A torn write (ENOSPC, SIGKILL, two hubs sharing one path) leaves
+            # raw bytes mid-file, and the writer uses ensure_ascii=False, so a
+            # non-ASCII reason is stored as bare multi-byte UTF-8. Strict
+            # decoding would raise inside the iterator and the outer handler
+            # would drop every remaining row — an 8KB decode block at a time,
+            # reporting a full journal as "no error records yet". Replacing
+            # bad bytes keeps surrounding rows readable: if replacement leaves
+            # a valid JSON string/value, the row survives with U+FFFD; only
+            # damage that still breaks JSON syntax is counted as skipped.
+            with os.fdopen(fd, encoding="utf-8", errors="replace") as fp:
                 fd = None
                 for line in fp:
                     line = line.strip()
@@ -4135,7 +4276,7 @@ def _load_error_rows(path: Path, limit: int) -> tuple[list[dict], int]:
                         continue
                     try:
                         row = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeError):
+                    except json.JSONDecodeError:
                         skipped += 1
                         continue
                     if not isinstance(row, dict) or not isinstance(
@@ -4145,6 +4286,12 @@ def _load_error_rows(path: Path, limit: int) -> tuple[list[dict], int]:
                         continue
                     rows.append(row)
         except (OSError, UnicodeError):
+            # UnicodeError here is about the *path*, not the contents: an
+            # unencodable journal path raises it from lstat/open. Decoding the
+            # contents can no longer raise at all — that is what errors=
+            # "replace" above buys, and why the json.loads handler no longer
+            # names UnicodeError. Reading either name as dead code loses the
+            # distinction.
             pass
         finally:
             if fd is not None:
@@ -4180,6 +4327,17 @@ def _format_error_row(row: dict, phase_width: int) -> str:
     ]
     if labels:
         parts.append("/".join(labels))
+    degrade_codes = row.get("deg")
+    if isinstance(degrade_codes, list):
+        rendered_degrade_codes = list(
+            dict.fromkeys(
+                code
+                for code in degrade_codes
+                if isinstance(code, str) and code
+            )
+        )
+        if rendered_degrade_codes:
+            parts.append("deg=" + ",".join(rendered_degrade_codes))
     message = row.get("message")
     if isinstance(message, str) and message:
         parts.append(message)

@@ -874,6 +874,9 @@ class StreamStateMachineContractTests(unittest.TestCase):
             "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
             responses.warning_codes,
         )
+        self.assertTrue(responses.error_terminal)
+        self.assertIsNone(responses.terminal_error_code)
+        self.assertIn("quota exhausted", responses.terminal_error_message)
 
         # The degradation code is still the honest signal when an error is
         # present but yields no forwardable evidence at all.
@@ -891,6 +894,9 @@ class StreamStateMachineContractTests(unittest.TestCase):
             "HUB_DEGRADE_UPSTREAM_ERROR_DETAIL_DROPPED",
             opaque.warning_codes,
         )
+        self.assertTrue(opaque.error_terminal)
+        self.assertIsNone(opaque.terminal_error_code)
+        self.assertIsNone(opaque.terminal_error_message)
 
         for response in (
             "malformed",
@@ -1644,7 +1650,7 @@ class StreamStateMachineContractTests(unittest.TestCase):
                     bridge.feed(event, json.dumps(payload))
                 self.assertEqual(raised.exception.code, "HUB_SSE_TOOL_CALL_INVALID")
 
-    def test_terminal_late_duplicate_and_usage_regression_fail_closed(self) -> None:
+    def test_terminal_late_duplicate_and_usage_regression_contract(self) -> None:
         completed = protocol.AnthropicStreamBridge("openai_responses")
         terminal = json.dumps(
             {
@@ -1671,9 +1677,15 @@ class StreamStateMachineContractTests(unittest.TestCase):
             )
         self.assertEqual(late.exception.code, "HUB_SSE_LATE_EVENT")
 
-        with self.assertRaises(protocol.ProtocolTransformError) as duplicate:
-            completed.feed("response.completed", terminal)
-        self.assertEqual(duplicate.exception.code, "HUB_SSE_DUPLICATE_CONFLICT")
+        # Behavior change (2026-08-17, R1/R2): a replayed terminal is a relay
+        # dialect, not a causality break, so it is absorbed with a degrade code
+        # and the turn still reaches its accounting exit. Late *content* above
+        # still fails closed.
+        self.assertEqual(completed.feed("response.completed", terminal), [])
+        self.assertIn(
+            "HUB_DEGRADE_DUPLICATE_TERMINAL_SKIPPED",
+            completed.warning_codes,
+        )
 
         regressing = protocol.AnthropicStreamBridge("openai_chat")
         regressing.feed(

@@ -83,6 +83,21 @@ def _sum_field(rows: list[dict], key: str) -> int:
     return sum(_num(row.get(key)) for row in rows)
 
 
+def _degrade_counts(rows: list[dict]) -> dict[str, int]:
+    """Count each degradation at most once per turn; legacy rows have none."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw_codes = row.get("deg")
+        if not isinstance(raw_codes, list):
+            continue
+        codes = dict.fromkeys(
+            code for code in raw_codes if isinstance(code, str) and code
+        )
+        for code in codes:
+            counts[code] = counts.get(code, 0) + 1
+    return counts
+
+
 def _cache_hit_rate(rows: list[dict]) -> float | None:
     """缓存命中率 = 缓存读 / (输入 + 缓存读)。无任何输入返回 None。"""
     cache_read = _sum_field(rows, "cr")
@@ -379,6 +394,13 @@ def render_usage_report(
         print("  缓存命中率    无数据（输入为 0）")
     else:
         print(f"  缓存命中率    {rate * 100:.1f}%")
+    degrade_counts = _degrade_counts(rows)
+    if degrade_counts:
+        print("\n  协议降级")
+        for code, count in sorted(
+            degrade_counts.items(), key=lambda item: (-item[1], item[0])
+        ):
+            print(f"    {code}  {count}")
     print()
     for line in _ascii_chart(_bucket_rows(mode, rows, now), mode=mode, now=now):
         print(line)

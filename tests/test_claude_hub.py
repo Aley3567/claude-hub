@@ -24,6 +24,8 @@ from unittest import mock
 import aiohttp
 from multidict import CIMultiDict
 
+import claude1_usage_report as usage_report
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "claude-hub.py"
@@ -348,6 +350,32 @@ class ClaudeHubTests(unittest.TestCase):
             {"web_search_requests": 1},
         )
 
+    def test_usage_log_records_degrade_codes(self):
+        hub.record_usage(
+            "fast",
+            "fixture-model",
+            "openai_chat",
+            {"input_tokens": 11, "output_tokens": 3},
+            degrade_codes=("HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",),
+        )
+
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"],
+        )
+
+    def test_usage_log_omits_degrade_field_for_clean_turns(self):
+        hub.record_usage(
+            "fast",
+            "fixture-model",
+            "openai_chat",
+            {"input_tokens": 11, "output_tokens": 3},
+        )
+
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertNotIn("deg", row)
+
     def test_native_compressed_json_usage_is_shadow_decoded_with_provenance(self):
         encoded = gzip.compress(
             json.dumps(
@@ -420,6 +448,43 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertNotIn("upstream_body", row)
         if os.name == "posix":
             self.assertEqual(self.errors_file.stat().st_mode & 0o777, 0o600)
+
+    def test_error_journal_records_unique_degrade_codes(self):
+        hub.record_error(
+            phase="response",
+            channel="fast",
+            model="fixture-model",
+            api_format="openai_chat",
+            status=500,
+            code="upstream_error",
+            message="upstream failed",
+            degrade_codes=(
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED",
+            ),
+        )
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            [
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED",
+            ],
+        )
+
+    def test_error_journal_omits_degrade_codes_for_clean_errors(self):
+        hub.record_error(
+            phase="response",
+            channel="fast",
+            model="fixture-model",
+            api_format="openai_chat",
+            status=500,
+        )
+
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertNotIn("deg", row)
 
     def test_error_journal_rotates_after_crossing_its_size_limit(self):
         with mock.patch.object(hub, "ERRORS_LOG_MAX_BYTES", 1):
@@ -523,8 +588,150 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertIn("IncompleteSSE", tail.getvalue())
         self.assertNotIn("5 小时限额已用完", tail.getvalue())
 
+    def test_error_journal_reads_past_non_utf8_bytes(self):
+        """R6: one torn byte used to truncate the journal without a word.
+
+        The reader decoded strictly, and the UnicodeDecodeError raised from
+        the line iterator was swallowed by the outer handler — so every row
+        from the failing 8KB decode block onward vanished while `skipped`
+        still reported 0. A small journal full of real errors rendered as
+        "no error records yet". The writer uses ensure_ascii=False, so a
+        Chinese reason is stored as bare multi-byte UTF-8 and a torn write
+        (ENOSPC, SIGKILL, two hubs sharing one path) lands exactly here.
+        """
+
+        def row_bytes(index):
+            return json.dumps(
+                {
+                    "ts": 1755000000 + index,
+                    "phase": "response",
+                    "channel": f"c{index}",
+                }
+            ).encode("utf-8")
+
+        # A lone 0xE9: the lead byte of a three-byte CJK sequence, cut short.
+        damaged = (
+            b'{"ts":9,"phase":"response","channel":"c-bad","message":"\xe9"}'
+        )
+
+        for label, count, bad_at in (("small", 3, 1), ("multi-block", 202, 100)):
+            with self.subTest(journal=label):
+                lines = [
+                    damaged if index == bad_at else row_bytes(index)
+                    for index in range(count)
+                ]
+                self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+                self.errors_file.write_bytes(b"\n".join(lines) + b"\n")
+                if label == "multi-block":
+                    # Larger than one TextIOWrapper decode block, which is
+                    # what made the old failure lose 62 rows instead of all.
+                    self.assertGreater(self.errors_file.stat().st_size, 8192)
+
+                rows, skipped = hub._load_error_rows(self.errors_file, 10_000)
+
+                # The bad byte becomes U+FFFD, which leaves the row valid
+                # JSON: lossy but usable, which is the repo's default gear.
+                self.assertEqual(len(rows), count)
+                self.assertEqual(skipped, 0)
+                channels = [row["channel"] for row in rows]
+                self.assertEqual(channels[0], "c0")
+                self.assertEqual(channels[-1], f"c{count - 1}")
+                self.assertEqual(channels[bad_at], "c-bad")
+                self.assertIn("�", rows[bad_at]["message"])
+
+    def test_error_journal_counts_a_torn_row_as_skipped(self):
+        """A write cut mid-row stays unparseable after byte replacement.
+
+        That is what `skipped` exists for, and it has to stay visible in the
+        CLI rather than quietly shrinking the report.
+        """
+        intact = json.dumps(
+            {"ts": 1755000000, "phase": "response", "channel": "before"}
+        ).encode("utf-8")
+        after = json.dumps(
+            {"ts": 1755000200, "phase": "stream", "exc": "IncompleteSSE"}
+        ).encode("utf-8")
+        torn = b'{"ts":1755000100,"phase":"resp\xe9onse","channel"'
+
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        self.errors_file.write_bytes(b"\n".join([intact, torn, after]) + b"\n")
+        self.errors_file.chmod(0o600)
+
+        rows, skipped = hub._load_error_rows(self.errors_file, 10_000)
+        self.assertEqual([row.get("channel") for row in rows], ["before", None])
+        self.assertEqual(skipped, 1)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            hub.cli_errors([])
+        rendered = buffer.getvalue()
+        self.assertIn("IncompleteSSE", rendered)
+        self.assertIn("1 stale record(s) skipped", rendered)
+
         with self.assertRaises(SystemExit):
             hub.cli_errors(["-n", "zero"])
+
+    def test_cli_errors_renders_degrade_codes_and_ignores_malformed_values(self):
+        self.errors_file.parent.mkdir(parents=True, exist_ok=True)
+        self.errors_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "ts": 1755000200,
+                            "phase": "response",
+                            "channel": "fast",
+                            "model": "fixture-model",
+                            "deg": [
+                                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                                "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED",
+                            ],
+                        }
+                    ),
+                    json.dumps(
+                        {"ts": 1755000201, "phase": "stream", "exc": "IncompleteSSE"}
+                    ),
+                    json.dumps(
+                        {
+                            "ts": 1755000202,
+                            "phase": "response",
+                            "deg": {"bad": "HUB_DEGRADE_NOT_A_LIST"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "ts": 1755000203,
+                            "phase": "response",
+                            "deg": [None, 7, "", "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.errors_file.chmod(0o600)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            hub.cli_errors([])
+        rendered = buffer.getvalue()
+
+        self.assertIn(
+            "deg=HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED,HUB_DEGRADE_SYSTEM_ROLE_PROMOTED",
+            rendered,
+        )
+        self.assertEqual(
+            rendered.count("HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"),
+            1,
+        )
+        self.assertEqual(
+            rendered.count("HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"),
+            2,
+        )
+        self.assertNotIn("HUB_DEGRADE_NOT_A_LIST", rendered)
+        self.assertIn("IncompleteSSE", rendered)
 
     @unittest.skipUnless(os.name == "posix", "POSIX permissions only")
     def test_cli_errors_warns_while_the_journal_is_still_world_readable(self):
@@ -659,6 +866,40 @@ class ClaudeHubTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+
+    def _configure_provider_and_channel(
+        self, alias, model, endpoint, api_format
+    ):
+        """Set a provider's endpoint/api_format and a channel's model list."""
+        connection = sqlite3.connect(self.db_file)
+        try:
+            try:
+                connection.execute("ALTER TABLE providers ADD COLUMN meta TEXT")
+            except sqlite3.OperationalError:
+                pass
+            connection.execute(
+                "UPDATE providers SET settings_config=?, meta=? WHERE name=?",
+                (
+                    json.dumps(
+                        {
+                            "env": {
+                                "ANTHROPIC_BASE_URL": endpoint,
+                                "ANTHROPIC_AUTH_TOKEN": "fixture-upstream-token",
+                            }
+                        }
+                    ),
+                    json.dumps({"isFullUrl": True, "apiFormat": api_format}),
+                    "Fixture HTTPS",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["channels"][alias]["models"] = [model]
+        self.config_file.write_text(json.dumps(raw), encoding="utf-8")
+        hub.reset_caches()
 
     def _write_account_pool_db(self, *, api_format="anthropic"):
         self.db_file.unlink(missing_ok=True)
@@ -2420,6 +2661,262 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(recorded_usage.get("cache_read_input_tokens"), 40)
         self.assertEqual(record.call_args.kwargs["source"], "upstream")
 
+    def test_native_connect_failure_persists_request_degrade(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "http://127.0.0.1:19090/v1/messages",
+            "anthropic",
+        )
+
+        class FailingSession:
+            def post(self, _url, **_kwargs):
+                raise aiohttp.ClientConnectionError("fixture native connect failure")
+
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session=FailingSession(),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 502)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "response")
+        self.assertEqual(row["exc"], "ClientConnectionError")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+
+    def test_nonstream_transformed_turn_persists_request_and_response_degrades(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        transformed = {
+            "id": "chatcmpl_fixture",
+            "model": "fixture-model",
+            "service_tier": "default",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fixture"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(transformed).encode("utf-8")],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            [
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            ],
+        )
+
+    def test_transformed_response_failure_persists_request_degrade(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps({"future_response_field": True}).encode()],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 502)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "response")
+        self.assertEqual(row["code"], "HUB_UPSTREAM_RESPONSE_INVALID")
+        self.assertIn("$", row["message"])
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"],
+        )
+        self.assertFalse(self.usage_file.exists())
+
+    def test_transformed_connect_failure_persists_request_degrade(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+
+        class FailingSession:
+            def post(self, _url, **_kwargs):
+                raise aiohttp.ClientConnectionError("fixture connect failure")
+
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session=FailingSession(),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 502)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "response")
+        self.assertEqual(row["exc"], "ClientConnectionError")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"],
+        )
+
+    def test_nonstream_transformed_upstream_error_persists_request_degrade(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream_body = {
+            "error": {
+                "code": "fixture_upstream_error",
+                "message": "fixture upstream failure",
+            }
+        }
+        upstream = _FakeUpstream(
+            500,
+            {"Content-Type": "application/json", "x-upstream": "kept-out"},
+            [json.dumps(upstream_body).encode("utf-8")],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(
+            json.loads(response.text),
+            {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": (
+                        "upstream HTTP 500 (fixture_upstream_error): "
+                        "fixture upstream failure"
+                    ),
+                },
+            },
+        )
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {key: row.get(key) for key in (
+                "phase",
+                "channel",
+                "model",
+                "format",
+                "status",
+                "code",
+                "message",
+            )},
+            {
+                "phase": "response",
+                "channel": "fast",
+                "model": "fixture-model",
+                "format": "openai_chat",
+                "status": 500,
+                "code": "fixture_upstream_error",
+                "message": "fixture upstream failure",
+            },
+        )
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"],
+        )
+        self.assertNotIn("payload", row)
+        self.assertNotIn("upstream_body", row)
+
+    def test_unwritable_usage_journal_does_not_break_transformed_turn(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [
+                json.dumps(
+                    {
+                        "id": "chatcmpl_fixture",
+                        "model": "fixture-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "fixture",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+            ],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(
+            hub,
+            "_open_usage_log",
+            side_effect=OSError("fixture journal unavailable"),
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.text)["content"][0]["text"], "fixture")
+        self.assertIsNone(hub._usage_fp)
+
     def test_complete_accounting_without_usage_records_unavailable(self):
         self._set_provider_endpoint(
             "Fixture HTTPS",
@@ -2515,7 +3012,97 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(record.call_args.kwargs["source"], "upstream")
 
-    def test_transformed_stream_clean_eof_without_terminal_aborts_fail_closed(self):
+    def test_native_nonstream_success_persists_request_degrade_without_rewriting_response(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        response_bytes = (
+            b'{"id":"msg_fixture","type":"message","role":"assistant",'
+            b'"content":[],"model":"fixture-model",'
+            b'"usage":{"input_tokens":7,"output_tokens":2}}'
+        )
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json", "X-Upstream-Trace": "kept"},
+            [response_bytes],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            session=_FakeSession(upstream),
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["X-Upstream-Trace"], "kept")
+        self.assertEqual(response.writes, [response_bytes])
+        self.assertTrue(response.eof)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["source"], "upstream")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+        )
+
+    def test_native_stream_success_persists_request_degrade_and_forwards_real_terminal(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS", "http://127.0.0.1:19090/v1/messages", "anthropic"
+        )
+        chunks = [
+            (
+                b'event: message_start\ndata: {"type":"message_start",'
+                b'"message":{"id":"msg_fixture","type":"message",'
+                b'"role":"assistant","content":[],"model":"fixture-model",'
+                b'"usage":{"input_tokens":7,"output_tokens":0}}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream", "X-Upstream-Trace": "kept"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertEqual(response.headers["X-Upstream-Trace"], "kept")
+        self.assertEqual(response.writes, chunks)
+        self.assertEqual(response.writes[-1], chunks[-1])
+        self.assertTrue(response.eof)
+        self.assertFalse(request.transport.aborted)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["source"], "upstream")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+        )
+
+    def test_transformed_stream_clean_eof_without_terminal_returns_sse_error(self):
         self._set_provider_endpoint(
             "Fixture HTTPS",
             "https://upstream.invalid/v1/chat/completions",
@@ -2545,15 +3132,23 @@ class ClaudeHubTests(unittest.TestCase):
             "StreamResponse",
             return_value=downstream,
         ):
-            with self.assertRaises(hub.UpstreamStreamAborted):
-                asyncio.run(hub.handle_messages(request))
+            response = asyncio.run(hub.handle_messages(request))
 
+        self.assertIs(response, downstream)
         rendered = b"".join(downstream.writes)
         self.assertIn(b'"text":"partial"', rendered)
         self.assertNotIn(b"event: message_delta\n", rendered)
         self.assertNotIn(b"event: message_stop\n", rendered)
-        self.assertFalse(downstream.eof)
-        self.assertTrue(request.transport.aborted)
+        self.assertIn(b"event: error\n", rendered)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        self.assertIn(
+            "HUB_SSE_MISSING_TERMINAL",
+            error_payload["error"]["message"],
+        )
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
 
     def test_transformed_stream_runtime_degradation_codes_are_logged(self):
         events = [
@@ -2607,6 +3202,147 @@ class ClaudeHubTests(unittest.TestCase):
             any("HUB_DEGRADE_UNSIGNED_THINKING" in entry for entry in observed)
         )
 
+    def test_transformed_stream_persists_request_and_runtime_degrades(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        events = [
+            {
+                "id": "chatcmpl_fixture",
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "delta": {"reasoning_content": "unsigned thought"},
+                        "finish_reason": None,
+                    }
+                ],
+                "usage": {"prompt_tokens": 3},
+            },
+            {
+                "choices": [
+                    {"delta": {"content": "answer"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"completion_tokens": 2},
+            },
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b"data:"
+                + json.dumps(event, separators=(",", ":")).encode()
+                + b"\n\n"
+                for event in events
+            ]
+            + [b"data: [DONE]\n\n"],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertTrue(downstream.eof)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b"event: message_stop\n", rendered)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            [
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_UNSIGNED_THINKING",
+            ],
+        )
+
+    def test_transformed_stream_failure_persists_observed_degrades(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        events = [
+            {
+                "id": "chatcmpl_fixture",
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "delta": {"reasoning_content": "unsigned thought"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {"delta": {"content": "partial"}, "finish_reason": None}
+                ]
+            },
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b"data:"
+                + json.dumps(event, separators=(",", ":")).encode()
+                + b"\n\n"
+                for event in events
+            ],
+            fail_after=True,
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertTrue(downstream.eof)
+        self.assertFalse(request.transport.aborted)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b"event: error\n", rendered)
+        self.assertNotIn(b"event: message_stop\n", rendered)
+        error_payload = json.loads(
+            rendered.rsplit(b"event: error\ndata: ", 1)[1].split(b"\n\n", 1)[0]
+        )
+        self.assertIn(
+            "HUB_UPSTREAM_STREAM_INTERRUPTED",
+            error_payload["error"]["message"],
+        )
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            [
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_UNSIGNED_THINKING",
+            ],
+        )
+        self.assertFalse(self.usage_file.exists())
+
     def _sse_frames(self, rendered):
         frames = []
         for frame in rendered.split(b"\n\n"):
@@ -2655,6 +3391,64 @@ class ClaudeHubTests(unittest.TestCase):
                 model_out="custom-model",
                 started=0,
             )
+        )
+
+    def test_synthesized_sse_persists_request_and_response_degrades(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        transformed = {
+            "id": "chatcmpl_fixture",
+            "model": "fixture-model",
+            "service_tier": "default",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [json.dumps(transformed).encode()],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+                "future_request_field": True,
+            },
+            session=_FakeSession(upstream),
+        )
+
+        response = asyncio.run(hub.handle_messages(request))
+
+        self.assertEqual(response.status, 200)
+        events = self._sse_frames(response.body)
+        self.assertEqual(
+            [name for name, _data in events],
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+        )
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            row["deg"],
+            [
+                "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            ],
         )
 
     def test_transformed_json_upstream_is_synthesized_into_sse_when_streaming(self):
@@ -3483,6 +4277,37 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertNotIn("fixture-upstream-token", line)
         self.assertNotIn("fixture-local-token", line)
 
+    def test_format_protocol_warnings_aggregates_by_code(self):
+        details = [
+            "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED@$.messages[3].role",
+            "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED@$.messages[6].role",
+            "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED@$.messages[9].role",
+            "HUB_DEGRADE_DROPPED_CACHE_CONTROL@$.messages[1]",
+        ]
+
+        rendered = hub._format_protocol_warnings(details)
+
+        # Bounded length: the raw list grows per turn, the aggregate does not.
+        self.assertEqual(
+            rendered,
+            "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED x3 (first: $.messages[3].role)"
+            ",HUB_DEGRADE_DROPPED_CACHE_CONTROL@$.messages[1]",
+        )
+        # One locating sample per code, counts preserved.
+        self.assertIn("x3", rendered)
+        self.assertIn("$.messages[3].role", rendered)
+        self.assertNotIn("$.messages[6].role", rendered)
+
+    def test_format_protocol_warnings_bare_codes_and_singletons(self):
+        self.assertEqual(
+            hub._format_protocol_warnings(["CODE_A", "CODE_A", "CODE_B"]),
+            "CODE_A x2,CODE_B",
+        )
+        self.assertEqual(hub._format_protocol_warnings([]), "")
+        self.assertEqual(
+            hub._format_protocol_warnings(["CODE_A@$.x"]), "CODE_A@$.x"
+        )
+
     def test_provider_snapshot_cache_hit_does_not_log(self):
         hub.open_log()
         hub.get_providers()
@@ -4007,6 +4832,186 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(response.headers["x-hub-token-count-exact"], "1")
         self.assertNotIn("x-hub-estimated", response.headers)
 
+    def test_streaming_count_tokens_is_not_accounted_as_a_turn(self):
+        """A streaming count probe stays transparent without a usage row."""
+        chunks = [
+            (
+                b'event: message_start\ndata: {"type":"message_start",'
+                b'"message":{"id":"count_fixture","type":"message",'
+                b'"role":"assistant","content":[],"usage":{"input_tokens":11,'
+                b'"output_tokens":0}}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        probe = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "stream": True,
+                "messages": [{"role": "user", "content": "fixture"}],
+            },
+            session=_FakeSession(probe),
+            path="/v1/messages/count_tokens",
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertEqual(response.writes, chunks)
+        self.assertTrue(response.eof)
+        self.assertFalse(self.usage_file.exists())
+
+    def test_streaming_count_tokens_error_terminal_is_still_journaled(self):
+        """Suppressing the probe's usage row must not suppress its failure.
+
+        The `not is_count` guard sits on the usage branch only, and the error
+        branch is tested nowhere else — moving the guard up to the shared
+        condition, or reordering the two branches, would drop the failure
+        silently and leave the operator with a count probe that fails with no
+        journal row at all. Errors attribute; usage counts.
+        """
+        chunks = [
+            b'event: message_start\ndata: {"type":"message_start",'
+            b'"message":{"id":"count_fixture","type":"message",'
+            b'"role":"assistant","content":[],"usage":{"input_tokens":11,'
+            b'"output_tokens":0}}}\n\n',
+            b'event: error\ndata: {"type":"error","error":{"type":"api_error",'
+            b'"message":"fixture count failure"}}\n\n',
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "stream": True,
+                "messages": [
+                    # Promoting this system turn is what puts a code in `deg`.
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session=_FakeSession(upstream),
+            path="/v1/messages/count_tokens",
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        # The probe is still forwarded byte for byte; only accounting differs.
+        self.assertEqual(downstream.writes, chunks)
+        self.assertTrue(downstream.eof)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["exc"], "UpstreamSSEError")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+        # The message_start above reports tokens; a probe still never counts.
+        self.assertFalse(self.usage_file.exists())
+
+    def test_count_tokens_preflight_is_not_accounted_as_a_turn(self):
+        """R3: a count_tokens probe must not reach the usage log.
+
+        Claude Code sends one count_tokens before every real turn. The probe
+        answers with `{"input_tokens": N}` rather than a `usage` object, so
+        the row it used to append carried no token counter at all — only a
+        timestamp and the request's `deg` list. That doubled both the request
+        total and every per-turn degrade count in `claude1 usage`.
+        """
+        payload = {
+            "model": "fast,custom-model",
+            "messages": [
+                # Promoting this system turn is what puts a code in `deg`.
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "fixture"},
+            ],
+        }
+        turn = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"usage":{"input_tokens":11,"output_tokens":3}}'],
+        )
+        probe = _FakeUpstream(
+            200,
+            {"Content-Type": "application/json"},
+            [b'{"input_tokens":11}'],
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(
+                hub.handle_messages(
+                    self._request(payload, session=_FakeSession(turn))
+                )
+            )
+            asyncio.run(
+                hub.handle_messages(
+                    self._request(
+                        payload,
+                        session=_FakeSession(probe),
+                        path="/v1/messages/count_tokens",
+                    )
+                )
+            )
+
+        rows = [
+            json.loads(line)
+            for line in self.usage_file.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["in"], 11)
+        self.assertEqual(rows[0]["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+        # The contract is the reported number, not just the row count.
+        self.assertEqual(
+            usage_report._degrade_counts(rows),
+            {"HUB_DEGRADE_SYSTEM_ROLE_PROMOTED": 1},
+        )
+
+    def test_count_tokens_failure_still_carries_its_degrade_codes(self):
+        """A failed probe is one failure to attribute, not a counted turn.
+
+        The journal names why a single request failed, so suppressing `deg`
+        there would hide the request-side degradation without protecting any
+        counter — usage is where per-turn counting happens, and the probe no
+        longer writes there at all.
+        """
+        probe = _FakeUpstream(
+            500,
+            {"Content-Type": "application/json"},
+            [b'{"error":{"message":"upstream exploded"}}'],
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session=_FakeSession(probe),
+            path="/v1/messages/count_tokens",
+        )
+
+        with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+            asyncio.run(hub.handle_messages(request))
+
+        self.assertFalse(self.usage_file.exists())
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+        self.assertEqual(row["status"], 500)
+
     def test_account_pool_round_robin_is_shared_across_requests(self):
         self._write_account_pool_db()
         self._write_account_pool_config()
@@ -4136,7 +5141,13 @@ class ClaudeHubTests(unittest.TestCase):
             ],
         )
         request = self._request(
-            {"model": "fast,custom-model", "messages": []},
+            {
+                "model": "fast,custom-model",
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
             session=_FakeSession(upstream),
         )
 
@@ -4148,6 +5159,10 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual((row["phase"], row["status"]), ("response", 403))
         self.assertEqual(row["channel"], "fast")
         self.assertEqual(row["message"], "用户额度不足")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+        )
         # 空 code 不是证据,不该写进 journal 冒充上游代码。
         self.assertNotIn("code", row)
 
@@ -4164,7 +5179,14 @@ class ClaudeHubTests(unittest.TestCase):
             fail_after=True,
         )
         request = self._request(
-            {"model": "fast,custom-model", "stream": True, "messages": []},
+            {
+                "model": "fast,custom-model",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
             session=_FakeSession(upstream),
         )
 
@@ -4177,6 +5199,11 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(row["channel"], "fast")
         self.assertEqual(row["format"], "anthropic")
         self.assertEqual(row["exc"], "ClientPayloadError")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+        )
+        self.assertFalse(self.usage_file.exists())
 
     def test_account_pool_never_retries_a_stream_after_downstream_commit(self):
         self._write_account_pool_db()
@@ -5406,7 +6433,10 @@ class ClaudeHubTests(unittest.TestCase):
         request = self._request(
             {
                 "model": "fast,custom-model",
-                "messages": [{"role": "user", "content": "fixture"}],
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "fixture"},
+                ],
             },
             session=session,
         )
@@ -5424,6 +6454,12 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(downstream.writes, chunks)
         self.assertFalse(downstream.eof)
         self.assertTrue(request.transport.aborted)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(row["exc"], "IncompleteSSE")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"],
+        )
 
     def test_sse_terminal_tracker_bounds_oversized_lines(self):
         tracker = hub._SSETerminalTracker()
@@ -5584,6 +6620,48 @@ class ClaudeHubTests(unittest.TestCase):
                 self.assertEqual(downstream.writes, chunks)
                 self.assertTrue(downstream.eof)
                 self.assertFalse(request.transport.aborted)
+
+    def test_native_sse_error_terminal_is_journaled_as_failure_not_usage(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "http://127.0.0.1:19090/v1/messages",
+            "anthropic",
+        )
+        chunks = [
+            b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            b'event: error\ndata: {"type":"error","error":{"type":"api_error",'
+            b'"message":"fixture native failure"}}\n\n',
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "stream": True,
+                "messages": [
+                    {"role": "system", "content": "system context"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        self.assertEqual(downstream.writes, chunks)
+        self.assertTrue(downstream.eof)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["exc"], "UpstreamSSEError")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+        self.assertFalse(self.usage_file.exists())
 
     def test_sse_cr_only_line_endings_dispatch_terminal_event(self):
         chunks = [

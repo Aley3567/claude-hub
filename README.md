@@ -390,9 +390,7 @@ EOF
 code / 原因」。转发路径上的任何 journal 写入失败都被静默吞掉，不会影响请求
 本身。
 
-消息在写入和转发前都会过一遍脱敏：`Bearer` token、URL、`token=` / `api_key:`
-这类赋值形状、`sk-` 前缀的 key 一律替换为占位符，长度截断到 512 字节。中文原
-因不受影响。
+消息在写入和转发前都会过一遍脱敏：`Bearer` / `Basic` token、URL、`token=` / `api_key:` / `cookie=` / `session=` 这类赋值形状、明确 header 语境中的 opaque value、JWT，以及 `sk-` / `rk-` / `pk-` 前缀的 key 一律替换为占位符；message 最多保留 512 个 Unicode 字符（不是 UTF-8 字节数）。中文原因不受影响。
 
 ## 安装位置与备份
 

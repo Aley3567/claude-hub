@@ -3057,6 +3057,123 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         self.assertEqual(protocol.sanitize_error_text("a\r\nb"), "a b")
         self.assertIsNone(protocol.sanitize_error_text("   "))
 
+    def test_sanitizer_redacts_credential_shapes_without_an_assignment(self):
+        """R5: four shapes walked straight through the earlier rules.
+
+        Forwarding upstream error detail downstream is only defensible while
+        the sanitizer covers what that detail can carry, so each shape here
+        is a fail-closed boundary rather than a nicety. Values are assembled
+        from fragments so no complete credential literal lives in the repo.
+        """
+        basic_payload = "dXNlcjpzdXBlcn" + "NlY3JldA=="
+        jwt_body = "eyJrIjoiRklYVFVSRSJ9"
+        jwt = "eyJhbGciOiJIUzI1NiJ9." + jwt_body + ".fixtureSIG"
+        bare_key = "abc123def456" + "ghi789"
+        session_value = "FIXTURESESSION" + "VALUE0123"
+        opaque_value = "OPAQUESESSION" + "VALUE"
+        quoted_value = "quoted opaque" + " credential"
+        quoted_key = "quoted123" + "value456"
+        cases = (
+            # `Basic` only ate the scheme word; the base64 payload survived.
+            (
+                "basic base64",
+                f"rejected Authorization=Basic {basic_payload}",
+                basic_payload,
+            ),
+            # Neither word was in the keyword alternation.
+            (
+                "cookie session",
+                f"cookie session={session_value} expired",
+                session_value,
+            ),
+            # Space-separated, so the [=:] anchor never matched.
+            ("bare jwt", f"invalid token {jwt}", jwt_body),
+            # A header value quoted with no separator at all.
+            (
+                "bare header value",
+                f"x-api-key header {bare_key} is revoked",
+                bare_key,
+            ),
+            (
+                "alphabetic opaque header value",
+                f"Authorization header {opaque_value} rejected",
+                opaque_value,
+            ),
+            (
+                "quoted header value",
+                f'api key header "{quoted_key}" is revoked',
+                quoted_key,
+            ),
+            (
+                "quoted assignment with spaces",
+                f"credential='{quoted_value}' rejected",
+                quoted_value,
+            ),
+        )
+        for label, raw, secret in cases:
+            with self.subTest(shape=label):
+                redacted = protocol.sanitize_error_text(raw)
+                self.assertNotIn(secret, redacted)
+                self.assertIn("[redacted", redacted)
+
+    def test_sanitizer_redacts_quoted_credentials_with_broken_quoting(self):
+        """Quoting arrives broken, and the breakage used to leak the value.
+
+        The same-quote backreference only matched tidy `'x'` / `"x"` pairs.
+        Every other shape fell through to the `\\S+` assignment rule, which
+        stops at the first space — so a value containing one was redacted up
+        to that space and printed in full afterwards. Each case asserts the
+        tail, not just the whole value, or a partial redaction would pass.
+        """
+        head = "SUPER"
+        tail = "SECRET VALUE0123"
+        secret = f"{head} {tail}"
+        cases = (
+            # A relay closed with the other quote character.
+            ("opposite closing quote", f"token='{secret}\" rejected"),
+            ("opposite opening quote", f'token="{secret}\' rejected'),
+            # A JSON-encoded error body escapes every quote it carries.
+            ("escaped double quotes", f'token=\\"{secret}\\" rejected'),
+            ("escaped single quotes", f"token=\\'{secret}\\' rejected"),
+            # 512-char truncation can cut the closing quote off entirely.
+            ("unterminated quote", f"token='{secret}"),
+            ("header opposite quote", f"api key header \"{secret}' is revoked"),
+            ("header escaped quote", f'x-api-key header \\"{secret}\\" bad'),
+            ("header unterminated", f'authorization header "{secret}'),
+        )
+        for label, raw in cases:
+            with self.subTest(shape=label):
+                redacted = protocol.sanitize_error_text(raw)
+                self.assertNotIn(tail, redacted)
+                self.assertNotIn(secret, redacted)
+                self.assertIn("[redacted]", redacted)
+
+    def test_sanitizer_keeps_prose_that_merely_names_a_credential(self):
+        """Over-redaction costs the operator their only diagnostic.
+
+        The nearby-value rule fires on a credential word followed by an
+        opaque value, so it must not fire on a credential word followed by
+        ordinary English — including a model ID, which is long, hyphenated
+        and full of digits without being a secret. The header rule reaches
+        further (a value of letters alone still counts), so the words that
+        most often follow header wording are pinned here too.
+        """
+        for text in (
+            "invalid token format",
+            "api key for model claude-opus-4-20250514 is invalid",
+            "your token specification is malformed",
+            "session expired, please retry",
+            # Header wording plus an ordinary long word: redacting these
+            # deletes the only word naming the failure.
+            "authorization header verification failed",
+            "cookie authentication is not configured",
+            "api key authentication unavailable",
+            "session identifier mismatch detected",
+            "Authorization header Verification failed",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(protocol.sanitize_error_text(text), text)
+
     def test_chat_stream_error_frame_terminates_with_the_real_reason(self) -> None:
         # OpenAI 兼容网关在流中报限额时发裸 {"error": ...} 帧。以前它会撞上
         # 字段白名单炸成 ProtocolTransformError（下游只看到裸断连），

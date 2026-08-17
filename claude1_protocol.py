@@ -3675,28 +3675,130 @@ def transform_response(body: dict, api_format: str) -> dict:
 # Credential-shaped fragments must never survive into downstream error text,
 # because these messages travel through mid-stream SSE and response bodies
 # that clients may echo into logs or UIs.
-_ERROR_TEXT_ASSIGNMENT = re.compile(
-    r"(?i)\b("
+_ERROR_TEXT_CREDENTIAL_WORDS = (
     r"token|secret|password|passwd|authorization|credential"
     r"|api[-_]?key|access[-_]?token|refresh[-_]?token|key"
-    r")\s*[=:]\s*\S+"
+    r"|set[-_]?cookie|cookie|session"
+)
+# One quoted value, matched the way upstream text actually quotes rather than
+# the way it ought to: a relay may close with the other quote character, a
+# JSON-encoded error body arrives with every quote backslash-escaped, and the
+# 512-char bound can cut the closing quote off entirely. A same-quote
+# backreference missed all three, and the miss was not inert — it handed the
+# value to the `\S+` assignment rule below, which redacted up to the first
+# space and left the rest of the credential in the text. The body can never
+# cross a quote, so a tolerant closer still stops at the nearest one.
+_ERROR_TEXT_QUOTED_VALUE = r"\\?['\"][^'\"\r\n]*(?:['\"]|(?=[\r\n])|\Z)"
+_ERROR_TEXT_QUOTED_ASSIGNMENT = re.compile(
+    r"(?i)\b(" + _ERROR_TEXT_CREDENTIAL_WORDS + r")\s*[=:]\s*"
+    + _ERROR_TEXT_QUOTED_VALUE
+)
+_ERROR_TEXT_ASSIGNMENT = re.compile(
+    r"(?i)\b(" + _ERROR_TEXT_CREDENTIAL_WORDS + r")\s*[=:]\s*\S+"
+)
+_ERROR_TEXT_HEADER_WORDS = (
+    r"authorization|x-api-key|api[-_]?key|api\s+key"
+    r"|set[-_]?cookie|cookie|session"
+)
+# Explicit header/value wording is strong context, so a value of letters alone
+# still counts here — but the context is not strong enough to skip the shape
+# check, or "authorization header verification failed" loses the one word that
+# names the failure.
+_ERROR_TEXT_HEADER_VALUE = re.compile(
+    r"(?i)(\b(?:" + _ERROR_TEXT_HEADER_WORDS + r")\b"
+    r"(?:\s+(?:header|value))?\s+)"
+    r"([A-Za-z0-9_\-./+=]{12,})"
+)
+_ERROR_TEXT_QUOTED_HEADER_VALUE = re.compile(
+    r"(?i)(\b(?:" + _ERROR_TEXT_HEADER_WORDS + r")\b"
+    r"(?:\s+(?:header|value))?\s+)" + _ERROR_TEXT_QUOTED_VALUE
 )
 _ERROR_TEXT_KEY_SHAPE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
+# A JWT carries its own unmistakable shape, so it is redacted without an
+# adjacent keyword: upstreams routinely report it as bare "invalid token
+# <jwt>", where no separator exists for the assignment rule to anchor on.
+_ERROR_TEXT_JWT_SHAPE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?"
+)
+# Header rejections read as "x-api-key header <value> is revoked" — keyword
+# and value separated by prose rather than by '='. At most ONE ordinary word
+# may sit between them: allowing more would swallow real reasons such as
+# "api key for model claude-opus-4-20250514 is invalid", which trades the
+# operator's only diagnostic for no additional secrecy.
+_ERROR_TEXT_NEARBY_VALUE = re.compile(
+    r"(?i)(\b(?:"
+    + _ERROR_TEXT_CREDENTIAL_WORDS
+    + r")\b(?:\s+[A-Za-z]{1,15}\b)?\s+)"
+    r"([A-Za-z0-9_\-./+=]{12,})"
+)
+
+
+def _is_credential_shaped(value: str) -> bool:
+    """Tell an opaque credential from an ordinary long word.
+
+    Length alone would redact prose like "specification"; a digit or a
+    structural character is what marks a value as machine-generated.
+    """
+    if value.startswith("[redacted"):
+        return False
+    return any(char.isdigit() for char in value) or any(
+        char in "_-./+=" for char in value
+    )
+
+
+def _is_opaque_header_value(value: str) -> bool:
+    """Decide whether a value quoted only by header wording is a secret.
+
+    A credential made of letters alone carries no digit or separator for
+    :func:`_is_credential_shaped` to key on, so casing is the remaining tell:
+    prose arrives lowercase or Capitalized, opaque values arrive SHOUTED or
+    camelCased. An all-caps ordinary word is redacted by this rule — that is
+    the fail-closed side of the trade, and the credential boundary is where
+    the repository takes it.
+    """
+    if _is_credential_shaped(value):
+        return True
+    return not (value.islower() or value.istitle())
 
 
 def sanitize_error_text(text: str) -> str | None:
     """Bound and redact one line of upstream error text for downstream reuse."""
     candidate = text.strip()[:512]
     candidate = re.sub(
-        r"(?i)\bBearer\s+\S+",
-        "Bearer [redacted-token]",
+        r"(?i)\b(Bearer|Basic)\s+\S+",
+        # Basic carries base64 user:password, so the scheme word alone is not
+        # the secret — the payload after it is.
+        lambda match: f"{match.group(1)} [redacted-token]",
         candidate,
     )
     candidate = re.sub(r"(?i)https?://\S+", "[redacted-url]", candidate)
+    candidate = _ERROR_TEXT_JWT_SHAPE.sub("[redacted-token]", candidate)
+    candidate = _ERROR_TEXT_QUOTED_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=[redacted]", candidate
+    )
     candidate = _ERROR_TEXT_ASSIGNMENT.sub(
         lambda match: f"{match.group(1)}=[redacted]", candidate
     )
     candidate = _ERROR_TEXT_KEY_SHAPE.sub("[redacted-key]", candidate)
+    candidate = _ERROR_TEXT_QUOTED_HEADER_VALUE.sub(
+        lambda match: f"{match.group(1)}[redacted]", candidate
+    )
+    candidate = _ERROR_TEXT_HEADER_VALUE.sub(
+        lambda match: (
+            f"{match.group(1)}[redacted]"
+            if _is_opaque_header_value(match.group(2))
+            else match.group(0)
+        ),
+        candidate,
+    )
+    candidate = _ERROR_TEXT_NEARBY_VALUE.sub(
+        lambda match: (
+            f"{match.group(1)}[redacted]"
+            if _is_credential_shaped(match.group(2))
+            else match.group(0)
+        ),
+        candidate,
+    )
     candidate = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()
     return candidate or None
 
@@ -3900,6 +4002,18 @@ MAX_STREAM_TEXT_BYTES = 2 * 1024 * 1024
 MAX_STREAM_TEXT_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_STREAM_BLOCKS = 4096
 MAX_STREAM_ITEM_ID_CHARS = 1024
+
+# Frames that carry a stream terminal. Relays replay these after the real
+# terminal; a repeat loses no semantics and breaks no causality, so it is
+# degraded rather than rejected.
+_TERMINAL_EVENT_KINDS = frozenset(
+    {
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+        "error",
+    }
+)
 
 _RESPONSES_SSE_EVENT_FIELDS = {
     "response.output_text.delta": {
@@ -6072,8 +6186,44 @@ class AnthropicStreamBridge:
             )
         return identifiers[0]
 
+    def _repeats_terminal(self, event: str, data: str) -> bool:
+        """Report whether a post-terminal frame merely replays the terminal.
+
+        Relays commonly resend the closing marker: a trailing ``[DONE]``, a
+        second ``response.completed``, another bare ``{"error": ...}`` frame, or
+        a repeated ``finish_reason``. None of those lose semantics, so they are
+        absorbed. Content arriving after the terminal is a real causality break
+        and still fails closed.
+        """
+        if data == "[DONE]":
+            return True
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("error") is not None:
+            return True
+        kind = payload.get("type") if isinstance(payload.get("type"), str) else event
+        if kind in _TERMINAL_EVENT_KINDS:
+            return True
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            return any(
+                isinstance(choice, dict) and choice.get("finish_reason")
+                for choice in choices
+            )
+        return False
+
     def feed(self, event: str, data: str) -> list[bytes]:
         if self.stopped:
+            if self._repeats_terminal(event, data):
+                self._observe_stream_degradation(
+                    "HUB_DEGRADE_DUPLICATE_TERMINAL_SKIPPED",
+                    "upstream replayed a terminal event after the stream closed",
+                )
+                return []
             raise ProtocolTransformError(
                 "upstream emitted data after the stream was closed",
                 code="HUB_SSE_LATE_EVENT",
@@ -6123,20 +6273,15 @@ class AnthropicStreamBridge:
                 )
         if self.upstream_terminal and self.api_format != "openai_chat":
             kind = payload.get("type") if isinstance(payload.get("type"), str) else event
-            code = (
-                "HUB_SSE_DUPLICATE_CONFLICT"
-                if kind
-                in {
-                    "response.completed",
-                    "response.incomplete",
-                    "response.failed",
-                    "error",
-                }
-                else "HUB_SSE_LATE_EVENT"
-            )
+            if kind in _TERMINAL_EVENT_KINDS:
+                self._observe_stream_degradation(
+                    "HUB_DEGRADE_DUPLICATE_TERMINAL_SKIPPED",
+                    "upstream replayed a terminal event after terminal",
+                )
+                return []
             raise ProtocolTransformError(
                 "upstream Responses emitted an event after terminal",
-                code=code,
+                code="HUB_SSE_LATE_EVENT",
             )
         return (
             self._feed_chat(payload)
@@ -6172,6 +6317,9 @@ class AnthropicStreamBridge:
             self.fsm.mark_error()
             self.fsm.close_stream()
             self.upstream_terminal = True
+            self.error_terminal = True
+            self.terminal_error_code = evidence_code
+            self.terminal_error_message = evidence_message
             self.stopped = True
             return [
                 sse_event(
@@ -6763,6 +6911,9 @@ class AnthropicStreamBridge:
             self.fsm.mark_error()
             self.fsm.close_stream()
             self.upstream_terminal = True
+            self.error_terminal = True
+            self.terminal_error_code = evidence_code
+            self.terminal_error_message = evidence_message
             self.stopped = True
             return [
                 sse_event(

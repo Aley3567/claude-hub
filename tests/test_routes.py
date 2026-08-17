@@ -540,8 +540,12 @@ class RouteGroupTests(unittest.TestCase):
         self.assertEqual(response.headers["x-hub-model"], "fixture-model-b")
         self.assertEqual(response.headers["x-hub-route"], "fixture-route")
 
-    def _write_pool_db(self):
-        """Two pool members on one endpoint plus a fallback provider."""
+    def _write_pool_db(self, meta=None):
+        """Two pool members on one endpoint plus a fallback provider.
+
+        ``meta`` overrides the provider metadata, so the same pool fixture can
+        drive either the native or the transformed handler.
+        """
         self.db_file.unlink(missing_ok=True)
         connection = sqlite3.connect(self.db_file)
         try:
@@ -555,7 +559,7 @@ class RouteGroupTests(unittest.TestCase):
                 ("fallback", "fixture-pool-token-c", "https://fixture-pool-b.invalid/v1"),
             ):
                 connection.execute(
-                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, '{}')",
+                    "INSERT INTO providers VALUES (?, ?, 'claude', ?, ?)",
                     (
                         provider_id,
                         f"Fixture Pool {provider_id}",
@@ -567,6 +571,7 @@ class RouteGroupTests(unittest.TestCase):
                                 }
                             }
                         ),
+                        json.dumps(meta or {}),
                     ),
                 )
             connection.commit()
@@ -847,6 +852,36 @@ class RouteGroupTests(unittest.TestCase):
         self.assertEqual(response.headers["x-hub-channel"], "alpha")
         self.assertEqual(response.headers["x-hub-route"], "fixture-route")
 
+    def test_final_transformed_route_exhaustion_keeps_last_request_degrade(self):
+        self._route_config(
+            {
+                "fixture-route": [
+                    {"channel": "gamma", "model": "fixture-model-c"},
+                ]
+            }
+        )
+        session = _SequencedFakeSession(
+            [_json_upstream(401, {"error": {"message": "fixture denied"}})]
+        )
+
+        response = self._run(
+            {
+                "model": "route:fixture-route",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session,
+        )
+
+        self.assertEqual(response.status, 401)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "route")
+        self.assertEqual(row["channel"], "gamma")
+        self.assertEqual(
+            row["deg"],
+            ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"],
+        )
+
     def test_403_moves_to_the_next_target(self):
         # Transport is pinned to direct so the fixture owns exactly one
         # candidate; once every transport of the target rejects with 403 the
@@ -977,6 +1012,61 @@ class RouteGroupTests(unittest.TestCase):
         self.assertEqual(response.headers["x-hub-route"], "fixture-pool-route")
         self.assertEqual(len(session.calls), 0)
 
+    def test_native_pool_exhaustion_keeps_the_request_degrade(self):
+        """R4: a pool-denied credential still has to name the degradation.
+
+        The pool refuses before anything is sent upstream, so this is the one
+        journal row the turn ever produces. Dropping `deg` here made a
+        degraded request indistinguishable from a clean one.
+        """
+        self._write_pool_db()
+        self._write_pool_config()
+        self._seed_pool_cooldown(300)
+        self._pool_route_config([{"channel": "alpha", "model": "pool-model-a"}])
+        session = _SequencedFakeSession([])
+
+        response = self._run(
+            {
+                "model": "route:fixture-pool-route",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session,
+        )
+
+        self.assertEqual(response.status, 429)
+        self.assertEqual(len(session.calls), 0)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "route")
+        self.assertEqual(row["channel"], "alpha")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+
+    def test_transformed_pool_exhaustion_keeps_the_request_degrade(self):
+        """R4, mirrored: the transformed handler raises from its own site."""
+        self._write_pool_db(meta={"apiFormat": "openai_chat"})
+        self._write_pool_config()
+        self._seed_pool_cooldown(300)
+        self._pool_route_config([{"channel": "alpha", "model": "pool-model-a"}])
+        session = _SequencedFakeSession([])
+
+        response = self._run(
+            {
+                "model": "route:fixture-pool-route",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "future_request_field": True,
+            },
+            session,
+        )
+
+        self.assertEqual(response.status, 429)
+        self.assertEqual(len(session.calls), 0)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "route")
+        self.assertEqual(row["channel"], "alpha")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED"])
+
     def test_count_tokens_route_estimates_when_upstream_lacks_the_endpoint(self):
         self._route_config(self._fixture_route())
         session = _SequencedFakeSession(
@@ -1000,6 +1090,41 @@ class RouteGroupTests(unittest.TestCase):
             [call[0] for call in session.calls],
             ["https://fixture-a.invalid/v1/messages/count_tokens"],
         )
+
+    def test_count_tokens_route_exhaustion_keeps_the_request_degrade(self):
+        """The probe's journal row attributes its own failure.
+
+        This site used to blank `deg` for count probes, as a guard against
+        double-counting them in the usage report. That is now handled at the
+        source — a probe records no usage row at all — so the one row this
+        turn produces may name its degradation like any other failure.
+        """
+        self._route_config(
+            {"fixture-route": [{"channel": "alpha", "model": "fixture-model-a"}]}
+        )
+        session = _SequencedFakeSession(
+            [_json_upstream(429, {"error": {"message": "fixture rate limited"}})]
+        )
+
+        response = self._run(
+            {
+                "model": "route:fixture-route",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "fixture"},
+                ],
+            },
+            session,
+            path="/v1/messages/count_tokens",
+        )
+
+        self.assertEqual(response.status, 429)
+        row = json.loads(self.errors_file.read_text(encoding="utf-8"))
+        self.assertEqual(row["phase"], "route")
+        self.assertEqual(row["channel"], "alpha")
+        self.assertEqual(row["deg"], ["HUB_DEGRADE_SYSTEM_ROLE_PROMOTED"])
+        # Counting stays fixed at the source, not by blanking attribution.
+        self.assertFalse(self.usage_file.exists())
 
     def test_count_tokens_route_failover_keeps_target_order(self):
         self._route_config(self._fixture_route())
