@@ -1076,11 +1076,17 @@ def _snapshot_metrics_hit() -> None:
         _snapshot_hits += 1
 
 
-def _snapshot_metrics_refresh(elapsed_ms: int) -> dict:
-    """Record a successful refresh and return the current sanitized snapshot."""
-    global _snapshot_misses, _snapshot_refreshes
+def _snapshot_metrics_miss() -> None:
+    """Count a fast-path miss, before any refresh is attempted."""
+    global _snapshot_misses
     with _snapshot_metrics_lock:
         _snapshot_misses += 1
+
+
+def _snapshot_metrics_refresh(elapsed_ms: int) -> dict:
+    """Record a successful refresh and return the current sanitized snapshot."""
+    global _snapshot_refreshes
+    with _snapshot_metrics_lock:
         _snapshot_refreshes += 1
         _snapshot_refresh_samples.append(elapsed_ms)
         return {
@@ -1090,6 +1096,14 @@ def _snapshot_metrics_refresh(elapsed_ms: int) -> dict:
             "p50_ms": _snapshot_percentile(_snapshot_refresh_samples, 50),
             "p95_ms": _snapshot_percentile(_snapshot_refresh_samples, 95),
         }
+
+
+def _snapshot_metrics_refresh_failed() -> int:
+    """Count a failed refresh and return the running failure total."""
+    global _snapshot_refresh_failures
+    with _snapshot_metrics_lock:
+        _snapshot_refresh_failures += 1
+        return _snapshot_refresh_failures
 
 
 def _read_provider_snapshot(path: Path) -> tuple:
@@ -1129,43 +1143,68 @@ def _read_provider_snapshot(path: Path) -> tuple:
 
 
 def get_providers() -> dict:
-    """Read current provider data from CC Switch using SQLite ``mode=ro``."""
+    """Read current provider data from CC Switch using SQLite ``mode=ro``.
+
+    Results are cached process-wide in a single-slot ``(revision, providers)``
+    entry keyed by a fingerprint of the main DB + WAL files. A revision match
+    is a zero-copy hit. Concurrent misses are single-flight coalesced: a
+    waiter accepts the entry another thread refreshed while it waited. The
+    0600 permission check runs on every call before the cache lookup and
+    fails closed with ``ProviderDatabaseError``.
+    """
     global _snapshot_entry
     path = _resolve_database_path(db_path())
     _require_private_database(path)
-    revision = _database_snapshot_state(path)
-    entry = _snapshot_entry
-    if entry is not None and entry[0] == revision:
-        _snapshot_metrics_hit()
-        return entry[1]
-    with _snapshot_lock:
+    try:
+        revision = _database_snapshot_state(path)
         entry = _snapshot_entry
         if entry is not None and entry[0] == revision:
             _snapshot_metrics_hit()
             return entry[1]
-        try:
+        _snapshot_metrics_miss()
+        with _snapshot_lock:
+            # Single-flight: if another thread refreshed while we waited, the
+            # entry object has changed. That entry was verified (permissions
+            # re-checked after copying) and is at least as fresh as the
+            # revision we stat'ed at entrance, so accept it instead of
+            # serializing one refresh per waiter (design doc §3.2).
+            refreshed = _snapshot_entry
+            if refreshed is not None and refreshed is not entry:
+                return refreshed[1]
             started = time.monotonic()
-            providers, verified = _read_provider_snapshot(path)
-            elapsed_ms = int(round((time.monotonic() - started) * 1000))
-            # Recheck because a writer can create WAL sidecars while the
-            # read is open.
-            _require_private_database(path)
-        except (sqlite3.Error, OSError) as exc:
-            raise ProviderDatabaseError(
-                "provider database could not be read"
-            ) from exc
-        _snapshot_entry = (verified, providers)
-        metrics = _snapshot_metrics_refresh(elapsed_ms)
-        log(
-            f"provider_snapshot "
-            f"refresh_ms={elapsed_ms} "
-            f"hits={metrics['hits']} "
-            f"misses={metrics['misses']} "
-            f"refreshes={metrics['refreshes']} "
-            f"p50_ms={metrics['p50_ms']} "
-            f"p95_ms={metrics['p95_ms']}"
-        )
-        return providers
+            try:
+                providers, verified = _read_provider_snapshot(path)
+                elapsed_ms = int(round((time.monotonic() - started) * 1000))
+                # Recheck because a writer can create WAL sidecars while the
+                # read is open.
+                _require_private_database(path)
+            except (ProviderDatabaseError, sqlite3.Error, OSError) as exc:
+                failures = _snapshot_metrics_refresh_failed()
+                log(
+                    f"provider_snapshot refresh_failed "
+                    f"failures={failures} error={type(exc).__name__}"
+                )
+                if isinstance(exc, ProviderDatabaseError):
+                    raise
+                raise ProviderDatabaseError(
+                    "provider database could not be read"
+                ) from exc
+            _snapshot_entry = (verified, providers)
+            metrics = _snapshot_metrics_refresh(elapsed_ms)
+    except (sqlite3.Error, OSError) as exc:
+        raise ProviderDatabaseError(
+            "provider database could not be read"
+        ) from exc
+    log(
+        f"provider_snapshot "
+        f"refresh_ms={elapsed_ms} "
+        f"hits={metrics['hits']} "
+        f"misses={metrics['misses']} "
+        f"refreshes={metrics['refreshes']} "
+        f"p50_ms={metrics['p50_ms']} "
+        f"p95_ms={metrics['p95_ms']}"
+    )
+    return providers
 
 
 def reset_caches() -> None:
@@ -1174,7 +1213,7 @@ def reset_caches() -> None:
     Primarily useful for isolated diagnostics and tests.
     """
     global _snapshot_entry, _snapshot_hits, _snapshot_misses, _snapshot_refreshes
-    global _errors_fp
+    global _snapshot_refresh_failures, _errors_fp
     _cfg_cache.update({"path": None, "mtime_ns": None, "size": None, "raw": None})
     with _snapshot_lock:
         _snapshot_entry = None
@@ -1182,6 +1221,7 @@ def reset_caches() -> None:
         _snapshot_hits = 0
         _snapshot_misses = 0
         _snapshot_refreshes = 0
+        _snapshot_refresh_failures = 0
         _snapshot_refresh_samples.clear()
     if _errors_fp is not None:
         try:
@@ -1218,6 +1258,7 @@ class RouteTargetExhausted(Exception):
         alias: str | None = None,
         evidence_code: str | None = None,
         evidence_message: str | None = None,
+        degrade_codes: tuple[str, ...] = (),
     ):
         super().__init__(f"route target exhausted after upstream {status}")
         self.status = status

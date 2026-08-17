@@ -2711,6 +2711,95 @@ class ClaudeHubTests(unittest.TestCase):
         ):
             hub.get_providers()
 
+    def test_snapshot_state_oserror_is_wrapped_as_database_error(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        # _database_snapshot_state runs before the snapshot read. A bare
+        # OSError (EACCES/ENOTDIR/ESTALE/EIO) escaping get_providers() would
+        # bypass controlled_error_middleware and degrade the controlled 503
+        # JSON into an aiohttp HTML 500.
+        with mock.patch.object(
+            hub,
+            "_database_snapshot_state",
+            side_effect=PermissionError(13, "Permission denied"),
+        ):
+            with self.assertRaisesRegex(
+                hub.ProviderDatabaseError, "provider database could not be read"
+            ):
+                hub.get_providers()
+
+        # The warm entry must survive the failed revision check.
+        self.assertIs(hub.get_providers(), cached)
+
+    def test_provider_snapshot_waiter_accepts_concurrent_refresh(self):
+        cached = hub.get_providers()
+        self.assertIn("Fixture HTTPS", cached)
+
+        fresh = {"Fresh HTTPS": {"token": "fresh-token"}}
+        real_lock = hub._snapshot_lock
+
+        class SwapOnEnter:
+            """Simulate a thread that refreshed while this one waited."""
+
+            def __enter__(self):
+                real_lock.__enter__()
+                hub._snapshot_entry = ((0, 0, 0, 0, 0), fresh)
+                return self
+
+            def __exit__(self, *args):
+                return real_lock.__exit__(*args)
+
+        # Force a miss with a revision that matches neither the warm entry
+        # nor the swapped-in one. The waiter must accept the concurrently
+        # refreshed entry instead of serializing a refresh of its own.
+        with mock.patch.object(
+            hub,
+            "_database_snapshot_state",
+            side_effect=lambda path: ((1, 1, 1, 1, 1), None),
+        ), mock.patch.object(
+            hub, "_snapshot_lock", SwapOnEnter()
+        ), mock.patch.object(
+            hub, "_read_provider_snapshot"
+        ) as read:
+            result = hub.get_providers()
+
+        self.assertIs(result, fresh)
+        read.assert_not_called()
+
+    def test_provider_snapshot_refresh_failure_is_counted_and_logged(self):
+        hub.open_log()
+        hub.get_providers()  # warm cache: misses=1, refreshes=1
+
+        with mock.patch.object(
+            hub,
+            "_database_snapshot_state",
+            side_effect=lambda path: ((0, 0, 0, 0, 0), None),
+        ), mock.patch.object(
+            hub,
+            "_read_provider_snapshot",
+            side_effect=hub.ProviderDatabaseError("boom"),
+        ):
+            with self.assertRaisesRegex(hub.ProviderDatabaseError, "boom"):
+                hub.get_providers()
+
+        # miss counted at entrance, refresh only on success: no longer equal.
+        self.assertEqual(hub._snapshot_misses, 2)
+        self.assertEqual(hub._snapshot_refreshes, 1)
+        self.assertEqual(hub._snapshot_refresh_failures, 1)
+
+        failure_lines = [
+            line
+            for line in self.log_file.read_text(encoding="utf-8").splitlines()
+            if "refresh_failed" in line
+        ]
+        self.assertEqual(len(failure_lines), 1, failure_lines)
+        self.assertIn("failures=1", failure_lines[0])
+        self.assertIn("error=ProviderDatabaseError", failure_lines[0])
+        # Sanitized: no paths, provider names, or payload.
+        self.assertNotIn(str(self.db_file), failure_lines[0])
+        self.assertNotIn("Fixture", failure_lines[0])
+
     def test_provider_snapshot_cache_hit_path_still_checks_permissions(self):
         cached = hub.get_providers()
         self.assertIn("Fixture HTTPS", cached)

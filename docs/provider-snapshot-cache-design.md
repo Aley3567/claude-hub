@@ -80,28 +80,35 @@ revision 必须同时包含 WAL 指纹才能检测到已提交但未 checkpoint 
 def get_providers() -> dict:
     path = _resolve_database_path(db_path())
     _require_private_database(path)              # 1. 权限先行，fail closed
-    revision = _database_snapshot_state(path)    # 2. 再取指纹
-    cached = _snapshot_cache
-    if cached["providers"] is not None and cached["revision"] == revision:
-        _snapshot_metrics_hit()                  # 3. 命中：零复制、零 SQLite
-        return cached["providers"]
-    with _snapshot_lock:                         # 4. single-flight
-        if (_snapshot_cache["providers"] is not None
-                and _snapshot_cache["revision"] == revision):
-            _snapshot_metrics_hit()              # 5. 等待者复用同一结果
-            return _snapshot_cache["providers"]
-        providers, verified = _read_provider_snapshot(path)   # 6. 唯一一次复制
-        _require_private_database(path)                       # 7. 读后复检 sidecar
-        _snapshot_cache.update(
-            {"revision": verified, "providers": providers}
-        )
-        return providers
+    try:
+        revision = _database_snapshot_state(path)    # 2. 再取指纹
+        cached = _snapshot_entry
+        if cached is not None and cached[0] == revision:
+            _snapshot_metrics_hit()              # 3. 命中：零复制、零 SQLite
+            return cached[1]
+        _snapshot_metrics_miss()
+        with _snapshot_lock:                     # 4. single-flight
+            refreshed = _snapshot_entry
+            if refreshed is not None and refreshed is not cached:
+                return refreshed[1]              # 5. 等待者复用等待期间的新刷新
+            providers, verified = _read_provider_snapshot(path)  # 6. 唯一一次复制
+            _require_private_database(path)                      # 7. 读后复检 sidecar
+            _snapshot_entry = (verified, providers)
+            metrics = _snapshot_metrics_refresh(elapsed_ms)
+    except (sqlite3.Error, OSError) as exc:      # 8. 指纹/读取的 OSError 统一包装
+        raise ProviderDatabaseError(...) from exc
+    log(...)                                     # 9. 日志在锁外
+    return providers
 ```
 
 要点：
 
-- **权限在指纹之前**。命中路径也必须完整过一次 `_require_private_database`，否则权限被
-  改宽后会因命中而跳过检查。命中路径的成本因此是 2–3 次 `stat`。
+- **权限在指纹之前**。命中路径也必须完整过一次 `_require_private_database`。这是深度
+  防御，而不是兜底：实测 `chmod 0600 → 0644` 只改 `ctime_ns`，指纹
+  `(dev, ino, size, mtime_ns, ctime_ns)` 必然变化，权限改宽后实际总是走 miss 路径，
+  命中路径根本到不了。保留检查的理由是不依赖「指纹必然覆盖权限变化」这一实现细节
+  —— 若将来指纹分量调整（例如去掉 ctime），这条检查仍然兜住。命中路径的成本因此是
+  2–3 次 `stat`。
 - **命中路径不做第二次 `_require_private_database`**。现有第二次检查的理由（注释写明
   「写者可能在读期间创建 WAL sidecar」）只在真正打开副本读取时成立；命中既不复制也不
   读，第一次检查已覆盖主库与现存 sidecar。
@@ -110,12 +117,21 @@ def get_providers() -> dict:
   后再 stat 一次」的结果做键，写者在读取刚结束时提交的话，会把新文件状态配上旧数据，
   产生一个不会自愈的 stale 命中。为此把 `_read_provider_snapshot` 的返回改为
   `(providers, verified_revision)` —— 它是私有 helper，不属于 interface。
-- **锁内完成 refresh**。刻意让并发 miss 线程串行等待一次约 42ms 的刷新，而不是各自复制
-  一遍。热路径是 `asyncio.to_thread`，多个线程并发进入同步函数，所以必须是
-  `threading.Lock`，不能用 `asyncio.Lock`。
+- **锁内完成 refresh，但等待者按条目身份而非 revision 复用**。刻意让并发 miss 线程
+  串行等待一次约 42ms 的刷新，而不是各自复制一遍。等待者进锁后不再要求自己入口处的
+  revision 严格相等：只要条目对象在等待期间被换过（说明另一个线程刚完成一次 verified
+  刷新），就直接接受它。入口 revision 只是该线程自己 stat 时刻的读数，revision 持续
+  变化时严格相等必然失败、会把可并行的复制串行化（实测 8 线程 60ms→447ms）。条目没变
+  才自己刷新，因此缓存不会在 DB 变化后卡死。热路径是 `asyncio.to_thread`，多个线程并发
+  进入同步函数，所以必须是 `threading.Lock`，不能用 `asyncio.Lock`。
 - **异常不写缓存、不清缓存**。DB 变得不可读或权限变宽时直接抛出，不回退到旧快照
   （旧 token 可能已被撤销）。保留旧缓存无害：下一次仍要先过权限与指纹，指纹已变就仍会
   尝试 refresh 并再次失败。
+- **`miss` 与 `refresh` 分离计数，失败单独计数并写日志**。`miss` 在入口未命中时 +1，
+  `refresh` 只在成功复制后 +1，失败计 `refresh_failed` 并写一行只含异常类型名的脱敏
+  日志。三者同源时会恒等（misses == refreshes），失败路径则完全静默 —— 一个反复
+  fail-closed 的 Hub 在日志里看不出任何异常。`log()` 在锁外，避免日志 I/O 阻塞等待
+  刷新的线程。
 - **`reset_caches()` 必须清 snapshot 缓存**。它已是测试隔离的既有闸门（`tests/` 中 19 处
   以上调用），新缓存不挂进去会造成测试间互相污染。
 - **`cli_doctor` 保持直接调用 `_read_provider_snapshot`**（`:3525`）。doctor 要验证的是
