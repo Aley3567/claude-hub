@@ -278,13 +278,15 @@ OK  'session expired, please retry'                        → 原样
 
 ---
 
-## R9 提交范围拆分
+## R9 ✅ 2026-08-17 提交范围拆分
 
-当前工作树混进三块与 T0.1–T0.5 无关的改动【报告】，按队列规则"一张卡 = 一次专注工作闭环"应拆开：
+原先混入 T0.1-T0.5 的三块改动已独立为三笔提交，journal 主提交不再携带它们：
 
-1. provider snapshot 单飞缓存重构。
-2. `[1m]` 对 OpenAI 渠道的转发行为变更——部分回退 `0270718`，且 docstring 理由（"upstreams that recognise it still receive the 1M intent"）**无证据来源**。AGENTS.md 第 27 行要求偏离写明"防什么 / 超在哪"，这条缺证据；不认识该后缀的 OpenAI 兼容上游会拿到一个不存在的 model id。
-3. 流失败改为下发 `event: error` 而非 abort——**R1 的爆炸半径就来自这块**。
+1. `1fed184` — provider snapshot 单飞缓存重构。
+2. `d9faf59` — `[1m]` 对 OpenAI 渠道的转发行为变更。
+3. `e37891e` — 流失败下发 `event: error` 而非 abort。
+
+提交边界已修复。第 2 项的上游兼容性证据仍应在后续功能审查中补齐；本卡只处理范围拆分。
 
 ---
 
