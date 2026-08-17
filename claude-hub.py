@@ -1934,10 +1934,21 @@ def ensure_1m_beta(headers, model_out: str) -> None:
     headers["anthropic-beta"] = ",".join(unique_values)
 
 
-def upstream_model_id(model_out: str) -> str:
-    """Remove Claude Code's client-side 1M selector from the wire model ID."""
+def upstream_model_id(model_out: str, api_format: str) -> str:
+    """Resolve the model ID to send upstream.
+
+    For Anthropic-format channels the ``[1m]`` suffix is a local routing
+    signal; it is stripped here and compensated with the context-1m beta
+    header elsewhere.  For OpenAI-compatible channels the suffix is forwarded
+    unchanged so upstreams that recognise it still receive the 1M intent.
+    """
+    if api_format != "anthropic":
+        return model_out
     if model_out.casefold().endswith("[1m]"):
-        return model_out[:-4]
+        stripped = model_out[:-4]
+        if stripped:
+            return stripped
+        return model_out
     return model_out
 
 
@@ -3136,11 +3147,13 @@ async def _forward_to_channel(
     account_pool = _RequestAccountPool(provider, providers)
     route_headers = {"x-hub-route": route_name} if route_name else {}
 
-    # ``[1m]`` selects Claude Code's 1M context mode; it is not part of the
-    # provider's model ID.  Keep ``model_out`` for routing/telemetry and beta
-    # header selection, but never send the selector in the JSON model field.
-    payload["model"] = upstream_model_id(model_out)
     api_format = provider.get("api_format", "anthropic")
+
+    # ``[1m]`` selects Claude Code's 1M context mode.  For Anthropic channels
+    # it is not part of the provider's model ID and is stripped here; the
+    # context-1m beta header is added below.  For OpenAI-compatible channels
+    # the suffix is forwarded unchanged so the upstream sees the 1M intent.
+    payload["model"] = upstream_model_id(model_out, api_format)
     if provider.get("is_full_url") and request.query_string:
         return anthropic_error(
             400,
@@ -3926,17 +3939,17 @@ async def cli_check(target: str | None) -> None:
             provider = resolve_provider(alias, cfg)
         except RouteError as exc:
             return alias, f"✗ {exc.message}"
+        api_format = provider.get("api_format", "anthropic")
         model = (
             channel["models"][0]
             if channel.get("models")
             else "claude-sonnet-4"
         )
         probe = {
-            "model": model,
+            "model": upstream_model_id(model, api_format),
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}],
         }
-        api_format = provider.get("api_format", "anthropic")
         endpoint, upstream_payload = transform_request(
             probe,
             api_format,

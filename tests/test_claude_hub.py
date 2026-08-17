@@ -1259,6 +1259,27 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(values.count("context-1m-2025-08-07"), 1)
         self.assertEqual(values.count("context-1m-old"), 1)
 
+    def test_upstream_model_id_strips_suffix_only_for_anthropic(self):
+        cases = [
+            # (api_format, model, expected)
+            ("anthropic", "claude-sonnet-4[1m]", "claude-sonnet-4"),
+            ("anthropic", "claude-sonnet-4[1M]", "claude-sonnet-4"),
+            ("anthropic", "x[1m]", "x"),
+            ("anthropic", "[1m]", "[1m]"),
+            ("anthropic", "[1M]", "[1M]"),
+            ("anthropic", "[1m]extra", "[1m]extra"),
+            ("anthropic", "", ""),
+            ("anthropic", "claude-sonnet-4", "claude-sonnet-4"),
+            ("openai_chat", "glm-5.3[1M]", "glm-5.3[1M]"),
+            ("openai_chat", "glm-5.3[1m]", "glm-5.3[1m]"),
+            ("openai_chat", "glm-5.3", "glm-5.3"),
+            ("openai_responses", "moonshotai/Kimi-K3[1M]", "moonshotai/Kimi-K3[1M]"),
+            ("openai_responses", "moonshotai/Kimi-K3[1m]", "moonshotai/Kimi-K3[1m]"),
+        ]
+        for api_format, model, expected in cases:
+            with self.subTest(api_format=api_format, model=model):
+                self.assertEqual(hub.upstream_model_id(model, api_format), expected)
+
     def test_remote_http_is_rejected_without_channel_opt_in(self):
         cfg = hub.get_config()
 
@@ -4466,6 +4487,183 @@ class ClaudeHubTests(unittest.TestCase):
         self.assertEqual(response.writes, chunks)
         self.assertEqual(b"".join(response.writes), b"".join(chunks))
         self.assertTrue(response.eof)
+
+    def test_forwarding_1m_selector_is_format_aware(self):
+        cases = [
+            (
+                "anthropic",
+                "http://127.0.0.1:19090/v1/messages",
+                "claude-sonnet-4[1m]",
+                "claude-sonnet-4",
+                [b'{"type":"message","content":[]}'],
+            ),
+            (
+                "openai_chat",
+                "http://127.0.0.1:19090/v1/chat/completions",
+                "glm-5.3[1M]",
+                "glm-5.3[1M]",
+                [
+                    json.dumps(
+                        {
+                            "id": "chat_1",
+                            "model": "glm-5.3[1M]",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "hi",
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "total_tokens": 2,
+                            },
+                        }
+                    ).encode()
+                ],
+            ),
+            (
+                "openai_responses",
+                "http://127.0.0.1:19090/custom/responses",
+                "custom-model[1m]",
+                "custom-model[1m]",
+                [
+                    json.dumps(
+                        {
+                            "id": "resp_1",
+                            "model": "custom-model[1m]",
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {"type": "output_text", "text": "hi"}
+                                    ],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 1,
+                            },
+                        }
+                    ).encode()
+                ],
+            ),
+        ]
+
+        for api_format, endpoint, model, expected_upstream_model, chunks in cases:
+            with self.subTest(api_format=api_format, model=model):
+                self._configure_provider_and_channel(
+                    "fast", model, endpoint, api_format
+                )
+
+                upstream = _FakeUpstream(
+                    200,
+                    {"Content-Type": "application/json"},
+                    chunks,
+                )
+                session = _FakeSession(upstream)
+                request = self._request(
+                    {
+                        "model": f"fast,{model}",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    session=session,
+                )
+
+                with mock.patch.object(
+                    hub.web, "StreamResponse", _FakeDownstream
+                ):
+                    response = asyncio.run(hub.handle_messages(request))
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(session.calls), 1)
+                url, kwargs = session.calls[0]
+                self.assertEqual(url, endpoint)
+                payload = json.loads(kwargs["data"])
+                self.assertEqual(payload["model"], expected_upstream_model)
+
+                if api_format == "anthropic":
+                    self.assertIn(
+                        "context-1m-2025-08-07",
+                        kwargs["headers"]["anthropic-beta"],
+                    )
+                else:
+                    self.assertNotIn("anthropic-beta", kwargs["headers"])
+
+    def test_check_and_serve_agree_on_upstream_model_for_1m_selector(self):
+        cases = [
+            (
+                "anthropic",
+                "http://127.0.0.1:19090/v1/messages",
+                "claude-sonnet-4[1m]",
+                "claude-sonnet-4",
+            ),
+            (
+                "openai_chat",
+                "http://127.0.0.1:19090/v1/chat/completions",
+                "glm-5.3[1M]",
+                "glm-5.3[1M]",
+            ),
+            (
+                "openai_responses",
+                "http://127.0.0.1:19090/custom/responses",
+                "custom-model[1m]",
+                "custom-model[1m]",
+            ),
+        ]
+
+        for api_format, endpoint, model, expected_upstream_model in cases:
+            with self.subTest(api_format=api_format, model=model):
+                self._configure_provider_and_channel(
+                    "fast", model, endpoint, api_format
+                )
+
+                class FakeResponse:
+                    status = 200
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, _exc_type, _exc, _traceback):
+                        return False
+
+                class FakeSession:
+                    def __init__(self):
+                        self.calls = []
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, _exc_type, _exc, _traceback):
+                        return False
+
+                    def post(self, url, **kwargs):
+                        self.calls.append((url, kwargs))
+                        return FakeResponse()
+
+                session = FakeSession()
+                with mock.patch.object(
+                    hub.aiohttp, "ClientSession", return_value=session
+                ), redirect_stdout(io.StringIO()):
+                    asyncio.run(hub.cli_check("fast"))
+
+                self.assertEqual(len(session.calls), 1)
+                url, kwargs = session.calls[0]
+                self.assertEqual(url, endpoint)
+                self.assertEqual(kwargs["json"]["model"], expected_upstream_model)
+
+                if api_format == "anthropic":
+                    self.assertIn(
+                        "context-1m-2025-08-07",
+                        kwargs["headers"]["anthropic-beta"],
+                    )
+                else:
+                    self.assertNotIn("anthropic-beta", kwargs["headers"])
 
     def test_native_forwarding_promotes_system_role_for_strict_upstreams(self):
         upstream = _FakeUpstream(
