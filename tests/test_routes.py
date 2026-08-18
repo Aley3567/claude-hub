@@ -909,6 +909,87 @@ class RouteGroupTests(unittest.TestCase):
         self.assertEqual(response.headers["x-hub-channel"], "beta")
         self.assertEqual(response.headers["x-hub-route"], "fixture-route")
 
+    def test_405_does_not_move_to_the_next_explicit_route_target(self):
+        # Method/path rejection is a capability or configuration failure, not
+        # a transient route failure. Preserve it instead of replaying a full
+        # Claude Code request against a different provider.
+        self._route_config(self._fixture_route(), transport={"mode": "direct"})
+        session = _SequencedFakeSession(
+            [
+                _json_upstream(
+                    405,
+                    {"error": {"code": "method_not_allowed", "message": "fixture route A"}},
+                    {"Allow": "GET"},
+                ),
+                _json_upstream(200, {"usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+
+        response = self._run(
+            {"model": "route:fixture-route", "messages": []}, session
+        )
+
+        self.assertEqual(response.status, 405)
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(response.headers["x-hub-channel"], "alpha")
+
+    def test_native_405_returns_safe_upstream_evidence(self):
+        # Native Anthropic errors used to be byte-transparent, which reduced
+        # an empty/HTML 405 to Claude Code's opaque ``API Error: 405``.
+        self._write_config(transport={"mode": "direct"})
+        upstream = _FakeUpstream(
+            405,
+            {"Content-Type": "text/plain", "Allow": "GET"},
+            [
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "method_not_allowed",
+                            "message": (
+                                "method not allowed at https://fixture.invalid/api?"
+                                "token=fixture-secret"
+                            ),
+                        }
+                    }
+                ).encode()
+            ],
+        )
+        session = _SequencedFakeSession([upstream])
+
+        response = self._run(
+            {"model": "fixture-model-a", "messages": []}, session
+        )
+
+        self.assertEqual(response.status, 405)
+        payload = json.loads(response.text)
+        self.assertIn("upstream HTTP 405", payload["error"]["message"])
+        self.assertIn("method not allowed", payload["error"]["message"])
+        self.assertNotIn("fixture-secret", payload["error"]["message"])
+        self.assertNotIn("fixture.invalid", payload["error"]["message"])
+        self.assertEqual(response.headers["allow"], "GET")
+
+    def test_native_405_empty_and_html_bodies_stay_safe(self):
+        for content_type, body in (("text/plain", b""), ("text/html", b"<html>405</html>")):
+            with self.subTest(content_type=content_type):
+                self._write_config(transport={"mode": "direct"})
+                upstream = _FakeUpstream(
+                    405,
+                    {"Content-Type": content_type, "Allow": "GET"},
+                    [body],
+                )
+                session = _SequencedFakeSession([upstream])
+
+                response = self._run(
+                    {"model": "fixture-model-a", "messages": []}, session
+                )
+
+                self.assertEqual(response.status, 405)
+                payload = json.loads(response.text)
+                message = payload["error"]["message"]
+                self.assertEqual(message, "upstream HTTP 405")
+                self.assertNotIn("<html>", message)
+                self.assertEqual(response.headers["allow"], "GET")
+
     def test_last_error_wins_drops_an_earlier_retry_after(self):
         # Target alpha rejects 429 with Retry-After, target beta rejects 401;
         # the final response reflects only the last target's rejection.
