@@ -37,6 +37,9 @@
 - `product-definition.md` — 产品定位
 - `cc-switch-implementation-research.md` — cc-switch 实现调研
 - `claude1-protocol-baseline-2026-08-16.md` — 协议层基线与薄弱点
+- `anthropic-protocol-implementation-status.md` — 协议能力矩阵与 disposition registry
+- `transport-routing-design.md` — transport 路由设计（已落地）
 - `维护与兼容指南.md` — 架构与维护约定
 - `p0-tasks.md` — 任务队列;存在即有效,从顶部拿活
 - `review-findings-2026-08-17.md` — 审查发现清单;R1–R6 是 T0.6 前置
+- `publishing.md` — npm 发布 runbook

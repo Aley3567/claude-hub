@@ -1,6 +1,6 @@
 # Anthropic 多协议内核实施状态
 
-> 实施合同：`docs/anthropic-protocol-compatibility-research.md`
+> 实施合同：`docs/anthropic-protocol-compatibility-research.md`（已于 2026-08-18 删除，历史见 git）
 > 基线冻结日期：2026-08-10
 
 ## 阶段 0：已冻结基线
@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | 原生 Hub 曾把 `messages[].role == "system"` 原样送往严格 Anthropic/SGLang。 | `prepare_request(..., "anthropic")` 会把合法的 Claude Code system-role 扩展提升、合并到顶层 `system`，并记录 `HUB_DEGRADE_SYSTEM_ROLE_PROMOTED`。Hub 的 native `/v1/messages` 路径已调用该 seam。 | `claude1 <native provider>` 的直连 launcher 不经过 Hub；见“Launcher 边界与未覆盖 beta”。包含 message 级额外字段或非 text system block 的提升会拒绝，避免伪造。 |
 | Chat/Responses 上游在干净 EOF 缺 terminal 时可能被补成正常 `message_stop`。 | 协议 bridge 与 Hub 生产流都在 EOF 调用显式 parser/FSM 的 `finish()`；没有有效 terminal、UTF-8 无效、JSON 不完整或 terminal 后继续内容时，已开始的下游传输会中止，而不是补成功。 | 下游可能已经收到有效的前缀字节；这只能通过断开传输表达失败，不能在已提交的 SSE 头后改写为 JSON 4xx。 |
-| 跨协议循环会静默跳过未知块或元数据。 | Chat/Responses 请求 IR 对未知顶层扩展在默认 `visible_lossy` 模式下丢弃并记录带 JSON path 的 warning，`strict` 模式拒绝；已知 block 的未知字段、未知 block、危险执行字段和未知上游 output item/event 始终 fail closed。 | 原生 Anthropic 保持透明（除了 system-role 兼容规范化）；它不能替严格上游验证未来原生扩展。 |
+| 跨协议循环会静默跳过未知块或元数据。 | Chat/Responses 请求 IR 对未知顶层扩展在默认 `visible_lossy` 模式下丢弃并记录带 JSON path 的 warning，`strict` 模式拒绝；已知 block 的未知字段、未知 block、危险执行字段始终 fail closed。Chat 上游的未知 wrapper/choice/delta 字段与未知 SSE event 默认降级丢弃（`HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`）、strict 拒绝；Responses 上游未知 output item/event 仍 fail closed。 | 原生 Anthropic 保持透明（除了 system-role 兼容规范化）；它不能替严格上游验证未来原生扩展。 |
 | `content_filter`、thinking signature、citation、cache 用量曾有伪造或静默丢失风险。 | refusal/content filter 统一为 `stop_reason: "refusal"`；signature 仅在上游真实提供时发出；citation 不能无损映射时只记录降级；usage 只复制实际的上游计数。 | 跨协议的 citation/cache-control/server-tool 语义仍不等价，按下表降级或拒绝。 |
 | `/count_tokens` 估算没有 provenance。 | Hub 对估算返回 `source=estimate`、`method=json_utf8_bytes_div_4`、`exact=0`、`error-bound=unbounded`；原生 count endpoint 成功时标记 `source=upstream`、`method=anthropic_count_tokens`、`exact=1`。 | 估算不是模型 tokenizer 的精确结果。 |
 
@@ -39,6 +39,8 @@
 - usage 是统计回执：未知 counter 不参与推导，丢弃并告警；已登记 counter 的非法值或冲突继续拒绝。
 - 上游 HTTP 错误只向日志和客户端保留经截断、脱敏的 `code/message`；不持久化完整请求 payload 或原始错误 body。
 - 本轮不加入自动探测、自学习路由或 provider 特判。provider capability override、多轮客户端 fixture 和运行中模块版本标识继续作为独立后续项。
+
+**2026-08-18 变更（T0.0a/T0.0b）**：Chat 上游响应方向的未知字段策略从 fail closed 放宽为默认 observable degradation——流式 payload/choice/delta 的未知字段、未知 SSE event、非流 wrapper 的未知字段均丢弃并记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`，`strict` 模式维持拒绝；`reasoning` 接纳为 `reasoning_content` 的通用别名。已识别 identity、choice 索引、tool-call 因果与真实终态的严格校验不变。Responses 方向的同类放宽列为 T0.0c，尚未实施，Responses 上游未知 output item/event 仍 fail closed。
 
 ## 协议 module 布局（2026-08-15）
 
@@ -128,7 +130,7 @@
 
 | 上游响应字段 / output union | Chat → Anthropic | Responses → Anthropic | 拒绝边界 |
 | --- | --- | --- | --- |
-| wrapper `id` / `model` | `exact`（存在时） | `exact`（存在时） | 非空 string；未知 wrapper 字段或 malformed core 为 `HUB_UPSTREAM_RESPONSE_INVALID`。 |
+| wrapper `id` / `model` | `exact`（存在时） | `exact`（存在时） | 非空 string；malformed core 为 `HUB_UPSTREAM_RESPONSE_INVALID`。Chat 未知 wrapper 字段默认降级为 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`，strict 拒绝。 |
 | `object` / `created` / tier / fingerprint / logprobs 等 wrapper metadata | `observable degradation` | `observable degradation` | shape 先校验；无 Anthropic carrier时记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`。 |
 | assistant text | `exact` | `exact` | 非 assistant role、未知 part 或未知 item fail closed。 |
 | reasoning summary / reasoning text carrier | unsigned thinking，`observable degradation` | unsigned summary，`observable degradation` | signature 不伪造；Responses 非空 `reasoning.content` / `reasoning_text` 仍拒绝。 |
@@ -154,7 +156,7 @@
 | Responses tool id 仅有 output index 或 anonymous fallback | `observable degradation` | 记录 `HUB_DEGRADE_SYNTHETIC_TOOL_ID`；strict 为 `HUB_SSE_TOOL_CALL_INVALID`，内部 alias 不泄漏。 |
 | streamed tool arguments | `exact` | 必须最终形成显式 JSON object；空 string、partial final JSON、2 MiB 超限、identity/order conflict 拒绝。 |
 | citation/annotation event | `observable degradation` | 必须关联正确 item/output/content、开放的 output_text part、合法 metadata carrier/index；strict 拒绝。 |
-| sequence/logprobs/obfuscation、known wrapper metadata | `observable degradation` | 稳定 metadata warning；unknown wrapper/event 字段拒绝。 |
+| sequence/logprobs/obfuscation、known wrapper metadata | `observable degradation` | 稳定 metadata warning；Chat 未知 wrapper/event 字段默认降级、strict 拒绝；Responses 未知 wrapper/event 字段拒绝。 |
 | upstream error detail | sanitized error + `observable degradation` | detail shape 校验，不回传 vendor secret；成功 terminal 携带 error 拒绝。 |
 | usage stream snapshots | 与非流 registry 相同；未观测字段省略不伪造 | 未知统计字段降级丢弃；已登记 counter 的 regression/malformed/conflict 拒绝；结束时缺 base 标记 provenance unavailable；terminal 才到达的 input usage 由 message_delta 如实携带并记录 `HUB_DEGRADE_LATE_INPUT_USAGE`。 |
 
@@ -183,7 +185,7 @@
 - `SSEParser` 与 `AnthropicStreamBridge` 是跨协议流的显式状态机；native raw SSE 使用 `_SSETerminalTracker`/`_SSEUsageTracker` 验证 terminal 与 usage，而非把不完整流补成成功。
 - Responses 的 `content_part.added/done`、`reasoning_summary_part.added/done`、text/summary delta 与 done snapshot 会按 item/index 生命周期显式配对；合法 snapshot 只补缺失 suffix，冲突、错序或未知 part fail closed。terminal item 快照调和成功即视为对应 part done（省略 `*.done` 事件的兼容路径），并记录 done snapshot 供幂等比对。Chat content→reasoning→content 交错时，开启 thinking 前会先关闭已打开的 text block，保证 Anthropic block 序列合法。无 structural wrapper 的兼容上游 delta/done 仍走独立坐标验证路径。citation/annotation event 同样校验 item/output/content 坐标、part open 状态、metadata carrier shape/index，strict 模式拒绝有损 metadata。
 - Terminal `response.output` 会重建此前未出现的完整 message、reasoning 或 function call snapshot；与 `output_item.done` 重复时幂等，identity enrichment 只补充缺失 id。相同 output index 的 type/id/content 或 encrypted snapshot 冲突会拒绝。只有 output index/anonymous identity 的 function call 使用公开 synthetic id 并记录 `HUB_DEGRADE_SYNTHETIC_TOOL_ID`，strict 拒绝；namespaced 内部 alias 不进入 Anthropic wire output。
-- Chat/Responses wrapper 的 response id/model 首见锁定，跨 chunk 改变拒绝；sequence、logprobs、obfuscation、known wrapper metadata 与 sanitized error detail 走稳定 observable degradation，unknown/malformed wrapper fail closed。
+- Chat/Responses wrapper 的 response id/model 首见锁定，跨 chunk 改变拒绝；sequence、logprobs、obfuscation、known wrapper metadata 与 sanitized error detail 走稳定 observable degradation；Chat 未知 wrapper 字段/SSE event 默认降级（strict 拒绝），Responses unknown/malformed wrapper 仍 fail closed，两侧 malformed 均 fail closed。
 - 每个 tool arguments 聚合上限 2 MiB，text/summary 每 part 2 MiB、每 bridge 合计 16 MiB，内容块总数 4096；上限按 UTF-8 bytes 计数，超限返回稳定 `HUB_SSE_*_TOO_LARGE` / `HUB_SSE_TOO_MANY_BLOCKS`。Responses 的 output item/output item id/redacted snapshot 注册表同样以 4096 条为上限，output item id 另限 1024 字符。tool arguments 即使为空也必须最终形成显式 JSON object，不能把 `""` 伪造成 `{}`；SSE 单事件边界使用 `HUB_SSE_EVENT_TOO_LARGE`。
 - Golden fixtures 位于 `tests/fixtures/anthropic_protocol/sse/`：`chat_utf8_crlf`、`responses_refusal`、`responses_tool_partial`，并与 request 的 `claude_code_system_role` golden fixture 一同覆盖稳定序列化。
 - `tests/test_protocol_sse_invariants.py` 覆盖任意及 fuzzed transport chunk 边界、UTF-8 分割、CRLF、partial JSON/tool arguments、响应 snapshot suffix 修复、invalid UTF-8/JSON、资源上限、重复/冲突 terminal、乱序/迟到事件、usage regression、无 terminal EOF、refusal、citation 与 cache/server usage。

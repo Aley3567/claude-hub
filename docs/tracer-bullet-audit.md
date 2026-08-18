@@ -55,7 +55,7 @@ credential 指纹、401/403 停用和 429 冷却，不保存 token。
 ## 阶段 2：CC Switch provider 快照热路径（下一优先级）
 
 **已落地（2026-08-16）**：实施设计见 `docs/provider-snapshot-cache-design.md`
-（含实施结果基准），任务拆解见 `docs/provider-snapshot-cache-issues.md`。
+（含实施结果基准与任务拆解记录）。
 命中路径零复制（p50 40.5ms → 0.02ms），权限检查仍在每次调用先执行，
 `reset_caches()` 是测试隔离闸门。以下原文保留作历史记录。
 
