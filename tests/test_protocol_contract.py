@@ -1272,6 +1272,67 @@ class ResponseCapabilityContractTests(unittest.TestCase):
             [{"type": "thinking", "thinking": "canonical"}],
         )
 
+    def test_chat_response_extracts_explicit_think_fence_and_keeps_malformed_text(self) -> None:
+        extracted = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "  <think>private plan</think>\nanswer",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertEqual(
+            extracted.payload["content"],
+            [
+                {"type": "thinking", "thinking": "private plan"},
+                {"type": "text", "text": "answer"},
+            ],
+        )
+        self.assertIn(
+            "HUB_DEGRADE_REASONING_FENCE_EXTRACTED",
+            extracted.plan.warning_codes,
+        )
+        malformed = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>not closed",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertEqual(
+            malformed.payload["content"],
+            [{"type": "text", "text": "<think>not closed"}],
+        )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.prepare_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "<think>private only</think>",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                "openai_chat",
+            )
+        self.assertEqual(raised.exception.code, "HUB_UPSTREAM_VISIBLE_OUTPUT_MISSING")
+
     def test_response_wrappers_reject_malformed_identity_fields(self) -> None:
         with self.assertRaises(protocol.ProtocolTransformError) as raised:
             protocol.prepare_response(

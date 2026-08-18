@@ -1101,6 +1101,86 @@ class StreamingTransformTests(unittest.TestCase):
             ],
         )
 
+    def test_chat_inline_think_fence_is_split_across_chunks(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = []
+        for content in ("<thi", "nk>private", " plan</think>", "answer"):
+            chunks.extend(
+                bridge.feed(
+                    "message",
+                    json.dumps(
+                        {"choices": [{"delta": {"content": content}, "finish_reason": None}]}
+                    ),
+                )
+            )
+        chunks.extend(
+            bridge.feed(
+                "message",
+                json.dumps(
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                ),
+            )
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1]) for chunk in chunks
+        ]
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "content_block_delta"
+        ]
+        self.assertEqual(
+            deltas,
+            [
+                {"type": "thinking_delta", "thinking": "private plan"},
+                {"type": "text_delta", "text": "answer"},
+            ],
+        )
+        self.assertIn("HUB_DEGRADE_REASONING_FENCE_EXTRACTED", bridge.warning_codes)
+        bridge.finish()
+
+    def test_chat_malformed_inline_think_is_emitted_as_visible_text(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        chunks = bridge.feed(
+            "message",
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": "<think>not closed"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ),
+        )
+        events = [
+            json.loads(chunk.decode().split("\ndata: ", 1)[1]) for chunk in chunks
+        ]
+        self.assertIn(
+            {"type": "text_delta", "text": "<think>not closed"},
+            [event["delta"] for event in events if event["type"] == "content_block_delta"],
+        )
+        bridge.finish()
+
+    def test_chat_reasoning_only_stream_does_not_reach_success_terminal(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            bridge.feed(
+                "message",
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {"content": "<think>private</think>"},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                ),
+            )
+        self.assertEqual(raised.exception.code, "HUB_UPSTREAM_VISIBLE_OUTPUT_MISSING")
+
     def test_chat_sse_is_emitted_as_terminal_anthropic_stream(self) -> None:
         upstream = [
             b'data: {"id":"chat_1","model":"model-test","choices":'
