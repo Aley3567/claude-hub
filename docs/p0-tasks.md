@@ -20,7 +20,7 @@
 
 ```text
 上游方言行为
-  → 协议层记 code（claude1_protocol.py，47 处 HUB_DEGRADE_*）
+  → 协议层记 code（claude1_protocol.py，53 处 HUB_DEGRADE_*）
   → 载体冒泡：plan.warning_codes（请求/非流响应/native）· bridge.warning_codes（流式运行时）
   → 回合收尾：record_usage（成功）/ record_error（失败）
   → JSONL journal（~/.cc-switch/logs/，0600，按大小轮转）
@@ -29,7 +29,7 @@
 
 ## 已验证事实（2026-08-16 读码确认，不用重查）
 
-- 47 处 code 全部在 `claude1_protocol.py`；不同 code 22+ 种，代表例：`HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED`（`claude1_protocol.py:2121`，请求带未知字段即确定性触发）。
+- 53 处 code 全部在 `claude1_protocol.py`（2026-08-18 复核）；不同 code 34 种，代表例：`HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED`（`claude1_protocol.py:2121`，请求带未知字段即确定性触发）。
 - 载体已通到 hub 层四个点：请求 `claude-hub.py:2748`、非流响应 `:2853`、流式 `:2945`、native `:3263`。
 - `record_usage`（`:388`）每回合调用，四个调用点 `:2862`/`:2958`/`:3526`/`:3545`；`record_error`（`:444`）仅失败回合。
 - journal 纪律现成：0600、O_NOFOLLOW、轮转、异常静默（`_open_usage_log` / `_open_errors_log`）。
@@ -38,7 +38,7 @@
 
 ---
 
-## T0.0a ✅ 2026-08-17（工作树待提交）· OpenAI Chat SSE 未知上游字段宽容
+## T0.0a ✅ 2026-08-17 · OpenAI Chat SSE 未知上游字段宽容
 
 **目的**：修复 `openai_chat` 流式响应因上游附加 metadata（例如
 `prompt_token_ids`、`token_ids`）或通用 reasoning 别名而返回 502 的问题。当前
@@ -69,7 +69,7 @@ degrade code，避免 cc-switch 式静默丢弃。
 
 ---
 
-## T0.0b ✅ 2026-08-17（工作树待提交）· OpenAI Chat 非流响应未知 wrapper 字段宽容
+## T0.0b ✅ 2026-08-17 · OpenAI Chat 非流响应未知 wrapper 字段宽容
 
 **目的**：使同一类 metadata 出现在 JSON Chat completion 时不会变成 Hub 502。
 
@@ -201,14 +201,14 @@ Code 的长 system prompt、工具调用和多轮 agent 状态。当前 `claude1
 
 ---
 
-## T0.5 收尾对账：47 处全盘点
+## T0.5 收尾对账：53 处全盘点
 
-**曳光弹已通、链路已宽之后**，盘点从"设计输入"变成"实证审计"：逐处核对 47 个 code 是否真的会落盘，产出 `docs/degrade-inventory.md`。
+**曳光弹已通、链路已宽之后**，盘点从"设计输入"变成"实证审计"：逐处核对 53 个 code 是否真的会落盘，产出 `docs/degrade-inventory.md`。
 
 **做法**：列：code | 位置 | 触发条件 | 冒泡载体 | 落盘状态（已落盘 / 到不了 hub 层+原因）。到不了的逐个补接通，或写明"不到 hub 层"的正当理由（如 strict 模式专属路径）。
 
 **验收合同**：
-1. 表行数与 `grep -c "HUB_DEGRADE_" claude1_protocol.py` 对账一致（当前 47）。
+1. 表行数与 `grep -c "HUB_DEGRADE_" claude1_protocol.py` 对账一致（2026-08-18 复核为 53）。
 2. 每行落盘状态有测试或代码路径佐证；"已落盘"行数统计写出来。
 3. 全量绿。
 

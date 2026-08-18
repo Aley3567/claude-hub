@@ -446,12 +446,12 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `install.sh` | 幂等安装与改写前备份 |
 | `tests/` | launcher、Hub、shell 与安装器的隔离测试 |
 | `docs/tracer-bullet-audit.md` | 端到端审计证据与分阶段性能优化合同 |
-| `docs/product-research.md` | 产品边界、同类产品研究与验收合同 |
-| `docs/release-verification.md` | 0.1.0 的测试、实机隔离与发布验证记录 |
+| `docs/product-definition.md` | 产品边界、现状/待建清单与验收合同 |
+| `docs/publishing.md` | npm 发布 runbook 与发布前验证 |
 
 产品取舍和协议范围见
-[docs/product-research.md](docs/product-research.md)，发布证据与已知限制见
-[docs/release-verification.md](docs/release-verification.md)，当前 tracer-bullet 审计与
+[docs/product-definition.md](docs/product-definition.md)，发布流程与已知限制见
+[docs/publishing.md](docs/publishing.md)，当前 tracer-bullet 审计与
 后续性能阶段见
 [docs/tracer-bullet-audit.md](docs/tracer-bullet-audit.md)。
 
