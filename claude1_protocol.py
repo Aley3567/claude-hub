@@ -992,6 +992,11 @@ def anthropic_to_chat(
     ):
         if source in payload:
             result[target] = payload[source]
+    if result.get("stream") is True:
+        # OpenAI-compatible providers only attach a usage chunk to a stream
+        # when explicitly asked.  Without it usage accounting degrades to
+        # "unavailable" (HUB_USAGE_PROVENANCE_UNAVAILABLE).
+        result["stream_options"] = {"include_usage": True}
 
     tools = []
     for tool_index, tool in enumerate(payload.get("tools", [])):
