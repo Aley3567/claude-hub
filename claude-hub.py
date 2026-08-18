@@ -3451,6 +3451,69 @@ async def _forward_to_channel(
                     },
                 )
 
+            if upstream.status == 405:
+                # Native providers do not consistently return an Anthropic
+                # error envelope: a 405 is commonly empty or HTML, which
+                # leaves Claude Code with only ``API Error: 405``.  The
+                # response is still pre-commit here, so consume its bounded
+                # body and render the same safe error shell used by protocol
+                # adapters.  Status and useful response metadata remain the
+                # upstream's; credentials and arbitrary headers do not.
+                raw = await _read_decoded_upstream_body(upstream)
+                try:
+                    decoded = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    decoded = raw.decode("utf-8", "replace")
+                evidence_code, evidence_message = upstream_error_evidence(
+                    decoded
+                )
+                body = transform_error(decoded, upstream.status)
+                detail = ""
+                if evidence_code:
+                    detail = f" ({evidence_code})"
+                if evidence_message:
+                    detail += f": {evidence_message}"
+                log(
+                    f"{request.path} '{model_in}' -> {alias}/{model_out} "
+                    f"anthropic upstream {upstream.status}{detail}"
+                )
+                record_error(
+                    phase="response",
+                    channel=alias,
+                    model=model_out,
+                    api_format="anthropic",
+                    status=upstream.status,
+                    code=evidence_code,
+                    message=evidence_message,
+                    route=route_name,
+                    degrade_codes=protocol_warning_codes,
+                )
+                error_headers = {
+                    "x-hub-channel": alias,
+                    "x-hub-model": model_out,
+                    "x-hub-upstream-format": "anthropic",
+                    "x-hub-account": account_attempt.lease.member,
+                    **route_headers,
+                }
+                if evidence_code:
+                    error_headers["x-hub-upstream-code"] = evidence_code
+                if protocol_warning_codes:
+                    error_headers["x-hub-protocol-warnings"] = ",".join(
+                        protocol_warning_codes
+                    )
+                # ``Allow`` is the one header that actually explains a 405,
+                # so it is forwarded verbatim while everything else stays
+                # filtered.  No retry-after branch here: this arm only ever
+                # sees 405.
+                allow = upstream.headers.get("allow")
+                if allow:
+                    error_headers["allow"] = allow
+                return web.json_response(
+                    body,
+                    status=upstream.status,
+                    headers=error_headers,
+                )
+
             response_connection_tokens = _connection_header_tokens(
                 upstream.headers
             )
