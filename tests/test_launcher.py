@@ -140,6 +140,98 @@ def health_server(
 
 
 class LauncherTuiLogicTests(unittest.TestCase):
+    def test_provider_semantic_compatibility_defaults_to_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                self.assertEqual(
+                    launcher.provider_semantic_compatibility({}, "provider-a"),
+                    ("unknown", "not_assessed"),
+                )
+                meta = {
+                    "provider-a": {
+                        "claude_code_compatibility": {
+                            "status": "verified",
+                            "reason_code": "manual_fixture_passed",
+                        }
+                    }
+                }
+                self.assertEqual(
+                    launcher.provider_semantic_compatibility(meta, "provider-a"),
+                    ("verified", "manual_fixture_passed"),
+                )
+
+    def test_incompatible_provider_is_not_in_normal_tui_view(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                cfg = {
+                    "providers": {
+                        "verified": {
+                            "hidden": False,
+                            "claude_code_compatibility": {
+                                "status": "verified",
+                                "reason_code": "manual_fixture_passed",
+                            },
+                        },
+                        "unknown": {"hidden": False},
+                        "incompatible": {
+                            "hidden": False,
+                            "claude_code_compatibility": {
+                                "status": "incompatible",
+                                "reason_code": "agent_state_failed",
+                            },
+                        },
+                    }
+                }
+
+                self.assertEqual(
+                    launcher._build_view(
+                        cfg,
+                        {"verified", "unknown", "incompatible"},
+                        {},
+                        True,
+                    ),
+                    ["verified", "unknown"],
+                )
+
+    def test_incompatible_provider_requires_explicit_diagnostic_override(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                selected = {"id": "fixture-id", "name": "Fixture Provider"}
+                cfg = {
+                    "providers": {
+                        "fixture-id": {
+                            "claude_code_compatibility": {
+                                "status": "incompatible",
+                                "reason_code": "agent_state_failed",
+                            }
+                        }
+                    }
+                }
+                with mock.patch.object(launcher, "load_config", return_value=cfg):
+                    with self.assertRaisesRegex(RuntimeError, "仅可用完整 id:fixture-id"):
+                        launcher.launch_provider(selected, [])
+
+    def test_explicit_id_allows_incompatible_provider_for_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                selected = {"id": "fixture-id", "name": "Fixture Provider"}
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "list_providers",
+                        return_value=[selected],
+                    ) as list_providers,
+                    mock.patch.object(
+                        launcher, "launch_provider", return_value=0
+                    ) as launch_provider,
+                ):
+                    self.assertEqual(launcher.main(["id:fixture-id"]), 0)
+
+                list_providers.assert_called_once_with(include_incompatible=True)
+                self.assertTrue(
+                    launch_provider.call_args.kwargs["allow_incompatible"]
+                )
+
     def test_first_run_uses_cc_switch_order_without_personal_seed_names(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -3478,12 +3570,14 @@ class LauncherSafetyTests(unittest.TestCase):
                                 "required": ["title"],
                             },
                         }
+                        system_prompt = "Use tools carefully and preserve context.\\n" * 400
                         initial = post(
                             base_url,
                             token,
                             {
                                 "model": settings_env["ANTHROPIC_MODEL"],
                                 "max_tokens": 128,
+                                "system": system_prompt,
                                 "messages": [
                                     {
                                         "role": "user",
@@ -3515,6 +3609,7 @@ class LauncherSafetyTests(unittest.TestCase):
                             {
                                 "model": settings_env["ANTHROPIC_MODEL"],
                                 "max_tokens": 128,
+                                "system": system_prompt,
                                 "messages": [
                                     {
                                         "role": "user",
@@ -3612,7 +3707,13 @@ class LauncherSafetyTests(unittest.TestCase):
                 self.assertEqual(initial_upstream["model"], "fixture-model")
                 self.assertEqual(
                     initial_upstream["messages"],
-                    [{"role": "user", "content": "微信 Coding Plan"}],  # secret-guard: allow private-provider-name 65941246a1
+                    [
+                        {
+                            "role": "system",
+                            "content": "Use tools carefully and preserve context.\n" * 400,
+                        },
+                        {"role": "user", "content": "微信 Coding Plan"},  # secret-guard: allow private-provider-name 65941246a1
+                    ],
                 )
                 function = initial_upstream["tools"][0]["function"]
                 self.assertEqual(function["name"], "write_plan")
@@ -3622,10 +3723,10 @@ class LauncherSafetyTests(unittest.TestCase):
                 )
 
                 self.assertEqual(
-                    continued_upstream["messages"][1]["tool_calls"][0]["id"],
+                    continued_upstream["messages"][2]["tool_calls"][0]["id"],
                     "call_fixture_plan",
                 )
-                tool_result = continued_upstream["messages"][2]
+                tool_result = continued_upstream["messages"][3]
                 self.assertEqual(tool_result["role"], "tool")
                 self.assertEqual(tool_result["tool_call_id"], "call_fixture_plan")
                 self.assertEqual(

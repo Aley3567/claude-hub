@@ -60,6 +60,12 @@ from claude1_transport import (
 
 VERSION = "0.1.0"
 
+PROVIDER_COMPATIBILITY_KEY = "claude_code_compatibility"
+PROVIDER_COMPATIBILITY_STATUSES = frozenset(
+    {"verified", "unknown", "incompatible"}
+)
+_PROVIDER_COMPATIBILITY_REASON_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
 
 def _env_path(name: str, default: Path) -> Path:
     value = os.environ.get(name)
@@ -425,6 +431,44 @@ def provider_launch_overrides(
     )
 
 
+def provider_semantic_compatibility(
+    meta: dict, provider_id: str
+) -> tuple[str, str]:
+    """Return the local Claude Code semantic-compatibility assessment.
+
+    This metadata is deliberately kept in ``claude1-config.json`` rather than
+    the CC Switch database.  Missing or malformed assessments are conservative
+    but usable: the provider remains ``unknown`` instead of being guessed from
+    its name, URL, wire protocol, or one short response.
+    """
+    entry = meta.get(provider_id)
+    assessment = (
+        entry.get(PROVIDER_COMPATIBILITY_KEY)
+        if isinstance(entry, dict)
+        else None
+    )
+    if not isinstance(assessment, dict):
+        return ("unknown", "not_assessed")
+    status = assessment.get("status")
+    reason = assessment.get("reason_code")
+    if status not in PROVIDER_COMPATIBILITY_STATUSES:
+        status = "unknown"
+    if not isinstance(reason, str) or not _PROVIDER_COMPATIBILITY_REASON_RE.fullmatch(
+        reason
+    ):
+        reason = "not_assessed"
+    return (status, reason)
+
+
+def _provider_compatibility_label(meta: dict, provider_id: str) -> str:
+    status, reason = provider_semantic_compatibility(meta, provider_id)
+    return f"{status}:{reason}"
+
+
+def _provider_is_incompatible(meta: dict, provider_id: str) -> bool:
+    return provider_semantic_compatibility(meta, provider_id)[0] == "incompatible"
+
+
 def load_provider_launch_overrides(
     provider_id: str,
 ) -> tuple[str | None, str | None]:
@@ -713,7 +757,7 @@ def provider_transport_config(provider: dict, settings: dict | None = None) -> d
         ) from exc
 
 
-def list_providers() -> list[dict]:
+def list_providers(*, include_incompatible: bool = False) -> list[dict]:
     rows = db_claude_rows()
     providers = [_provider_from_row(row) for row in rows]
     by_id = {str(provider["id"]): provider for provider in providers}
@@ -729,14 +773,43 @@ def list_providers() -> list[dict]:
     ordered = []
     for provider_id in visible:
         if provider_id in by_id:
+            if (
+                not include_incompatible
+                and _provider_is_incompatible(cfg["providers"], provider_id)
+            ):
+                continue
             entry = dict(by_id[provider_id])
-            alias = cfg["providers"][provider_id].get("alias")
+            private_meta = cfg["providers"][provider_id]
+            alias = private_meta.get("alias")
             if alias:
                 entry["alias"] = alias
+            status, reason = provider_semantic_compatibility(
+                cfg["providers"], provider_id
+            )
+            entry["claude_code_compatibility"] = status
+            entry["claude_code_compatibility_reason"] = reason
             ordered.append(entry)
     if not ordered:
-        # 全被隐藏(或配置为空) —— 别把人困住，回退到全部。
-        ordered = providers
+        # 全被隐藏(或配置为空)时保留旧的解困行为，但不让明确不兼容的
+        # provider 因 fallback 重新进入普通选择器。
+        fallback_ids = {
+            provider_id
+            for provider_id in by_id
+            if include_incompatible
+            or not _provider_is_incompatible(cfg["providers"], provider_id)
+        }
+        ordered = []
+        for provider in providers:
+            provider_id = str(provider["id"])
+            if provider_id not in fallback_ids:
+                continue
+            entry = dict(provider)
+            status, reason = provider_semantic_compatibility(
+                cfg["providers"], provider_id
+            )
+            entry["claude_code_compatibility"] = status
+            entry["claude_code_compatibility_reason"] = reason
+            ordered.append(entry)
     return ordered
 
 
@@ -877,6 +950,15 @@ def build_settings(provider: dict) -> dict:
     env["CLAUDE1_PROVIDER_ID"] = str(provider.get("id") or "")
     env["CLAUDE1_SESSION_SOURCE"] = "provider"
     env["CLAUDE1_API_FORMAT"] = selected_provider_api_format(provider)
+    metadata_cfg = load_config()
+    metadata_providers = metadata_cfg.get("providers")
+    if not isinstance(metadata_providers, dict):
+        metadata_providers = {}
+    compatibility, reason_code = provider_semantic_compatibility(
+        metadata_providers, str(provider.get("id") or "")
+    )
+    env["CLAUDE1_PROVIDER_COMPATIBILITY"] = compatibility
+    env["CLAUDE1_PROVIDER_COMPATIBILITY_REASON"] = reason_code
     cfg["env"] = env
 
     # Drop the cc-switch-specific top-level "model" alias (e.g. "opus[1m]");
@@ -2854,6 +2936,7 @@ def _build_view(cfg, db_ids, mru, show_hidden):
         for provider_id in meta
         if provider_id in db_ids
         and (show_hidden or not meta[provider_id].get("hidden"))
+        and not _provider_is_incompatible(meta, provider_id)
     ]
 
 
@@ -3397,6 +3480,7 @@ def _draw_launcher(
             status.append(f"模型:{model_override}")
         if effort_override:
             status.append(f"effort:{effort_override}")
+        status.append(_provider_compatibility_label(meta, provider_id))
         if provider_id == recent:
             status.append("最近")
         if hidden:
@@ -5554,6 +5638,8 @@ def _session_identity_prompt(settings: dict) -> str | None:
             ("selected_provider", "CLAUDE1_PROVIDER_NAME"),
             ("api_format", "CLAUDE1_API_FORMAT"),
             ("selected_model", "ANTHROPIC_MODEL"),
+            ("semantic_compatibility", "CLAUDE1_PROVIDER_COMPATIBILITY"),
+            ("compatibility_reason", "CLAUDE1_PROVIDER_COMPATIBILITY_REASON"),
         ):
             value = label(key)
             if value is not None:
@@ -6164,6 +6250,9 @@ def cli_list_providers(show_all: bool = False) -> int:
             details.append("最近")
         if meta.get("hidden"):
             details.append("已隐藏")
+        details.append(_provider_compatibility_label(cfg["providers"], provider_id))
+        if _provider_is_incompatible(cfg["providers"], provider_id):
+            details.append("仅可用 id:ID 诊断")
         suffix = f"  {' · '.join(details)}" if details else ""
         print(f"  {index:>2}  {labels[provider_id]}{suffix}")
     print(
@@ -6618,7 +6707,21 @@ def launch_provider(
     claude_args: list[str],
     *,
     backend_kind: str = "provider",
+    allow_incompatible: bool = False,
 ) -> int:
+    cfg = load_config()
+    provider_meta = cfg.get("providers")
+    if not isinstance(provider_meta, dict):
+        provider_meta = {}
+    provider_id = str(selected.get("id") or "")
+    compatibility, reason_code = provider_semantic_compatibility(
+        provider_meta, provider_id
+    )
+    if compatibility == "incompatible" and not allow_incompatible:
+        raise RuntimeError(
+            f"provider {selected['name']} 已标记为 Claude Code 语义不兼容"
+            f"（{reason_code}）；仅可用完整 id:{provider_id} 强制诊断"
+        )
     settings = build_settings(selected)
     api_format = selected_provider_api_format(selected)
     transport = provider_transport_config(selected, settings)
@@ -6630,6 +6733,20 @@ def launch_provider(
         print(f"[claude1] 本次使用 CC Switch 当前 provider: {selected['name']}")
     else:
         print(f"[claude1] 本次使用 provider: {selected['name']}")
+    print(
+        "[claude1] Claude Code 语义兼容性: "
+        f"{compatibility} ({reason_code})"
+    )
+    if compatibility == "unknown":
+        print(
+            "[claude1] 警告: 该 provider 尚未完成长 system、工具调用和多轮语义验收",
+            file=sys.stderr,
+        )
+    elif compatibility == "incompatible":
+        print(
+            "[claude1] 警告: 正在按显式 id: 选择强制启动不兼容 provider，仅用于诊断",
+            file=sys.stderr,
+        )
     if account_label is not None:
         print(f"[claude1] 账号池本次选择: {account_label}")
     if api_format != "anthropic" or transport["mode"] != "direct":
@@ -6713,8 +6830,16 @@ def main(argv: list[str]) -> int:
         return exec_hub(claude_args)
 
     # 默认路径：给了名字就直接匹配启动；没给名字就进 TUI 启动器选一个
+    # A single source of truth for the diagnostic override: the selector
+    # filter and the launch gate must never disagree about what counts as an
+    # explicit ``id:`` request.
+    explicit_incompatible_diagnostic = hint is not None and hint.casefold().startswith(
+        "id:"
+    )
     if hint is not None:
-        providers = list_providers()
+        providers = list_providers(
+            include_incompatible=explicit_incompatible_diagnostic
+        )
         if not providers:
             print("[claude1] CC Switch 中没有 Claude provider", file=sys.stderr)
             return 1
@@ -6752,7 +6877,11 @@ def main(argv: list[str]) -> int:
                 print(f"[claude1] 找不到 provider id: {payload}", file=sys.stderr)
                 return 1
 
-    return launch_provider(selected, claude_args)
+    return launch_provider(
+        selected,
+        claude_args,
+        allow_incompatible=explicit_incompatible_diagnostic,
+    )
 
 
 if __name__ == "__main__":

@@ -123,7 +123,7 @@ Claude Code 语义验收明确失败，后续应由独立的 provider capability
 
 ---
 
-## T0.0e · Provider 语义兼容性门槛（独立 issue）
+## T0.0e ✅ 2026-08-18 · Provider 语义兼容性门槛（独立 issue）
 
 **问题**：`api_format=openai_chat` 只描述线协议，不代表 provider/model 能承载 Claude
 Code 的长 system prompt、工具调用和多轮 agent 状态。当前 `claude1` 会让这类 provider
@@ -143,6 +143,15 @@ Code 的长 system prompt、工具调用和多轮 agent 状态。当前 `claude1
 4. 提供离线 fixture 覆盖长 system、tool schema、tool_use/tool_result 多轮和正常终态；
    真实 provider 结果只能由用户手动写入状态，测试不携带凭证。
 5. 全量 `python3 -m unittest discover -s tests -p 'test_*.py'` 绿。
+
+**实现**：`claude-provider-once.py` 从 `claude1-config.json` 的 provider 私有
+metadata 读取 `verified / unknown / incompatible`，普通选择器过滤明确不兼容项，
+启动 banner 和 `claude1 list` 展示状态；仅显式完整 `id:...` 允许诊断性强制启动。
+缺省状态为 `unknown:not_assessed`，不根据 provider 名称、URL 或短请求推断。离线
+回归覆盖状态读取、TUI 过滤、默认拒绝和显式诊断放行；既有 launcher → Hub
+端到端 fixture 扩展为约 16KB system prompt，并覆盖 tool schema、`tool_use/tool_result`
+多轮和正常 `end_turn`。全量 `python3 -m unittest discover -s tests -p 'test_*.py'`：
+690 tests OK。
 
 ---
 
