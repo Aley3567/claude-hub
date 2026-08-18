@@ -1194,19 +1194,10 @@ class ResponseCapabilityContractTests(unittest.TestCase):
             id_only_call.plan.warning_codes,
         )
 
-    def test_response_wrappers_reject_unknown_or_malformed_identity_fields(self) -> None:
+    def test_chat_response_wrapper_metadata_is_observably_degraded(self) -> None:
         chat_cases = (
             {
                 "future_response_field": True,
-                "choices": [
-                    {
-                        "message": {"role": "assistant", "content": "answer"},
-                        "finish_reason": "stop",
-                    }
-                ],
-            },
-            {
-                "id": {"hidden": True},
                 "choices": [
                     {
                         "message": {"role": "assistant", "content": "answer"},
@@ -1226,12 +1217,79 @@ class ResponseCapabilityContractTests(unittest.TestCase):
         )
         for body in chat_cases:
             with self.subTest(api_format="openai_chat", body=body):
-                with self.assertRaises(protocol.ProtocolTransformError) as raised:
-                    protocol.prepare_response(body, "openai_chat")
-                self.assertEqual(
-                    raised.exception.code,
-                    "HUB_UPSTREAM_RESPONSE_INVALID",
+                prepared = protocol.prepare_response(body, "openai_chat")
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                    prepared.plan.warning_codes,
                 )
+
+        aliased_reasoning = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning": "think",
+                            "future_message_field": True,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertEqual(
+            aliased_reasoning.payload["content"],
+            [
+                {"type": "thinking", "thinking": "think"},
+                {"type": "text", "text": "answer"},
+            ],
+        )
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            aliased_reasoning.plan.warning_codes,
+        )
+
+        preferred_reasoning = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "alias",
+                            "reasoning_content": "canonical",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertEqual(
+            preferred_reasoning.payload["content"],
+            [{"type": "thinking", "thinking": "canonical"}],
+        )
+
+    def test_response_wrappers_reject_malformed_identity_fields(self) -> None:
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.prepare_response(
+                {
+                    "id": {"hidden": True},
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "answer"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+                "openai_chat",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_RESPONSE_INVALID",
+        )
 
         for body in (
             {"status": "completed", "output": [], "future_response_field": True},
@@ -1297,31 +1355,31 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
                 )
 
-    def test_chat_content_parts_reject_unknown_fields(self) -> None:
-        with self.assertRaises(protocol.ProtocolTransformError) as raised:
-            protocol.prepare_response(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "visible",
-                                        "future_content": "hidden",
-                                    }
-                                ],
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ]
-                },
-                "openai_chat",
-            )
-        self.assertEqual(
-            raised.exception.code,
-            "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+    def test_chat_content_part_metadata_is_observably_degraded(self) -> None:
+        prepared = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "visible",
+                                    "future_content": "hidden",
+                                }
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertEqual(prepared.payload["content"], [{"type": "text", "text": "visible"}])
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            prepared.plan.warning_codes,
         )
 
     def test_chat_content_parts_reject_conflicting_text_carriers(self) -> None:
@@ -1357,11 +1415,6 @@ class ResponseCapabilityContractTests(unittest.TestCase):
             "function": {"name": "lookup", "arguments": "{}"},
         }
         malformed_messages = (
-            {
-                "role": "assistant",
-                "content": "answer",
-                "future_message_field": "hidden",
-            },
             {
                 "role": "assistant",
                 "content": None,
@@ -1404,6 +1457,26 @@ class ResponseCapabilityContractTests(unittest.TestCase):
                     raised.exception.code,
                     "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
                 )
+
+        prepared = protocol.prepare_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "future_message_field": "hidden",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "openai_chat",
+        )
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            prepared.plan.warning_codes,
+        )
 
     def test_completed_tool_calls_require_valid_indices_arguments_and_status(self) -> None:
         for call in (

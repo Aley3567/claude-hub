@@ -2428,7 +2428,7 @@ class StreamStateMachineContractTests(unittest.TestCase):
                     bridge.feed(event, json.dumps(payload))
                 self.assertEqual(raised.exception.code, expected_code)
 
-    def test_unknown_stream_events_and_output_items_fail_closed(self) -> None:
+    def test_unknown_responses_stream_events_and_output_items_fail_closed(self) -> None:
         cases = [
             (
                 protocol.AnthropicStreamBridge("openai_responses"),
@@ -2445,25 +2445,37 @@ class StreamStateMachineContractTests(unittest.TestCase):
                 },
                 "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
             ),
-            (
-                protocol.AnthropicStreamBridge("openai_chat"),
-                "message",
-                {
-                    "choices": [
-                        {
-                            "delta": {"audio": {"data": "opaque"}},
-                            "finish_reason": None,
-                        }
-                    ]
-                },
-                "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
-            ),
         ]
         for bridge, event, payload, expected_code in cases:
             with self.subTest(event=event, expected_code=expected_code):
                 with self.assertRaises(protocol.ProtocolTransformError) as raised:
                     bridge.feed(event, json.dumps(payload))
                 self.assertEqual(raised.exception.code, expected_code)
+
+        audio_metadata = {
+            "choices": [
+                {
+                    "delta": {"audio": {"data": "opaque"}},
+                    "finish_reason": None,
+                }
+            ]
+        }
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        bridge.feed("message", json.dumps(audio_metadata))
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            bridge.warning_codes,
+        )
+        strict = protocol.AnthropicStreamBridge(
+            "openai_chat",
+            compatibility_mode="strict",
+        )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            strict.feed("message", json.dumps(audio_metadata))
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+        )
 
     def test_responses_stream_payload_type_must_be_a_string_when_present(self) -> None:
         bridge = protocol.AnthropicStreamBridge("openai_responses")
@@ -2688,14 +2700,10 @@ class StreamStateMachineContractTests(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.code, "HUB_SSE_TOOL_CALL_INVALID")
 
-    def test_chat_stream_wrapper_fields_are_rejected_or_observably_degraded(self) -> None:
-        invalid_payloads = (
+    def test_chat_stream_wrapper_fields_are_observably_degraded(self) -> None:
+        metadata_payloads = (
             {
                 "future_top_level": True,
-                "choices": [{"delta": {}, "finish_reason": "stop"}],
-            },
-            {
-                "id": 7,
                 "choices": [{"delta": {}, "finish_reason": "stop"}],
             },
             {
@@ -2703,16 +2711,35 @@ class StreamStateMachineContractTests(unittest.TestCase):
                     {"delta": {}, "finish_reason": "stop", "future_choice": True}
                 ],
             },
+            {
+                "choices": [
+                    {
+                        "delta": {"future_delta": True},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
         )
-        for payload in invalid_payloads:
+        for payload in metadata_payloads:
             with self.subTest(payload=payload):
                 bridge = protocol.AnthropicStreamBridge("openai_chat")
-                with self.assertRaises(protocol.ProtocolTransformError) as raised:
-                    bridge.feed("message", json.dumps(payload))
-                self.assertEqual(
-                    raised.exception.code,
-                    "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+                bridge.feed("message", json.dumps(payload))
+                self.assertIn(
+                    "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                    bridge.warning_codes,
                 )
+
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            protocol.AnthropicStreamBridge("openai_chat").feed(
+                "message",
+                json.dumps(
+                    {"id": 7, "choices": [{"delta": {}, "finish_reason": "stop"}]}
+                ),
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+        )
 
         degraded = protocol.AnthropicStreamBridge("openai_chat")
         degraded.feed(
@@ -2737,6 +2764,83 @@ class StreamStateMachineContractTests(unittest.TestCase):
         self.assertIn(
             "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
             degraded.warning_codes,
+        )
+
+    def test_chat_stream_unknown_event_and_nebius_metadata_are_compatible(self) -> None:
+        bridge = protocol.AnthropicStreamBridge("openai_chat")
+        self.assertEqual(
+            bridge.feed("provider.keepalive", json.dumps({"opaque": True})),
+            [],
+        )
+        frames = (
+            {
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "prompt_token_ids": None,
+                "prompt_text": None,
+                "choices": [
+                    {
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                        "index": 0,
+                        "logprobs": None,
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {"reasoning": "We", "reasoning_content": "We"},
+                        "finish_reason": None,
+                        "index": 0,
+                        "logprobs": None,
+                        "token_ids": None,
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {"reasoning": " decide", "reasoning_content": " decide"},
+                        "finish_reason": "length",
+                        "index": 0,
+                        "logprobs": None,
+                        "stop_reason": None,
+                        "token_ids": None,
+                    }
+                ],
+            },
+        )
+        chunks: list[bytes] = []
+        for frame in frames:
+            chunks.extend(bridge.feed("message", json.dumps(frame)))
+        chunks.extend(bridge.feed("message", "[DONE]"))
+
+        events = _payloads(chunks)
+        thinking = "".join(
+            event["delta"]["thinking"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "thinking_delta"
+        )
+        self.assertEqual(thinking, "We decide")
+        self.assertEqual(events[-1]["type"], "message_stop")
+        self.assertIn(
+            "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+            bridge.warning_codes,
+        )
+
+        strict = protocol.AnthropicStreamBridge(
+            "openai_chat",
+            compatibility_mode="strict",
+        )
+        with self.assertRaises(protocol.ProtocolTransformError) as raised:
+            strict.feed("provider.keepalive", json.dumps({"opaque": True}))
+        self.assertEqual(
+            raised.exception.code,
+            "HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
         )
 
     def test_responses_structural_parts_preserve_exact_snapshots(self) -> None:
