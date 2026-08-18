@@ -38,6 +38,114 @@
 
 ---
 
+## T0.0a ✅ 2026-08-17（工作树待提交）· OpenAI Chat SSE 未知上游字段宽容
+
+**目的**：修复 `openai_chat` 流式响应因上游附加 metadata（例如
+`prompt_token_ids`、`token_ids`）或通用 reasoning 别名而返回 502 的问题。当前
+Nebius DeepSeek V4 Flash 已用真实帧复现；处理必须对所有 OpenAI-compatible  <!-- secret-guard: allow private-provider-name bf32772a16 -->
+provider 通用，不能出现 provider 名或专用字段白名单。
+
+**实现边界**：顶层、choice、delta 的未知非结构字段，以及未知 SSE event，默认跳过并
+记录 `HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`；`reasoning` 作为
+`reasoning_content` 的兼容别名。仍严格校验已识别载体的类型、choice 索引、真实终态、
+tool call 结构及参数因果。`strict` 模式对上述降级继续拒绝。
+
+**依据**：`AGENTS.md` 的“默认放行”规则，以及 cc-switch
+`src-tauri/src/proxy/providers/streaming.rs` 只消费转换必需字段的做法；本仓库额外记录
+degrade code，避免 cc-switch 式静默丢弃。
+
+**验收合同**：
+1. Nebius 捕获的 Chat SSE 帧（`prompt_token_ids`、`prompt_text`、`token_ids`、
+   `reasoning`/`reasoning_content`、`finish_reason=length`）完整转换为 Anthropic SSE，
+   不产生 502。
+2. 任意未知顶层、choice、delta 字段和未知 event 在默认模式不截流，并带 metadata
+   degrade code；严格模式拒绝。
+3. 非法已识别 identity、非零 choice、错误 tool call 与错误终态的既有拒绝测试保持绿。
+4. `python3 -m unittest discover -s tests -p 'test_*.py'` 绿。
+
+**验证**：真实帧回归覆盖 bridge 与 Hub 流式转译；默认模式完成 `message_stop` 并落
+`HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED`，`strict` 模式拒绝。全量
+`python3 -m unittest discover -s tests -p 'test_*.py'`：677 tests OK。
+
+---
+
+## T0.0b ✅ 2026-08-17（工作树待提交）· OpenAI Chat 非流响应未知 wrapper 字段宽容
+
+**目的**：使同一类 metadata 出现在 JSON Chat completion 时不会变成 Hub 502。
+
+**实现边界**：顶层、choice、message、content-part 的未知字段记录
+`HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED` 后跳过；`reasoning` 是
+`reasoning_content` 的通用别名。已识别 identity、finish reason、内容类型、tool call
+结构和工具参数继续严格校验。
+
+**验收合同**：
+1. 带任意未知 wrapper 字段的正常 Chat completion 返回 Anthropic 成功响应且 plan 有
+   metadata degrade code。
+2. `reasoning` 单独出现时转为 thinking；与 `reasoning_content` 同时出现时优先标准
+   字段，不重复输出。
+3. 畸形 identity、工具调用与语义内容载体继续返回原有转换错误；全量 unittest 绿。
+
+**验证**：协议契约与 Hub JSON 回归覆盖未知 wrapper、content-part metadata 和 reasoning
+别名优先级；全量 `python3 -m unittest discover -s tests -p 'test_*.py'`：678 tests OK。
+
+---
+
+## T0.0c · OpenAI Responses 上游方言宽容
+
+**目的**：将同一三档策略覆盖 Responses 的非流 wrapper、SSE event envelope 和
+output-item metadata；工具调用因果、终态和内容类型仍严格。
+
+**验收合同**：未知 metadata/event 默认降级记录并不中断；工具因果冲突仍拒绝；Chat 与
+Responses 的降级出口一致；全量 unittest 绿。
+
+---
+
+## T0.0d ⚠️ 2026-08-17 · 真实 provider 验收：协议通过，模型语义不兼容
+
+**目的**：在用户申请的正式 key 下用 `claude1` 做 Nebius smoke，分别验收协议桥和
+Claude Code 语义行为。该卡需要用户提供可用凭证，不能由测试 key 替代。
+
+**已验证（真实 Nebius 请求）**：
+
+- 最小 `system + user`、简单 tool schema、`reasoning_effort=high` 和普通流式请求均
+  能返回；协议桥对 `reasoning`、`prompt_token_ids` 等未知 metadata 已宽容，不再因字段
+  形状直接返回 502。
+- 接近 Claude Code 的长 system prompt（约 14K 字符）会触发乱码、重复 token、
+  reasoning/content 异常，且出现 `finish_reason=length`。历史 `claude1` 会话中的
+  中英文/代码/system prompt 碎片混杂与此一致。
+
+**结论**：`Nebius DeepSeek V4 Flash` 当前不能作为 Claude Code 的兼容后端。它是模型  <!-- secret-guard: allow private-provider-name bf32772a16 -->
+语义/上下文承载失败，不是 SSE 或 OpenAI Chat wrapper 的兼容问题；不能把“无 502”写成
+“Claude Code 兼容通过”，也不能用继续增加 DeepSeek 专属字段映射来修复。
+
+**未完成**：`claude1 usage` / `errors` 的降级落盘仍按 T0.1–T0.4 接线计划推进；本卡的
+Claude Code 语义验收明确失败，后续应由独立的 provider capability gate issue 处理。
+
+---
+
+## T0.0e · Provider 语义兼容性门槛（独立 issue）
+
+**问题**：`api_format=openai_chat` 只描述线协议，不代表 provider/model 能承载 Claude
+Code 的长 system prompt、工具调用和多轮 agent 状态。当前 `claude1` 会让这类 provider
+正常启动，失败后用户只能看到模型乱码或不相关的重试。
+
+**目标**：给 provider 增加显式、可审计的 Claude Code 语义兼容状态；不凭 provider 名、URL
+或一次短回复猜测。状态未知时可启动但必须在选择器和启动输出中明确“未验收”，状态明确为
+不兼容时默认不进入普通 `claude1` 选择器（仍允许显式 `id:` 强制诊断）。
+
+**验收合同**：
+
+1. 兼容性状态存于 `claude1-config.json` 的 provider 私有 metadata，不写凭证或完整
+   prompt；CC Switch DB 不被改写。
+2. 选择器、`claude1 list` 和启动 banner 显示 `verified / unknown / incompatible`，
+   并给出不泄露上游细节的原因码。
+3. `incompatible` provider 默认不可选；显式 `id:` 只用于诊断并打印警告，不伪装成功。
+4. 提供离线 fixture 覆盖长 system、tool schema、tool_use/tool_result 多轮和正常终态；
+   真实 provider 结果只能由用户手动写入状态，测试不携带凭证。
+5. 全量 `python3 -m unittest discover -s tests -p 'test_*.py'` 绿。
+
+---
+
 ## T0.1 曳光弹：一个 code 打穿全链路
 
 **弹头**：`HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED`。选它的理由：请求侧、确定性触发（请求体塞一个未知字段即可）、走 openai_chat 非流路径、不依赖上游任何配合。

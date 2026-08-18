@@ -2874,12 +2874,23 @@ def _require_upstream_field_allowlist(
         )
 
 
+def _record_unknown_upstream_response_fields(
+    value: dict,
+    allowed_fields: set[str],
+    *,
+    path: str,
+    plan: ConversionPlan | None,
+) -> None:
+    for field_name in sorted(set(value) - allowed_fields):
+        _record_response_metadata_degradation(plan, f"{path}.{field_name}")
+
+
 def chat_to_anthropic(
     body: dict,
     *,
     plan: ConversionPlan | None = None,
 ) -> tuple[dict, UsageReceipt]:
-    _require_upstream_response_allowlist(
+    _record_unknown_upstream_response_fields(
         body,
         {
             "id",
@@ -2892,7 +2903,7 @@ def chat_to_anthropic(
             "system_fingerprint",
         },
         path="$",
-        label="OpenAI Chat response",
+        plan=plan,
     )
     for field_name in ("id", "model"):
         if field_name in body and (
@@ -2953,11 +2964,11 @@ def chat_to_anthropic(
             code="HUB_UPSTREAM_RESPONSE_INVALID",
             path="$.choices[0]",
         )
-    _require_upstream_response_allowlist(
+    _record_unknown_upstream_response_fields(
         choice,
         {"index", "message", "finish_reason", "logprobs"},
         path="$.choices[0]",
-        label="OpenAI Chat response choice",
+        plan=plan,
     )
     if "index" in choice and (
         not isinstance(choice["index"], int)
@@ -3005,11 +3016,12 @@ def chat_to_anthropic(
         has_tool=finish_reason in {"tool_calls", "function_call"},
     )
     message = choice["message"]
-    _require_upstream_field_allowlist(
+    _record_unknown_upstream_response_fields(
         message,
         {
             "role",
             "content",
+            "reasoning",
             "reasoning_content",
             "refusal",
             "tool_calls",
@@ -3021,7 +3033,7 @@ def chat_to_anthropic(
             "signature",
         },
         path="$.choices[0].message",
-        label="OpenAI Chat message",
+        plan=plan,
     )
     if "role" in message and message["role"] != "assistant":
         raise ProtocolTransformError(
@@ -3046,6 +3058,8 @@ def chat_to_anthropic(
             )
     content: list[dict] = []
     reasoning = message.get("reasoning_content", _MISSING)
+    if reasoning is _MISSING and "reasoning" in message:
+        reasoning = message["reasoning"]
     if isinstance(reasoning, str) and reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
         if plan is not None:
@@ -3073,11 +3087,11 @@ def chat_to_anthropic(
                     code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
                 )
             part_path = f"$.choices[0].message.content[{part_index}]"
-            _require_upstream_field_allowlist(
+            _record_unknown_upstream_response_fields(
                 part,
                 {"type", "text", "refusal", "annotations", "citations"},
                 path=part_path,
-                label="OpenAI Chat content part",
+                plan=plan,
             )
             part_type = part.get("type")
             if part_type not in {None, "text", "output_text", "refusal"}:
@@ -6248,10 +6262,11 @@ class AnthropicStreamBridge:
                 code="HUB_SSE_UNKNOWN_EVENT",
             )
         if self.api_format == "openai_chat" and event != "message":
-            raise ProtocolTransformError(
-                f"OpenAI Chat SSE event {event!r} is unsupported",
-                code="HUB_SSE_UNKNOWN_EVENT",
+            self._observe_stream_degradation(
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                f"OpenAI Chat SSE event {event!r} has no Anthropic event carrier",
             )
+            return []
         if self.api_format == "openai_responses":
             payload_type = payload.get("type", _MISSING)
             if payload_type is not _MISSING and (
@@ -6344,9 +6359,9 @@ class AnthropicStreamBridge:
             "system_fingerprint",
         }
         if set(payload) - allowed_payload_fields:
-            raise ProtocolTransformError(
-                "OpenAI Chat stream payload has unsupported fields",
-                code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+            self._observe_stream_degradation(
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                "OpenAI Chat stream metadata has no Anthropic event carrier",
             )
         for field_name in ("id", "model"):
             if field_name in payload:
@@ -6443,9 +6458,9 @@ class AnthropicStreamBridge:
             "logprobs",
         }
         if unknown_choice_fields:
-            raise ProtocolTransformError(
-                "OpenAI Chat stream choice has unsupported fields",
-                code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+            self._observe_stream_degradation(
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                "OpenAI Chat stream choice metadata has no Anthropic event carrier",
             )
         if "index" in choice and self._response_stream_index(choice["index"]) is None:
             raise ProtocolTransformError(
@@ -6474,6 +6489,7 @@ class AnthropicStreamBridge:
         unknown_delta_fields = set(delta) - {
             "role",
             "content",
+            "reasoning",
             "reasoning_content",
             "reasoning_signature",
             "signature",
@@ -6483,9 +6499,9 @@ class AnthropicStreamBridge:
             "citations",
         }
         if unknown_delta_fields:
-            raise ProtocolTransformError(
-                "OpenAI Chat emitted an unsupported delta field",
-                code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
+            self._observe_stream_degradation(
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                "OpenAI Chat delta metadata has no Anthropic event carrier",
             )
         chunks: list[bytes] = []
         role = delta.get("role", _MISSING)
@@ -6495,9 +6511,14 @@ class AnthropicStreamBridge:
                 code="HUB_UPSTREAM_OUTPUT_BLOCK_UNSUPPORTED",
                 path="$.choices[0].delta.role",
             )
+        reasoning_field = "reasoning_content"
+        reasoning_value = delta.get(reasoning_field, _MISSING)
+        if reasoning_value is _MISSING and "reasoning" in delta:
+            reasoning_field = "reasoning"
+            reasoning_value = delta[reasoning_field]
         reasoning = self._optional_stream_text(
-            delta.get("reasoning_content", _MISSING),
-            field_name="choices[0].delta.reasoning_content",
+            reasoning_value,
+            field_name=f"choices[0].delta.{reasoning_field}",
         )
         if reasoning:
             chunks.extend(self._thinking(reasoning))

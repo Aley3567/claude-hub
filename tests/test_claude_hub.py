@@ -2701,6 +2701,7 @@ class ClaudeHubTests(unittest.TestCase):
             "id": "chatcmpl_fixture",
             "model": "fixture-model",
             "service_tier": "default",
+            "future_response_field": True,
             "choices": [
                 {
                     "index": 0,
@@ -3268,6 +3269,98 @@ class ClaudeHubTests(unittest.TestCase):
                 "HUB_DEGRADE_UNKNOWN_REQUEST_FIELD_DROPPED",
                 "HUB_DEGRADE_UNSIGNED_THINKING",
             ],
+        )
+
+    def test_transformed_nebius_chat_stream_metadata_completes_without_502(self):
+        self._set_provider_endpoint(
+            "Fixture HTTPS",
+            "https://upstream.invalid/v1/chat/completions",
+            "openai_chat",
+        )
+        frames = [
+            {
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "prompt_token_ids": None,
+                "prompt_text": None,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                        "logprobs": None,
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning": "We", "reasoning_content": "We"},
+                        "finish_reason": None,
+                        "logprobs": None,
+                        "token_ids": None,
+                    }
+                ],
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "reasoning": " decide",
+                            "reasoning_content": " decide",
+                        },
+                        "finish_reason": "length",
+                        "logprobs": None,
+                        "stop_reason": None,
+                        "token_ids": None,
+                    }
+                ],
+            },
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            [
+                b"data:"
+                + json.dumps(frame, separators=(",", ":")).encode()
+                + b"\n\n"
+                for frame in frames
+            ]
+            + [b"data: [DONE]\n\n"],
+        )
+        request = self._request(
+            {
+                "model": "fast,fixture-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "stream": True,
+            },
+            session=_FakeSession(upstream),
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(
+            hub.web, "StreamResponse", return_value=downstream
+        ):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        rendered = b"".join(downstream.writes)
+        self.assertIn(b'"thinking":"We"', rendered)
+        self.assertIn(b"event: message_stop\n", rendered)
+        self.assertNotIn(b"event: error\n", rendered)
+        self.assertTrue(downstream.eof)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(row["deg"]),
+            {
+                "HUB_DEGRADE_UNSIGNED_THINKING",
+                "HUB_DEGRADE_UPSTREAM_RESPONSE_METADATA_DROPPED",
+                "HUB_USAGE_PROVENANCE_UNAVAILABLE",
+            },
         )
 
     def test_transformed_stream_failure_persists_observed_degrades(self):
