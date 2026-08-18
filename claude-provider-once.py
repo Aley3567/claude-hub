@@ -460,9 +460,25 @@ def provider_semantic_compatibility(
     return (status, reason)
 
 
-def _provider_compatibility_label(meta: dict, provider_id: str) -> str:
+_PROVIDER_COMPATIBILITY_LABELS = {
+    "verified": "已验收",
+    "incompatible": "不兼容",
+    "unknown": "未验收",
+}
+
+
+def _provider_compatibility_badge(meta: dict, provider_id: str) -> str | None:
+    """Return a row badge for one provider's assessment, or None when default.
+
+    ``unknown:not_assessed`` is what every unassessed provider reports, so
+    repeating it on each row drowns out the badges that do carry information
+    and buries the alias/recent markers next to them.  Only a real assessment
+    earns a badge; the unassessed total is surfaced once by ``claude1 list``.
+    """
     status, reason = provider_semantic_compatibility(meta, provider_id)
-    return f"{status}:{reason}"
+    if status == "unknown" and reason == "not_assessed":
+        return None
+    return f"{_PROVIDER_COMPATIBILITY_LABELS[status]}:{reason}"
 
 
 def _provider_is_incompatible(meta: dict, provider_id: str) -> bool:
@@ -3480,7 +3496,9 @@ def _draw_launcher(
             status.append(f"模型:{model_override}")
         if effort_override:
             status.append(f"effort:{effort_override}")
-        status.append(_provider_compatibility_label(meta, provider_id))
+        compatibility_badge = _provider_compatibility_badge(meta, provider_id)
+        if compatibility_badge:
+            status.append(compatibility_badge)
         if provider_id == recent:
             status.append("最近")
         if hidden:
@@ -6250,14 +6268,28 @@ def cli_list_providers(show_all: bool = False) -> int:
             details.append("最近")
         if meta.get("hidden"):
             details.append("已隐藏")
-        details.append(_provider_compatibility_label(cfg["providers"], provider_id))
+        compatibility_badge = _provider_compatibility_badge(
+            cfg["providers"], provider_id
+        )
+        if compatibility_badge:
+            details.append(compatibility_badge)
         if _provider_is_incompatible(cfg["providers"], provider_id):
             details.append("仅可用 id:ID 诊断")
         suffix = f"  {' · '.join(details)}" if details else ""
         print(f"  {index:>2}  {labels[provider_id]}{suffix}")
+    unassessed = sum(
+        1
+        for provider_id in provider_ids
+        if _provider_compatibility_badge(cfg["providers"], provider_id) is None
+    )
     print(
         f"\n共 {len(provider_ids)} 个；运行 `claude1 <名称、别名或 id:ID>` 可直接启动。"
     )
+    if unassessed:
+        print(
+            f"其中 {unassessed} 个尚未做 Claude Code 语义验收"
+            "（长 system prompt、工具调用、多轮终态）。"
+        )
     return 0
 
 
@@ -6733,16 +6765,15 @@ def launch_provider(
         print(f"[claude1] 本次使用 CC Switch 当前 provider: {selected['name']}")
     else:
         print(f"[claude1] 本次使用 provider: {selected['name']}")
-    print(
-        "[claude1] Claude Code 语义兼容性: "
-        f"{compatibility} ({reason_code})"
-    )
-    if compatibility == "unknown":
+    # An unassessed provider is the norm, not news: printing it on every
+    # launch trains the user to ignore the line that matters.  Speak up only
+    # for a real assessment.
+    if (compatibility, reason_code) != ("unknown", "not_assessed"):
         print(
-            "[claude1] 警告: 该 provider 尚未完成长 system、工具调用和多轮语义验收",
-            file=sys.stderr,
+            "[claude1] Claude Code 语义兼容性: "
+            f"{compatibility} ({reason_code})"
         )
-    elif compatibility == "incompatible":
+    if compatibility == "incompatible":
         print(
             "[claude1] 警告: 正在按显式 id: 选择强制启动不兼容 provider，仅用于诊断",
             file=sys.stderr,
