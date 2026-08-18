@@ -160,6 +160,58 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     ("verified", "manual_fixture_passed"),
                 )
 
+    def test_default_compatibility_earns_no_row_badge(self) -> None:
+        """The unassessed default must stay silent on every row.
+
+        Every provider nobody has assessed reports ``unknown:not_assessed``,
+        so a badge for it is pure noise that buries the alias and recent
+        markers sharing the row.
+        """
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                self.assertIsNone(
+                    launcher._provider_compatibility_badge({}, "provider-a")
+                )
+                self.assertIsNone(
+                    launcher._provider_compatibility_badge(
+                        {"provider-a": {"hidden": False}}, "provider-a"
+                    )
+                )
+                meta = {
+                    "verified": {
+                        "claude_code_compatibility": {
+                            "status": "verified",
+                            "reason_code": "manual_fixture_passed",
+                        }
+                    },
+                    "broken": {
+                        "claude_code_compatibility": {
+                            "status": "incompatible",
+                            "reason_code": "no_tool_support",
+                        }
+                    },
+                    "pending": {
+                        "claude_code_compatibility": {
+                            "status": "unknown",
+                            "reason_code": "smoke_pending",
+                        }
+                    },
+                }
+                self.assertEqual(
+                    launcher._provider_compatibility_badge(meta, "verified"),
+                    "已验收:manual_fixture_passed",
+                )
+                self.assertEqual(
+                    launcher._provider_compatibility_badge(meta, "broken"),
+                    "不兼容:no_tool_support",
+                )
+                # A non-default reason still carries information even while the
+                # status itself stays unknown.
+                self.assertEqual(
+                    launcher._provider_compatibility_badge(meta, "pending"),
+                    "未验收:smoke_pending",
+                )
+
     def test_incompatible_provider_is_not_in_normal_tui_view(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             with loaded_launcher(isolated_env(Path(raw_home))) as launcher:

@@ -147,6 +147,11 @@ Code 的长 system prompt、工具调用和多轮 agent 状态。当前 `claude1
 **实现**：`claude-provider-once.py` 从 `claude1-config.json` 的 provider 私有
 metadata 读取 `verified / unknown / incompatible`，普通选择器过滤明确不兼容项，
 启动 banner 和 `claude1 list` 展示状态；仅显式完整 `id:...` 允许诊断性强制启动。
+状态展示按"默认态不出声"收敛：`unknown:not_assessed` 是所有未评估 provider 的默认
+值，逐行重复只会淹没同一行的别名和"最近"标记，因此选择器与 `claude1 list` 只为真实
+评估结论标注（`已验收:` / `不兼容:` / 非默认 reason 的 `未验收:`），未验收总数由
+`claude1 list` 尾部汇总一次；启动 banner 同理只在有真实结论时打印，`incompatible`
+的诊断警告保留。
 缺省状态为 `unknown:not_assessed`，不根据 provider 名称、URL 或短请求推断。离线
 回归覆盖状态读取、TUI 过滤、默认拒绝和显式诊断放行；既有 launcher → Hub
 端到端 fixture 扩展为约 16KB system prompt，并覆盖 tool schema、`tool_use/tool_result`
