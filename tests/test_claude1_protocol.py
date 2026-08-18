@@ -79,6 +79,26 @@ class CanonicalRequestContractTests(unittest.TestCase):
 
 
 class RequestTransformTests(unittest.TestCase):
+    def test_chat_stream_requests_usage_via_stream_options(self) -> None:
+        base = {
+            "model": "usage-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        _, streaming = protocol.transform_request(
+            {**base, "stream": True}, "openai_chat"
+        )
+        _, non_streaming = protocol.transform_request(base, "openai_chat")
+        _, anthropic = protocol.transform_request(
+            {**base, "stream": True}, "anthropic"
+        )
+
+        self.assertEqual(
+            streaming.get("stream_options"), {"include_usage": True}
+        )
+        self.assertNotIn("stream_options", non_streaming)
+        self.assertNotIn("stream_options", anthropic)
+
     def test_system_message_role_is_preserved_for_current_claude_code(self) -> None:
         payload = {
             "model": "system-message-model",
