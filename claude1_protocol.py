@@ -315,6 +315,32 @@ def _json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _split_leading_think_block(text: str) -> tuple[str, str] | None:
+    """Split one explicit leading ``<think>`` carrier without guessing.
+
+    This mirrors cc-switch's proven compatibility rule: leading whitespace is
+    allowed, but the first non-whitespace content must be an opening tag and a
+    matching closing tag must already be present. Malformed or incidental tags
+    remain ordinary visible text.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith(_THINK_OPEN_TAG):
+        return None
+    body_start = len(_THINK_OPEN_TAG)
+    close_start = stripped.find(_THINK_CLOSE_TAG, body_start)
+    if close_start < 0:
+        return None
+    answer_start = close_start + len(_THINK_CLOSE_TAG)
+    return (
+        stripped[body_start:close_start].strip(),
+        stripped[answer_start:].lstrip("\r\n\t "),
+    )
+
+
 def _system_text(system: object) -> str:
     if isinstance(system, str):
         return system
@@ -3065,6 +3091,7 @@ def chat_to_anthropic(
     reasoning = message.get("reasoning_content", _MISSING)
     if reasoning is _MISSING and "reasoning" in message:
         reasoning = message["reasoning"]
+    has_fenced_reasoning = False
     if isinstance(reasoning, str) and reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
         if plan is not None:
@@ -3082,6 +3109,31 @@ def chat_to_anthropic(
     text = message.get("content", None)
     refused = False
     if isinstance(text, str):
+        fenced = (
+            _split_leading_think_block(text)
+            if reasoning in (_MISSING, None, "")
+            else None
+        )
+        if fenced is not None:
+            fenced_reasoning, text = fenced
+            if fenced_reasoning:
+                content.append(
+                    {"type": "thinking", "thinking": fenced_reasoning}
+                )
+                has_fenced_reasoning = True
+                if plan is not None:
+                    plan.add(
+                        SupportDisposition.DEGRADED,
+                        "HUB_DEGRADE_REASONING_FENCE_EXTRACTED",
+                        "$.choices[0].message.content",
+                        "inline_reasoning_carrier",
+                    )
+                    plan.add(
+                        SupportDisposition.DEGRADED,
+                        "HUB_DEGRADE_UNSIGNED_THINKING",
+                        "$.choices[0].message.content",
+                        "unsigned_thinking",
+                    )
         if text:
             content.append({"type": "text", "text": text})
     elif isinstance(text, list):
@@ -3243,6 +3295,16 @@ def chat_to_anthropic(
             }
         )
         has_tool = True
+    has_visible_text = any(
+        block.get("type") == "text" and bool(block.get("text"))
+        for block in content
+    )
+    if has_fenced_reasoning and not has_visible_text and not has_tool and not refused:
+        raise ProtocolTransformError(
+            "OpenAI Chat response contained reasoning but no visible output",
+            code="HUB_UPSTREAM_VISIBLE_OUTPUT_MISSING",
+            path="$.choices[0].message.content",
+        )
     raw_usage, _base_input, _base_output = _response_base_usage(
         body,
         api_format="openai_chat",
@@ -4353,6 +4415,11 @@ class AnthropicStreamBridge:
     terminal_error_message: str | None = None
     thinking_signature: str | None = None
     thinking_has_delta: bool = False
+    visible_text_emitted: bool = False
+    reasoning_emitted: bool = False
+    inline_reasoning_emitted: bool = False
+    chat_inline_think_mode: str = "detecting"
+    chat_inline_think_buffer: str = ""
     observations: list[str] = field(default_factory=list)
     fsm: StreamStateMachine = field(default_factory=StreamStateMachine)
 
@@ -4672,6 +4739,8 @@ class AnthropicStreamBridge:
             )
         )
         self.fsm.add_delta(self.text_index, "text_delta")
+        if text:
+            self.visible_text_emitted = True
         return chunks
 
     def _thinking(self, text: str) -> list[bytes]:
@@ -4698,6 +4767,43 @@ class AnthropicStreamBridge:
         )
         self.fsm.add_delta(self.thinking_index, "thinking_delta")
         self.thinking_has_delta = True
+        if text:
+            self.reasoning_emitted = True
+        return chunks
+
+    def _flush_chat_inline_content(self) -> list[bytes]:
+        buffered = self.chat_inline_think_buffer
+        self.chat_inline_think_buffer = ""
+        self.chat_inline_think_mode = "text"
+        return self._text(buffered) if buffered else []
+
+    def _chat_content(self, text: str) -> list[bytes]:
+        if self.chat_inline_think_mode == "text":
+            return self._text(text)
+
+        self.chat_inline_think_buffer += text
+        buffered = self.chat_inline_think_buffer
+        stripped = buffered.lstrip()
+        if self.chat_inline_think_mode == "detecting":
+            if not stripped or _THINK_OPEN_TAG.startswith(stripped):
+                return []
+            if not stripped.startswith(_THINK_OPEN_TAG):
+                return self._flush_chat_inline_content()
+            self.chat_inline_think_mode = "reasoning"
+
+        fenced = _split_leading_think_block(buffered)
+        if fenced is None:
+            return []
+        reasoning, answer = fenced
+        self.chat_inline_think_buffer = ""
+        self.chat_inline_think_mode = "text"
+        chunks: list[bytes] = []
+        if reasoning:
+            self._observe("HUB_DEGRADE_REASONING_FENCE_EXTRACTED")
+            self.inline_reasoning_emitted = True
+            chunks.extend(self._thinking(reasoning))
+        if answer:
+            chunks.extend(self._text(answer))
         return chunks
 
     def _signature(self, signature: str) -> list[bytes]:
@@ -6526,6 +6632,7 @@ class AnthropicStreamBridge:
             field_name=f"choices[0].delta.{reasoning_field}",
         )
         if reasoning:
+            chunks.extend(self._flush_chat_inline_content())
             chunks.extend(self._thinking(reasoning))
         signatures: list[str] = []
         for signature_field in ("reasoning_signature", "signature"):
@@ -6550,7 +6657,7 @@ class AnthropicStreamBridge:
             field_name="choices[0].delta.content",
         )
         if text:
-            chunks.extend(self._text(text))
+            chunks.extend(self._chat_content(text))
         refusal = self._optional_stream_text(
             delta.get("refusal", _MISSING),
             field_name="choices[0].delta.refusal",
@@ -6573,6 +6680,8 @@ class AnthropicStreamBridge:
                 "OpenAI Chat streamed tool_calls must be an array",
                 code="HUB_SSE_TOOL_CALL_INVALID",
             )
+        if raw_tool_calls:
+            chunks.extend(self._flush_chat_inline_content())
         for position, call in enumerate(raw_tool_calls):
             if not isinstance(call, dict):
                 raise ProtocolTransformError(
@@ -6642,6 +6751,18 @@ class AnthropicStreamBridge:
                 raise ProtocolTransformError(
                     "upstream Chat finish_reason must be a non-empty string or null",
                     code="HUB_UPSTREAM_STOP_REASON_UNMAPPABLE",
+                )
+            chunks.extend(self._flush_chat_inline_content())
+            if (
+                self.inline_reasoning_emitted
+                and not self.visible_text_emitted
+                and not self.has_tool
+                and not self.refused
+            ):
+                raise ProtocolTransformError(
+                    "OpenAI Chat stream contained reasoning but no visible output",
+                    code="HUB_UPSTREAM_VISIBLE_OUTPUT_MISSING",
+                    path="$.choices[0].delta.content",
                 )
             self.upstream_terminal = True
             self.stop = _stop_reason(
