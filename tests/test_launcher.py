@@ -284,6 +284,60 @@ class LauncherTuiLogicTests(unittest.TestCase):
                     launch_provider.call_args.kwargs["allow_incompatible"]
                 )
 
+    def test_hint_matching_only_incompatible_provider_names_the_real_reason(
+        self,
+    ) -> None:
+        """A filtered provider must not be reported as a missing one.
+
+        ``list_providers`` drops ``incompatible`` providers, so ``choose`` used
+        to answer an explicit hint with "找不到" — a known, already-explained
+        local filter wearing the mask of a provider that does not exist.
+        """
+        with tempfile.TemporaryDirectory() as raw_home:
+            with loaded_launcher(isolated_env(Path(raw_home))) as launcher:
+                healthy = {"id": "healthy-id", "name": "Healthy Provider"}
+                broken = {
+                    "id": "broken-id",
+                    "name": "Broken Provider",
+                    "claude_code_compatibility": "incompatible",
+                    "claude_code_compatibility_reason": "agent_state_failed",
+                }
+
+                def fake_list_providers(*, include_incompatible: bool = False):
+                    return [healthy, broken] if include_incompatible else [healthy]
+
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "list_providers",
+                        side_effect=fake_list_providers,
+                    ) as list_providers,
+                    mock.patch.object(
+                        launcher, "launch_provider", return_value=0
+                    ) as launch_provider,
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        launcher.main(["Broken Provider"])
+                    message = str(raised.exception)
+
+                    # The gate is untouched: the normal selector still runs
+                    # filtered, and nothing was launched.
+                    self.assertEqual(
+                        list_providers.call_args_list[0].kwargs,
+                        {"include_incompatible": False},
+                    )
+                    launch_provider.assert_not_called()
+                    self.assertIn("Broken Provider", message)
+                    self.assertIn("agent_state_failed", message)
+                    self.assertIn("id:broken-id", message)
+                    self.assertNotIn("找不到", message)
+
+                    # A hint that really matches nothing keeps the old wording.
+                    with self.assertRaisesRegex(
+                        RuntimeError, "找不到匹配 'ghost' 的 provider"
+                    ):
+                        launcher.main(["ghost"])
+
     def test_first_run_uses_cc_switch_order_without_personal_seed_names(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:
             env = isolated_env(Path(raw_home))
@@ -4370,6 +4424,150 @@ class HubWorkspaceTests(unittest.TestCase):
                     if isinstance(value, str)
                 )
                 self.assertIn("回退", fallback)
+
+    def test_hub_channel_badges_resolve_id_and_unique_name_selectors(self) -> None:
+        """Channels name providers exactly the way ``claude-hub`` keys them.
+
+        ``id:<provider-id>`` always resolves; a bare name only while it stays
+        unique.  Anything else earns no badge instead of a guess.
+        """
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home, write_config=False)
+            db_path = Path(env["CLAUDE1_DB_PATH"])
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE providers ("
+                    "id TEXT, name TEXT, settings_config TEXT, "
+                    "app_type TEXT, sort_index INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO providers VALUES (?, ?, ?, 'claude', ?)",
+                    [
+                        ("broken-id", "Broken Provider", '{"env": {}}', 1),
+                        ("verified-id", "Verified Provider", '{"env": {}}', 2),
+                        ("twin-a", "Twin", '{"env": {}}', 3),
+                        ("twin-b", "Twin", '{"env": {}}', 4),
+                        ("plain-id", "Plain Provider", '{"env": {}}', 5),
+                    ],
+                )
+            db_path.chmod(0o600)
+            Path(env["CLAUDE1_CONFIG_PATH"]).write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "providers": {
+                            "broken-id": {
+                                "claude_code_compatibility": {
+                                    "status": "incompatible",
+                                    "reason_code": "no_tool_support",
+                                }
+                            },
+                            "verified-id": {
+                                "claude_code_compatibility": {
+                                    "status": "verified",
+                                    "reason_code": "manual_fixture_passed",
+                                }
+                            },
+                            "twin-a": {
+                                "claude_code_compatibility": {
+                                    "status": "incompatible",
+                                    "reason_code": "no_tool_support",
+                                }
+                            },
+                            "plain-id": {"hidden": False},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with loaded_launcher(env) as launcher:
+                index = launcher._hub_provider_badge_index()
+                channels = [
+                    launcher.HubChannel("byid", "id:broken-id", ("m-1",), False),
+                    launcher.HubChannel(
+                        "byname", "Verified Provider", ("m-2",), False
+                    ),
+                    launcher.HubChannel("ambiguous", "Twin", ("m-3",), False),
+                    launcher.HubChannel(
+                        "unassessed", "Plain Provider", ("m-4",), False
+                    ),
+                    launcher.HubChannel(
+                        "missing", "Deleted Provider", ("m-5",), False
+                    ),
+                    launcher.HubChannel("legacy", "", ("m-6",), False),
+                ]
+                badges = launcher._hub_channel_compatibility_badges(channels, index)
+
+            self.assertEqual(index["id:broken-id"], "不兼容:no_tool_support")
+            self.assertEqual(index["Broken Provider"], "不兼容:no_tool_support")
+            self.assertEqual(index["id:twin-a"], "不兼容:no_tool_support")
+            # A duplicated name is not a selector claude-hub would resolve.
+            self.assertNotIn("Twin", index)
+            # The unassessed default stays silent, like every other row badge.
+            self.assertNotIn("id:plain-id", index)
+            self.assertNotIn("Plain Provider", index)
+            self.assertEqual(
+                badges,
+                {
+                    "byid": "不兼容:no_tool_support",
+                    "byname": "已验收:manual_fixture_passed",
+                },
+            )
+
+    def test_hub_workspace_surfaces_channel_provider_compatibility(self) -> None:
+        """The workspace shows the verdict it used to hide, without blocking.
+
+        ``claude1 list`` badges an incompatible provider while a named Hub
+        channel keeps launching the same one; the rows and the slot-binding
+        prompts have to say so instead of contradicting the launcher.
+        """
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            env = self._hub_env(home, write_config=False)
+            config_path = Path(env["CLAUDE1_HUB_CONFIG"])
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(HUB_V2_FIXTURE), encoding="utf-8")
+
+            with loaded_launcher(env) as launcher:
+                status, _options = launcher.build_hub_view(HUB_V2_FIXTURE)
+                launcher.C = {}
+                # Four ``j`` presses land on the first unbound pool row, which
+                # belongs to the badged gpt channel.
+                window = ScriptedWindow([ord("j")] * 4 + [ord("b"), 27])
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "_hub_provider_badge_index",
+                        return_value={"GPT Provider": "不兼容:no_tool_support"},
+                    ),
+                    mock.patch.object(launcher, "hub_healthy", return_value=True),
+                    mock.patch.object(
+                        launcher, "_choose_hub_slot", return_value="fable"
+                    ) as choose_slot,
+                    mock.patch.object(
+                        launcher, "_confirm", return_value=False
+                    ) as confirm,
+                ):
+                    outcome, payload = launcher._hub_workspace(window, status, [])
+
+            badge_rows = [
+                value
+                for call in window.added
+                for value in call
+                if isinstance(value, str) and "不兼容:no_tool_support" in value
+            ]
+
+            self.assertEqual((outcome, payload), ("back", None))
+            # Both the bound haiku slot and the unbound pool row point at the
+            # gpt channel, so both carry the verdict; glm-backed rows stay clean.
+            self.assertTrue(any("Haiku" in row for row in badge_rows))
+            self.assertTrue(any("gpt-5.6-luna" in row for row in badge_rows))
+            self.assertFalse(any("Sonnet" in row for row in badge_rows))
+            self.assertIn("不兼容:no_tool_support", choose_slot.call_args.args[1])
+            self.assertIn("不兼容:no_tool_support", confirm.call_args.args[1])
 
     def test_loading_v1_config_migrates_once_and_keeps_route_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as raw_home:

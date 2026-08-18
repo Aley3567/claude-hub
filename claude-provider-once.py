@@ -1535,6 +1535,40 @@ def choose(providers: list[dict], hint: str | None) -> dict:
     raise RuntimeError("无效选择，已取消")
 
 
+def _incompatible_hint_diagnostic(hint: str) -> str | None:
+    """Explain a hint whose only matches were filtered out as incompatible.
+
+    ``list_providers`` drops ``incompatible`` providers from the normal
+    selector, so ``choose`` would report a known, already-explained filter as
+    "not found" — a local policy wearing the mask of a missing provider.  Match
+    once more with the gate lifted, purely to name the real reason and hand back
+    the ``id:`` diagnostic escape hatch; the gate itself stays exactly where it
+    was.  Returns None when the hint genuinely matches nothing, leaving the
+    existing wording in place.
+    """
+    try:
+        providers = list_providers(include_incompatible=True)
+    except (OSError, RuntimeError, sqlite3.Error):
+        return None
+    matches, _exact = match_providers(providers, hint)
+    filtered = [
+        provider
+        for provider in matches
+        if provider.get("claude_code_compatibility") == "incompatible"
+    ]
+    if not filtered:
+        return None
+    details = "、".join(
+        f"{provider['name']}"
+        f"（{provider['claude_code_compatibility_reason']}，id:{provider['id']}）"
+        for provider in filtered
+    )
+    return (
+        f"'{hint}' 匹配到的 provider 已标记为 Claude Code 语义不兼容: {details}"
+        "；仅可用上述完整 id: 选择器强制诊断启动"
+    )
+
+
 def _reserved_backend_provider(provider_word: str) -> dict | None:
     """Find an exact provider name shadowed by a positional backend command."""
     if not DB_PATH.is_file():
@@ -2509,6 +2543,58 @@ def build_hub_channels(hub_cfg: dict) -> list[HubChannel]:
     if not channels:
         raise ValueError("hub 配置没有可用的渠道模型")
     return channels
+
+
+def _hub_provider_badge_index() -> dict[str, str]:
+    """Map every hub provider selector to its compatibility badge, if any.
+
+    Hub channels name a provider the way ``claude-hub`` keys its provider rows:
+    ``id:<provider-id>`` always works, a bare provider name only when it is
+    unique in the CC Switch database.  Keying both here keeps the workspace in
+    step with what the hub will actually resolve.  Nothing is inferred from a
+    name, URL or wire protocol: unreadable state simply yields no badges.
+    """
+    try:
+        rows = db_claude_rows()
+    except (OSError, RuntimeError, sqlite3.Error):
+        return {}
+    cfg = load_config()
+    meta = cfg.get("providers")
+    if not isinstance(meta, dict):
+        return {}
+    entries = [
+        (str(provider["id"]), str(provider["name"]))
+        for provider in (_provider_from_row(row) for row in rows)
+    ]
+    name_counts: dict[str, int] = {}
+    for _provider_id, name in entries:
+        name_counts[name] = name_counts.get(name, 0) + 1
+    index: dict[str, str] = {}
+    for provider_id, name in entries:
+        badge = _provider_compatibility_badge(meta, provider_id)
+        if badge is None:
+            continue
+        index[f"id:{provider_id}"] = badge
+        if name_counts[name] == 1:
+            index[name] = badge
+    return index
+
+
+def _hub_channel_compatibility_badges(
+    channels: list[HubChannel],
+    index: dict[str, str],
+) -> dict[str, str]:
+    """Resolve channel alias → provider compatibility badge.
+
+    A selector that does not resolve to exactly one provider is skipped rather
+    than guessed at: an absent badge means "no verdict on record", which is
+    also what an unassessed provider reports.
+    """
+    return {
+        channel.alias: index[channel.provider]
+        for channel in channels
+        if channel.provider in index
+    }
 
 
 def build_hub_view(hub_cfg: dict) -> tuple[HubStatus, list[HubModelOption]]:
@@ -3579,8 +3665,14 @@ def _draw_hub_workspace(
     tab: str = "slots",
     notice: str | None = None,
     hub_name: str = "Claude-Hub",
+    badges: dict[str, str] | None = None,
 ) -> None:
-    """Render native slots followed by the unbound model pool."""
+    """Render native slots followed by the unbound model pool.
+
+    ``badges`` maps a channel alias to its provider's compatibility badge. The
+    workspace only shows the verdict; every entry stays launchable, because a
+    named Hub channel is a standing reference the user created on purpose.
+    """
     win.erase()
     h, w = win.getmaxyx()
     _addstr(win, 0, 2, f"Claude1  ›  {hub_name}", C.get("dim", 0))
@@ -3646,6 +3738,9 @@ def _draw_hub_workspace(
             ),
             cols,
         )
+        badge = (badges or {}).get(option.channel)
+        if badge:
+            text = _compose_row(text, badge, max(0, w - 4))
         row = list_top + offset
         if i == idx:
             _addstr(
@@ -4907,6 +5002,9 @@ def _hub_workspace(
     hub_id = hub.hub_id if hub is not None else None
     slots, pool = build_hub_workspace(config)
     channels = build_hub_channels(config)
+    # Provider verdicts are hand-maintained metadata, so read them once per
+    # workspace visit and resolve aliases against that snapshot on each draw.
+    badge_index = _hub_provider_badge_index()
     tab = "slots"
     rows: list[HubSlotOption | HubModelOption | HubChannel] = [*slots, *pool]
     initial_slot = initial_slot if initial_slot in HUB_SLOT_ORDER else status.launch_slot
@@ -4917,7 +5015,15 @@ def _hub_workspace(
     tab_indices = {"slots": idx, "channels": 0}
     notice: str | None = None
     # Draw once while probing so a down hub does not freeze the screen silently.
-    _draw_hub_workspace(win, status, rows, idx, tab, hub_name=hub_name)
+    _draw_hub_workspace(
+        win,
+        status,
+        rows,
+        idx,
+        tab,
+        hub_name=hub_name,
+        badges=_hub_channel_compatibility_badges(channels, badge_index),
+    )
     instance_id = config.get("instance_id")
     health_token = (
         _hub_local_token(config) if isinstance(instance_id, str) else None
@@ -4930,7 +5036,15 @@ def _hub_workspace(
             instance_id=instance_id if isinstance(instance_id, str) else None,
         ),
     )
-    _draw_hub_workspace(win, status, rows, idx, tab, hub_name=hub_name)
+    _draw_hub_workspace(
+        win,
+        status,
+        rows,
+        idx,
+        tab,
+        hub_name=hub_name,
+        badges=_hub_channel_compatibility_badges(channels, badge_index),
+    )
     while True:
         ch = win.getch()
         notice = None
@@ -4985,13 +5099,16 @@ def _hub_workspace(
             item = rows[idx]
             if isinstance(item, (HubSlotOption, HubChannel)):
                 continue
-            target_slot = _choose_hub_slot(win, f"绑定 {item.selector}")
+            badges = _hub_channel_compatibility_badges(channels, badge_index)
+            badge = badges.get(item.channel)
+            suffix = f"（{badge}）" if badge else ""
+            target_slot = _choose_hub_slot(win, f"绑定 {item.selector}{suffix}")
             if target_slot is None:
                 continue
             current_selector = config["model_slots"][target_slot]
             if current_selector != item.selector and not _confirm(
                 win,
-                f"用 {item.selector} 替换 {target_slot} 的 {current_selector}?",
+                f"用 {item.selector}{suffix} 替换 {target_slot} 的 {current_selector}?",
             ):
                 continue
 
@@ -5104,6 +5221,7 @@ def _hub_workspace(
             tab,
             notice,
             hub_name=hub_name,
+            badges=_hub_channel_compatibility_badges(channels, badge_index),
         )
 
 
@@ -6874,6 +6992,12 @@ def main(argv: list[str]) -> int:
         if not providers:
             print("[claude1] CC Switch 中没有 Claude provider", file=sys.stderr)
             return 1
+        if not explicit_incompatible_diagnostic and not match_providers(
+            providers, hint
+        )[0]:
+            diagnostic = _incompatible_hint_diagnostic(hint)
+            if diagnostic is not None:
+                raise RuntimeError(diagnostic)
         selected = choose(providers, hint)
     else:
         action, payload = run_tui_launcher()
