@@ -132,3 +132,7 @@ claude1-backend.json
 
 # 本机设计截图可能把真实渠道信息画进像素，只保留在桌面工作目录
 docs/design-references/local-private-*
+
+# 清扫暂存与本地交接目录（不提交）
+.cleanup-staging/
+.kimi-code/
