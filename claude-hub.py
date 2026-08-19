@@ -35,6 +35,7 @@ from collections import deque
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -51,6 +52,7 @@ from claude1_protocol import (
     prepare_response,
     protocol_capability_matrix,
     provider_api_format,
+    protocol_format_for_endpoint,
     sanitize_error_text,
     sse_event,
     transform_error,
@@ -789,6 +791,14 @@ def validate_config(raw: object, providers: dict | None = None) -> dict:
                     "openai_chat, or openai_responses"
                 )
             channel["api_format"] = api_format
+        native_system_role_mode = channel_raw.get("native_system_role_mode")
+        if native_system_role_mode is not None:
+            if native_system_role_mode not in {"passthrough", "promote"}:
+                raise ConfigError(
+                    f"channels.{alias}.native_system_role_mode must be "
+                    "passthrough or promote"
+                )
+            channel["native_system_role_mode"] = native_system_role_mode
         if "proxy" in channel_raw:
             proxy = channel_raw["proxy"]
             if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
@@ -1726,6 +1736,76 @@ def resolve_provider(
     return resolved
 
 
+class ChannelTarget(NamedTuple):
+    """Facts resolved once for one request's logical channel target.
+
+    The provider mapping remains the credential-bearing runtime record; this
+    object keeps the non-secret routing decisions together so native and
+    translated paths do not each re-derive them from ``cfg`` and ``provider``.
+    """
+
+    alias: str
+    model_in: str
+    model_out: str
+    provider: dict
+    api_format: str
+    provider_type: str | None
+    base_url: str
+    is_full_url: bool
+    native_system_role_mode: str
+
+    @classmethod
+    def resolve(
+        cls,
+        alias: str,
+        model_in: str,
+        model_out: str,
+        cfg: dict,
+        providers: dict,
+    ) -> "ChannelTarget":
+        channel = cfg["channels"].get(alias)
+        if not channel:
+            raise RouteError(400, f"unknown channel alias '{alias}'")
+        provider = resolve_provider(alias, cfg, providers)
+        return cls.from_provider(alias, model_in, model_out, cfg, provider)
+
+    @classmethod
+    def from_provider(
+        cls,
+        alias: str,
+        model_in: str,
+        model_out: str,
+        cfg: dict,
+        provider: dict,
+    ) -> "ChannelTarget":
+        channel = cfg["channels"].get(alias)
+        if not channel:
+            raise RouteError(400, f"unknown channel alias '{alias}'")
+        api_format = provider.get("api_format") or "anthropic"
+        return cls(
+            alias=alias,
+            model_in=model_in,
+            model_out=model_out,
+            provider=provider,
+            api_format=api_format,
+            provider_type=provider.get("provider_type"),
+            base_url=str(provider["base_url"]),
+            is_full_url=bool(provider.get("is_full_url")),
+            native_system_role_mode=(
+                channel.get("native_system_role_mode") or "passthrough"
+            ),
+        )
+
+    def upstream_url(self, path: str) -> str:
+        """Resolve a protocol endpoint against this target's base URL."""
+        if self.is_full_url:
+            return self.base_url
+        return self.base_url + path
+
+    def transport_policy(self, cfg: dict, endpoint: str):
+        return channel_transport_policy(self.alias, cfg, self.provider, endpoint)
+
+
 class _AccountAttempt:
     __slots__ = ("provider", "lease")
 
@@ -1886,15 +1966,7 @@ def _full_endpoint_matches_format(provider: dict, api_format: str) -> bool:
     if not provider.get("is_full_url"):
         return True
     path = urlparse(provider["base_url"]).path.rstrip("/")
-    formats = {
-        "/v1/messages": "anthropic",
-        "/v1/chat/completions": "openai_chat",
-        "/v1/responses": "openai_responses",
-    }
-    expected = next(
-        (value for suffix, value in formats.items() if path.endswith(suffix)),
-        None,
-    )
+    expected = protocol_format_for_endpoint(path)
     return expected is None or expected == api_format
 
 
@@ -2737,16 +2809,26 @@ async def _handle_transformed_messages(
     account_pool: _RequestAccountPool | None = None,
     route_failover: bool = False,
     route_name: str | None = None,
+    target: ChannelTarget | None = None,
 ) -> web.StreamResponse:
+    if target is None:
+        target = ChannelTarget.from_provider(
+            alias, model_in, model_out, cfg, provider
+        )
+    provider = target.provider
+    alias = target.alias
+    model_in = target.model_in
+    model_out = target.model_out
     if account_pool is None:
         account_pool = _RequestAccountPool(provider, {})
     route_headers = {"x-hub-route": route_name} if route_name else {}
-    api_format = provider["api_format"]
+    api_format = target.api_format
     try:
         prepared_request = prepare_request(
             payload,
             api_format,
-            provider_type=provider.get("provider_type"),
+            provider_type=target.provider_type,
+            native_system_role_mode=target.native_system_role_mode,
         )
     except ProtocolRequestError as exc:
         log(
@@ -2770,7 +2852,7 @@ async def _handle_transformed_messages(
         separators=(",", ":"),
     ).encode()
     streaming = upstream_payload.get("stream") is True
-    url = _upstream_url(provider, endpoint)
+    url = target.upstream_url(endpoint)
     session = _upstream_session(request)
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
 
@@ -2782,7 +2864,7 @@ async def _handle_transformed_messages(
             data=data,
             headers_for_token=lambda token: _transformed_headers(token, streaming),
             timeout=timeout,
-            transport_policy=channel_transport_policy(alias, cfg, provider, url),
+            transport_policy=target.transport_policy(cfg, url),
             log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
         ) as (upstream, account_attempt):
             if route_failover and upstream.status in ROUTE_FAILOVER_STATUSES:
@@ -3313,18 +3395,19 @@ async def _forward_to_channel(
     route dispatcher can replay the still-buffered body against the next
     target. Once any downstream byte is prepared the outcome is final.
     """
-    provider = resolve_provider(alias, cfg, providers)
+    target = ChannelTarget.resolve(alias, model_in, model_out, cfg, providers)
+    provider = target.provider
     account_pool = _RequestAccountPool(provider, providers)
     route_headers = {"x-hub-route": route_name} if route_name else {}
 
-    api_format = provider.get("api_format", "anthropic")
+    api_format = target.api_format
 
     # ``[1m]`` selects Claude Code's 1M context mode.  For Anthropic channels
     # it is not part of the provider's model ID and is stripped here; the
     # context-1m beta header is added below.  For OpenAI-compatible channels
     # the suffix is forwarded unchanged so the upstream sees the 1M intent.
-    payload["model"] = upstream_model_id(model_out, api_format)
-    if provider.get("is_full_url") and request.query_string:
+    payload["model"] = upstream_model_id(target.model_out, api_format)
+    if target.is_full_url and request.query_string:
         return anthropic_error(
             400,
             "full-url channels do not accept a request query string",
@@ -3332,7 +3415,11 @@ async def _forward_to_channel(
     protocol_warning_codes: tuple[str, ...] = ()
     if api_format == "anthropic":
         try:
-            prepared = prepare_request(payload, "anthropic")
+            prepared = prepare_request(
+                payload,
+                "anthropic",
+                native_system_role_mode=target.native_system_role_mode,
+            )
         except ProtocolRequestError as exc:
             log(
                 f"{request.path} '{model_in}' -> {alias}/{model_out} "
@@ -3348,7 +3435,7 @@ async def _forward_to_channel(
             f"{_format_protocol_warnings(prepared.plan.warning_details)}"
             )
     if is_count and (
-        api_format != "anthropic" or provider.get("is_full_url")
+        api_format != "anthropic" or target.is_full_url
     ):
         if api_format != "anthropic":
             # Estimation shares the messages-path inbound validation so a
@@ -3357,7 +3444,7 @@ async def _forward_to_channel(
                 prepare_request(
                     payload,
                     api_format,
-                    provider_type=provider.get("provider_type"),
+                    provider_type=target.provider_type,
                 )
             except ProtocolRequestError as exc:
                 log(
@@ -3392,6 +3479,7 @@ async def _forward_to_channel(
             started=started,
             route_failover=route_failover,
             route_name=route_name,
+            target=target,
         )
     try:
         data = json.dumps(
@@ -3403,7 +3491,7 @@ async def _forward_to_channel(
         return anthropic_error(400, "request body contains unsupported JSON values")
 
     path_and_query = request.path_qs
-    url = _upstream_url(provider, path_and_query)
+    url = target.upstream_url(path_and_query)
     session = _upstream_session(request)
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=600)
 
@@ -3420,7 +3508,7 @@ async def _forward_to_channel(
             data=data,
             headers_for_token=headers_for_token,
             timeout=timeout,
-            transport_policy=channel_transport_policy(alias, cfg, provider, url),
+            transport_policy=target.transport_policy(cfg, url),
             log_context=f"{request.path} '{model_in}' -> {alias}/{model_out}",
         ) as (upstream, account_attempt):
             if route_failover and upstream.status in ROUTE_FAILOVER_STATUSES:

@@ -291,6 +291,13 @@ class RouteGroupTests(unittest.TestCase):
         updates["routes"] = routes
         self._write_config(**updates)
 
+    def _set_native_system_role_mode(self, channel, mode):
+        config = json.loads(self.config_file.read_text(encoding="utf-8"))
+        config["channels"][channel]["native_system_role_mode"] = mode
+        self.config_file.write_text(json.dumps(config), encoding="utf-8")
+        self.config_file.chmod(0o600)
+        hub.reset_caches()
+
     def _fixture_route(self):
         return {
             "fixture-route": [
@@ -1104,6 +1111,7 @@ class RouteGroupTests(unittest.TestCase):
         self._write_pool_config()
         self._seed_pool_cooldown(300)
         self._pool_route_config([{"channel": "alpha", "model": "pool-model-a"}])
+        self._set_native_system_role_mode("alpha", "promote")
         session = _SequencedFakeSession([])
 
         response = self._run(
@@ -1183,6 +1191,7 @@ class RouteGroupTests(unittest.TestCase):
         self._route_config(
             {"fixture-route": [{"channel": "alpha", "model": "fixture-model-a"}]}
         )
+        self._set_native_system_role_mode("alpha", "promote")
         session = _SequencedFakeSession(
             [_json_upstream(429, {"error": {"message": "fixture rate limited"}})]
         )

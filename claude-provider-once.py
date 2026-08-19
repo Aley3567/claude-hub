@@ -4353,8 +4353,8 @@ def complete_hub_setup(hub: HubRef) -> tuple[HubRef, dict]:
     return ready_ref, config
 
 
-def _infer_hub_provider_api_format(provider: dict) -> str | None:
-    """Return a metadata-backed format, or None when passthrough is uncertain."""
+def _declared_provider_api_format(provider: dict) -> str | None:
+    """Return a metadata-backed format, or None when it is unassessed."""
     try:
         settings = json.loads(provider.get("settings_config") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -4367,18 +4367,12 @@ def _infer_hub_provider_api_format(provider: dict) -> str | None:
         settings = {}
     if not isinstance(meta, dict):
         meta = {}
-    provider_type = provider.get("provider_type") or meta.get("providerType")
-    if provider_type == "codex_oauth":
-        return "openai_responses"
-    for value in (meta.get("apiFormat"), settings.get("api_format")):
-        if value in {"anthropic", "openai_chat", "openai_responses"}:
-            return str(value)
-    legacy = settings.get("openrouter_compat_mode")
-    if legacy is True or legacy == 1 or (
-        isinstance(legacy, str) and legacy.strip().casefold() in {"1", "true"}
-    ):
-        return "openai_chat"
-    return None
+    return provider_api_format(
+        meta=meta,
+        settings=settings,
+        provider_type=provider.get("provider_type"),
+        fallback=None,
+    )
 
 
 def _choose_hub_api_format(win, detail: str = "") -> str | None:
@@ -4844,7 +4838,7 @@ def _hub_setup_wizard(win, hub: HubRef) -> str:
         )
         if model is None:
             continue
-        api_format = _infer_hub_provider_api_format(provider)
+        api_format = _declared_provider_api_format(provider)
         if api_format is None:
             api_format = _choose_hub_setup_api_format(
                 win,
@@ -4946,7 +4940,7 @@ def _hub_add_channel_wizard(
         settings = json.loads(provider.get("settings_config") or "{}")
     except (TypeError, json.JSONDecodeError):
         settings = {}
-    inferred_api_format = _infer_hub_provider_api_format(provider)
+    inferred_api_format = _declared_provider_api_format(provider)
     models = _choose_hub_models(
         win,
         provider,

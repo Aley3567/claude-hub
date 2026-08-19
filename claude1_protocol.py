@@ -280,12 +280,15 @@ def provider_api_format(
     settings: object = None,
     provider_type: object = None,
     override: object = None,
-) -> str:
+    fallback: str | None = "anthropic",
+) -> str | None:
     """Resolve the format using the same precedence as CC Switch.
 
     An explicit channel/launcher override wins. Codex OAuth is always Responses.
     Then prefer ``meta.apiFormat``, followed by legacy settings fields.
-    Unknown values fail closed to Anthropic passthrough.
+    Unknown values use ``fallback``.  Callers that need to distinguish an
+    unassessed provider pass ``fallback=None`` instead of reimplementing the
+    precedence rules.
     """
 
     if isinstance(override, str) and override in API_FORMATS:
@@ -306,7 +309,27 @@ def provider_api_format(
         isinstance(legacy, str) and legacy.strip().casefold() in {"1", "true"}
     ):
         return "openai_chat"
-    return "anthropic"
+    return fallback
+
+
+def protocol_format_for_endpoint(path: object) -> str | None:
+    """Return the registered wire format for a standard endpoint suffix.
+
+    A custom full URL is intentionally reported as unknown.  The caller can
+    then retain its explicit metadata-backed format instead of guessing from
+    a provider name or an arbitrary path.
+    """
+
+    if not isinstance(path, str):
+        return None
+    normalized = path.rstrip("/")
+    matches = [
+        api_format
+        for api_format in API_FORMATS
+        if (endpoint := CAPABILITY_PROFILES[api_format].endpoint)
+        and normalized.endswith(endpoint)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _json_text(value: object) -> str:
@@ -2575,6 +2598,7 @@ def prepare_request(
     *,
     provider_type: str | None = None,
     compatibility_mode: str = "visible_lossy",
+    native_system_role_mode: str = "promote",
 ) -> PreparedRequest:
     """Parse, plan and encode one Anthropic Messages request.
 
@@ -2584,6 +2608,10 @@ def prepare_request(
 
     if compatibility_mode not in {"visible_lossy", "strict"}:
         raise ValueError("compatibility_mode must be visible_lossy or strict")
+    if native_system_role_mode not in {"passthrough", "promote"}:
+        raise ValueError(
+            "native_system_role_mode must be passthrough or promote"
+        )
     profile = CAPABILITY_PROFILES.get(api_format)
     if profile is None:
         raise ProtocolRequestError(
@@ -2599,11 +2627,17 @@ def prepare_request(
         )
     plan = ConversionPlan(adapter=profile.name)
     if api_format == "anthropic":
-        body = _normalize_native_system_roles(
-            payload,
-            plan,
-            compatibility_mode=compatibility_mode,
-        )
+        if native_system_role_mode == "promote":
+            body = _normalize_native_system_roles(
+                payload,
+                plan,
+                compatibility_mode=compatibility_mode,
+            )
+        else:
+            # Native system-role messages are an Anthropic extension accepted
+            # by the selected upstream. Keeping their original position avoids
+            # moving turn-by-turn additions into the cache prefix.
+            body = copy.deepcopy(payload)
     elif api_format in REQUEST_ADAPTERS:
         request_ir = _parse_request_ir(
             payload,
@@ -2622,12 +2656,17 @@ def prepare_request(
 
 
 def transform_request(
-    payload: dict, api_format: str, *, provider_type: str | None = None
+    payload: dict,
+    api_format: str,
+    *,
+    provider_type: str | None = None,
+    native_system_role_mode: str = "promote",
 ) -> tuple[str, dict]:
     prepared = prepare_request(
         payload,
         api_format,
         provider_type=provider_type,
+        native_system_role_mode=native_system_role_mode,
     )
     return prepared.endpoint, prepared.payload
 

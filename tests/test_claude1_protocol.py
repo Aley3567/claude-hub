@@ -26,6 +26,27 @@ class ProviderFormatTests(unittest.TestCase):
         )
         self.assertEqual(protocol.provider_api_format(), "anthropic")
 
+    def test_format_fallback_can_preserve_unassessed_state(self) -> None:
+        self.assertIsNone(
+            protocol.provider_api_format(
+                meta={"apiFormat": "future_wire"},
+                fallback=None,
+            )
+        )
+
+    def test_endpoint_format_lookup_uses_registered_profiles(self) -> None:
+        self.assertEqual(
+            protocol.protocol_format_for_endpoint("/v1/messages"),
+            "anthropic",
+        )
+        self.assertEqual(
+            protocol.protocol_format_for_endpoint("https://example.test/v1/responses"),
+            "openai_responses",
+        )
+        self.assertIsNone(
+            protocol.protocol_format_for_endpoint("/custom/gateway"),
+        )
+
 
 class CanonicalRequestContractTests(unittest.TestCase):
     def test_native_system_role_is_promoted_without_losing_metadata_or_extensions(self) -> None:
@@ -54,7 +75,11 @@ class CanonicalRequestContractTests(unittest.TestCase):
             "future_native_extension": {"opaque": True},
         }
 
-        prepared = protocol.prepare_request(payload, "anthropic")
+        prepared = protocol.prepare_request(
+            payload,
+            "anthropic",
+            native_system_role_mode="promote",
+        )
 
         self.assertEqual(prepared.endpoint, "/v1/messages")
         self.assertEqual(
@@ -76,6 +101,46 @@ class CanonicalRequestContractTests(unittest.TestCase):
         self.assertEqual(prepared.payload["future_native_extension"], {"opaque": True})
         self.assertIn("HUB_DEGRADE_SYSTEM_ROLE_PROMOTED", prepared.plan.warning_codes)
         self.assertEqual(payload["messages"][0]["role"], "system")
+
+    def test_native_system_role_passthrough_preserves_message_position(self) -> None:
+        payload = {
+            "model": "native-model",
+            "system": [{"type": "text", "text": "stable prefix"}],
+            "messages": [
+                {"role": "user", "content": "first"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "turn-local context"}
+                    ],
+                },
+                {"role": "user", "content": "second"},
+            ],
+        }
+
+        prepared = protocol.prepare_request(
+            payload,
+            "anthropic",
+            native_system_role_mode="passthrough",
+        )
+
+        self.assertEqual(prepared.payload, payload)
+        self.assertIsNot(prepared.payload, payload)
+        self.assertEqual(prepared.payload["system"], payload["system"])
+        self.assertEqual(
+            prepared.payload["messages"][1], payload["messages"][1]
+        )
+        self.assertNotIn(
+            "HUB_DEGRADE_SYSTEM_ROLE_PROMOTED", prepared.plan.warning_codes
+        )
+
+    def test_native_system_role_mode_must_be_known(self) -> None:
+        with self.assertRaisesRegex(ValueError, "native_system_role_mode"):
+            protocol.prepare_request(
+                {"model": "native-model", "messages": []},
+                "anthropic",
+                native_system_role_mode="automatic",
+            )
 
 
 class RequestTransformTests(unittest.TestCase):

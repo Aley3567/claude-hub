@@ -807,6 +807,7 @@ class ClaudeHubTests(unittest.TestCase):
                 "fast": {
                     "provider": "Fixture HTTPS",
                     "models": ["claude-sonnet-4", "claude-opus-4"],
+                    "native_system_role_mode": "promote",
                 },
                 "blocked": {
                     "provider": "Fixture HTTP",
@@ -1540,6 +1541,48 @@ class ClaudeHubTests(unittest.TestCase):
         provider = hub.resolve_provider("local", cfg)
 
         self.assertEqual(provider["base_url"], "http://127.0.0.1:19090")
+
+    def test_channel_target_resolves_effective_format_url_and_transport_once(self):
+        cfg = hub.get_config()
+        cfg["channels"]["fast"]["api_format"] = "openai_chat"
+        cfg["channels"]["fast"]["transport"] = {
+            "mode": "direct",
+            "proxies": [],
+        }
+        providers = hub.get_providers()
+
+        target = hub.ChannelTarget.resolve(
+            "fast", "fast,fixture-model", "fixture-model", cfg, providers
+        )
+
+        self.assertEqual(target.api_format, "openai_chat")
+        self.assertEqual(target.native_system_role_mode, "promote")
+        self.assertEqual(target.upstream_url("/v1/chat/completions"),
+                         "https://upstream.invalid/v1/chat/completions")
+        policy = target.transport_policy(
+            cfg, target.upstream_url("/v1/chat/completions")
+        )
+        self.assertEqual(policy.mode, "direct")
+        self.assertEqual(
+            [candidate.identity for candidate in policy.candidates], ["direct"]
+        )
+
+    def test_native_system_role_mode_defaults_to_passthrough(self):
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["channels"]["fast"].pop("native_system_role_mode")
+        cfg = hub.validate_config(raw)
+        target = hub.ChannelTarget.resolve(
+            "fast", "fast,fixture-model", "fixture-model", cfg, hub.get_providers()
+        )
+
+        self.assertEqual(target.native_system_role_mode, "passthrough")
+
+    def test_config_rejects_unknown_native_system_role_mode(self):
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["channels"]["fast"]["native_system_role_mode"] = "automatic"
+
+        with self.assertRaisesRegex(hub.ConfigError, "native_system_role_mode"):
+            hub.validate_config(raw)
 
     def test_provider_https_proxy_is_inherited_and_channel_proxy_wins(self):
         connection = sqlite3.connect(self.db_file)
@@ -6298,6 +6341,120 @@ class ClaudeHubTests(unittest.TestCase):
         )
         self.assertEqual(forwarded["messages"], [{"role": "user", "content": "hello"}])
         self.assertEqual(forwarded["future_native_extension"], {"opaque": True})
+
+    def test_default_native_nonstream_keeps_turn_system_roles_out_of_cache_prefix(self):
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["channels"]["fast"].pop("native_system_role_mode")
+        self.config_file.write_text(json.dumps(raw), encoding="utf-8")
+        hub.reset_caches()
+
+        stable_system = [
+            {
+                "type": "text",
+                "text": "stable prefix",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        for turn_context in ("first turn context", "second turn context"):
+            with self.subTest(turn_context=turn_context):
+                upstream = _FakeUpstream(
+                    200,
+                    {"Content-Type": "application/json"},
+                    [
+                        b'{"type":"message","content":[],"usage":'
+                        b'{"input_tokens":7,"output_tokens":2}}'
+                    ],
+                )
+                session = _FakeSession(upstream)
+                request = self._request(
+                    {
+                        "model": "fast,custom-model",
+                        "system": stable_system,
+                        "messages": [
+                            {"role": "user", "content": "stable history"},
+                            {
+                                "role": "system",
+                                "content": [
+                                    {"type": "text", "text": turn_context}
+                                ],
+                            },
+                            {"role": "user", "content": "current turn"},
+                        ],
+                    },
+                    session=session,
+                )
+
+                with mock.patch.object(hub.web, "StreamResponse", _FakeDownstream):
+                    response = asyncio.run(hub.handle_messages(request))
+
+                self.assertEqual(response.status, 200)
+                forwarded = json.loads(session.calls[0][1]["data"])
+                self.assertEqual(forwarded["system"], stable_system)
+                self.assertEqual(forwarded["messages"][1]["role"], "system")
+                self.assertEqual(
+                    forwarded["messages"][1]["content"],
+                    [{"type": "text", "text": turn_context}],
+                )
+
+        rows = [
+            json.loads(line)
+            for line in self.usage_file.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("deg" not in row for row in rows))
+
+    def test_default_native_stream_keeps_system_role_and_real_terminal(self):
+        raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+        raw["channels"]["fast"].pop("native_system_role_mode")
+        self.config_file.write_text(json.dumps(raw), encoding="utf-8")
+        hub.reset_caches()
+
+        chunks = [
+            (
+                b'event: message_start\ndata: {"type":"message_start",'
+                b'"message":{"id":"msg_fixture","type":"message",'
+                b'"role":"assistant","content":[],"model":"fixture-model",'
+                b'"usage":{"input_tokens":7,"output_tokens":0}}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        upstream = _FakeUpstream(
+            200,
+            {"Content-Type": "text/event-stream"},
+            chunks,
+        )
+        session = _FakeSession(upstream)
+        request = self._request(
+            {
+                "model": "fast,custom-model",
+                "stream": True,
+                "system": [{"type": "text", "text": "stable prefix"}],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "turn context"}],
+                    },
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            session=session,
+        )
+        downstream = _FakeDownstream(200)
+
+        with mock.patch.object(hub.web, "StreamResponse", return_value=downstream):
+            response = asyncio.run(hub.handle_messages(request))
+
+        self.assertIs(response, downstream)
+        forwarded = json.loads(session.calls[0][1]["data"])
+        self.assertEqual(
+            forwarded["system"], [{"type": "text", "text": "stable prefix"}]
+        )
+        self.assertEqual(forwarded["messages"][0]["role"], "system")
+        self.assertEqual(downstream.writes, chunks)
+        self.assertTrue(downstream.eof)
+        row = json.loads(self.usage_file.read_text(encoding="utf-8"))
+        self.assertNotIn("deg", row)
 
     def test_ambiguous_upstream_representation_headers_fail_before_prepare(self):
         cases = {
