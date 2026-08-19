@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Hub</title>
+  <desc id="desc">An open folded A with an offset inner seam, representing a visible route through a local agent hub.</desc>
+  <defs>
+    <linearGradient id="left" x1="39" y1="222" x2="144" y2="30" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#06B6D4"/>
+      <stop offset="0.48" stop-color="#168BEE"/>
+      <stop offset="1" stop-color="#2563FF"/>
+    </linearGradient>
+    <linearGradient id="right" x1="128" y1="34" x2="229" y2="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563FF"/>
+      <stop offset="0.5" stop-color="#5948F4"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="111" y1="180" x2="199" y2="219" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F8FAFC"/>
+      <stop offset="0.52" stop-color="#E2E8F0"/>
+      <stop offset="1" stop-color="#B8C6E0"/>
+    </linearGradient>
+    <linearGradient id="navy" x1="107" y1="101" x2="159" y2="221" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#102A56"/>
+    </linearGradient>
+  </defs>
+
+  <!-- The interior is deliberately open: the route is visible before launch. -->
+  <path d="M128 68 62 217h138L142 74c-3-8-10-10-14-6Z" fill="url(#navy)"/>
+
+  <!-- The selected route becomes the only light surface inside the mark. -->
+  <path d="M112 199c18-17 41-30 67-40l22 54c-15-6-30-9-45-7-14 1-27 6-38 14-8 6-17 8-29 7 7-11 14-20 23-28Z" fill="url(#fold)"/>
+
+  <!-- Broad outer bands are independent paths so the mark remains editable. -->
+  <path d="M42 226c-15 0-24-16-17-29l78-148c8-15 23-24 40-24h16c-15 4-26 14-33 28L64 214c-4 8-12 12-22 12Z" fill="url(#left)"/>
+  <path d="M125 53c6-17 21-28 39-28 15 0 28 9 34 23l36 147c7 15-4 31-20 31-11 0-19-6-23-16L137 72c-3-8-7-14-12-19Z" fill="url(#right)"/>
+
+</svg>
