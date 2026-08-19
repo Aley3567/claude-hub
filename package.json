@@ -32,12 +32,12 @@
     "claude_hub_catalog.py",
     "statusline-model.py",
     "install.sh",
-    "probe.sh",
-    "watchd.sh",
-    "observe-claude1.sh",
-    "alert.sh",
-    "zsh-functions.sh",
-    "zsh-sticky-integration.sh",
+    "scripts/probe.sh",
+    "scripts/watchd.sh",
+    "scripts/observe-claude1.sh",
+    "scripts/alert.sh",
+    "scripts/zsh-functions.sh",
+    "scripts/zsh-sticky-integration.sh",
     "examples"
   ],
   "keywords": [

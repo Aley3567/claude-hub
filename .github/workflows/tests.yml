@@ -59,6 +59,6 @@ jobs:
       - name: Run shell integration tests
         run: |
           sh -n install.sh
-          zsh -n zsh-functions.sh zsh-sticky-integration.sh tests/test_shell_integration.zsh tests/test_install.zsh
+          zsh -n scripts/zsh-functions.sh scripts/zsh-sticky-integration.sh tests/test_shell_integration.zsh tests/test_install.zsh
           ./tests/test_shell_integration.zsh
           ./tests/test_install.zsh

@@ -220,6 +220,6 @@
 - Shell integration：`zsh tests/test_shell_integration.zsh`，11/11 通过。
 - 安装回归：`zsh tests/test_install.zsh`，6/6 通过。
 - Python 语法：`python3 -m py_compile claude-provider-once.py claude-hub.py claude1_protocol.py claude1_account_pool.py claude_hub_catalog.py statusline-model.py scripts/secret_guard.py` 通过。
-- Shell 语法：`sh -n install.sh` 以及 `zsh -n zsh-functions.sh zsh-sticky-integration.sh tests/test_shell_integration.zsh tests/test_install.zsh` 通过。
+- Shell 语法：`sh -n install.sh` 以及 `zsh -n scripts/zsh-functions.sh scripts/zsh-sticky-integration.sh tests/test_shell_integration.zsh tests/test_install.zsh` 通过。
 - 工作树安全检查：`python3 scripts/secret_guard.py --working-tree --no-private-sources` 与 `git diff --check` 均通过。
 - 未进行真实第三方 provider 的联网调用；跨 provider 证据来自公开 adapter 边界、loopback fixture 和上述不变量测试，不能据此扩大为所有 OpenAI-compatible 实现都支持相同 beta 子集。

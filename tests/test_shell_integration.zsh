@@ -4,8 +4,8 @@ set -eu
 
 typeset -r TEST_DIR="${0:A:h}"
 typeset -r REPO_ROOT="${TEST_DIR:h}"
-typeset -r DEFAULT_INTEGRATION="${REPO_ROOT}/zsh-functions.sh"
-typeset -r STICKY_INTEGRATION="${REPO_ROOT}/zsh-sticky-integration.sh"
+typeset -r DEFAULT_INTEGRATION="${REPO_ROOT}/scripts/zsh-functions.sh"
+typeset -r STICKY_INTEGRATION="${REPO_ROOT}/scripts/zsh-sticky-integration.sh"
 typeset -r TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/claude1-shell.XXXXXX")"
 
 cleanup() {

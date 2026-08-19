@@ -1,8 +1,19 @@
+<div align="center">
+
 # claude1
 
-`claude1` 是一个轻量的 Claude Code 渠道启动器：渠道与凭证继续由 CC Switch
-管理，`claude1` 只为本次会话选择渠道。可选的 `claude-hub` 还能在同一个
-Claude Code 会话里沿用原生 `/model` 切换渠道和模型。
+**轻量的 Claude Code 渠道启动器** — 渠道与凭证继续由 CC Switch 管理，`claude1` 只为本次会话选择渠道
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)
+
+<img src="docs/screenshots/claude1-home.png" alt="claude1 渠道选择器：Hub 工作区与单渠道直连列表" width="760">
+
+</div>
+
+可选的 `claude-hub` 还能在同一个 Claude Code 会话里沿用原生 `/model`
+切换渠道和模型。
 
 本仓库的桌面主工作目录、常改文件、兼容层入口和安全发布流程见
 [维护与兼容指南](docs/维护与兼容指南.md)。提交和推送前建议先运行
@@ -104,7 +115,7 @@ Provider 名称匹配不区分大小写；如果 CC Switch 中存在重名 provi
 - Hub 以只读方式从 CC Switch DB 获取上游地址和凭证，配置示例中不保存上游
   token。
 
-仓库中的 `zsh-sticky-integration.sh` 是显式 opt-in 功能，默认安装器不会复制
+仓库中的 `scripts/zsh-sticky-integration.sh` 是显式 opt-in 功能，默认安装器不会复制
 或 source 它。需要让 `claude1 use <backend>` 改变普通 `claude` 的后续路由
 时，显式运行：
 
@@ -439,8 +450,9 @@ CLAUDE1_INSTALL_ROOT=/tmp/claude1-install \
 | `claude1_transport.py` | 上游 transport policy、代理选择与请求边界 |
 | `claude1_usage_report.py` | Hub usage 日志读取、汇总和终端图表 |
 | `statusline-model.py` | 自定义 statusline 可复用的实际上游模型解析 |
-| `zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
-| `zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
+| `scripts/zsh-functions.sh` | 默认安全的 `claude1` shell 集成 |
+| `scripts/zsh-sticky-integration.sh` | 需要人工接入的普通 `claude` 粘性路由 |
+| `scripts/` 其余脚本 | 安装守卫、凭证扫描与 probe / watch / alert 辅助脚本 |
 | `examples/claude-hub.example.json` | 无凭证 Hub 配置示例 |
 | `examples/claude1-account-pools.example.json` | 无凭证账号池规则示例 |
 | `install.sh` | 幂等安装与改写前备份 |

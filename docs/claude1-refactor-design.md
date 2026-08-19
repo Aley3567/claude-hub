@@ -14,7 +14,7 @@
 1. **fail-closed 过头**：协议层历史上对上游方言（流中途换 id、新增字段、自定义 SSE 事件、tool 参数非 object）一律拒绝，上游多样性直接变成用户可见故障。详见基线文档 10 个薄弱点。
 2. **三条启动路径行为不一致**:launcher 直连（无协议层）/ 临时协议桥（短命）/ 常驻 hub（可选）——同一 provider 走不同路径，协议处理、错误整形、usage 记录能力都不同（例：system-role normalization 只在 bridge 路径生效）。
 3. **降级观测断裂**：协议层 47 处 `HUB_DEGRADE_*` 记录的出口只有响应头（`x-hub-protocol-warnings`）和 hub.log;`record_error` 只在失败回合写持久 journal，成功回合的降级永不落盘，临时桥日志随会话销毁。**降级实际不可见**——宽容化之前必须先修这个出口，否则宽容等于吞错。
-4. **测试自证**:639 个测试断言的是自己想象的上游行为，没有真实流量语料反哺机制（`observe-claude1.sh` 只记会话成败类别，不录协议流量）。
+4. **测试自证**:639 个测试断言的是自己想象的上游行为，没有真实流量语料反哺机制（`scripts/observe-claude1.sh` 只记会话成败类别，不录协议流量）。
 5. **方言知识无处沉淀**：没有 preset/适配数据层，供应商方言只能散落代码分支或强行按规范假设。
 6. **韧性薄**:failover 只认 401/403/429 且仅在响应开始前；超时单旋钮（`claude-hub.py:2764`,`connect=15, sock_read=600, total=None`)，无首字节/静默分级；无熔断器。
 
@@ -107,5 +107,5 @@ provider 定义必须长出"方言画像"这一维，且是**数据不是代码�
 - CC Switch DB 只读支持 schema 13–16，版本检测 fail-closed（明确报错，不静默失败）——姿态正确，欠公开声明。
 - usage 记录含 account / instance / source / method / exact 字段（对账基础已在）。
 - `record_error` 绝不写 payload；但上游错误 message 可能携带敏感路径，脱敏规则需从"只防凭证"扩展到路径。
-- `observe-claude1.sh` 只记成败类别，不录协议流量。
+- `scripts/observe-claude1.sh` 只记成败类别，不录协议流量。
 - 仓库现状：639 测试全绿，无 TODO/FIXME 注释传统。

@@ -108,7 +108,7 @@ for source_file in \
   "$SCRIPT_DIR/claude1_usage_report.py" \
   "$SCRIPT_DIR/statusline-model.py" \
   "$SCRIPT_DIR/codex-provider-once.py" \
-  "$SCRIPT_DIR/zsh-functions.sh"
+  "$SCRIPT_DIR/scripts/zsh-functions.sh"
 do
   if [ ! -f "$source_file" ] || [ ! -r "$source_file" ]; then
     printf '%s\n' "[claude1] 安装失败：仓库文件缺失或不可读：$source_file" >&2
@@ -116,10 +116,10 @@ do
   fi
 done
 if [ "$MANAGE_STICKY" -eq 1 ] &&
-  { [ ! -f "$SCRIPT_DIR/zsh-sticky-integration.sh" ] ||
-    [ ! -r "$SCRIPT_DIR/zsh-sticky-integration.sh" ]; }; then
+  { [ ! -f "$SCRIPT_DIR/scripts/zsh-sticky-integration.sh" ] ||
+    [ ! -r "$SCRIPT_DIR/scripts/zsh-sticky-integration.sh" ]; }; then
   printf '%s\n' \
-    "[claude1] 安装失败：仓库文件缺失或不可读：$SCRIPT_DIR/zsh-sticky-integration.sh" \
+    "[claude1] 安装失败：仓库文件缺失或不可读：$SCRIPT_DIR/scripts/zsh-sticky-integration.sh" \
     >&2
   exit 1
 fi
@@ -299,10 +299,10 @@ needs_install "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755 &
   NEED_STATUSLINE_MODEL=1
 needs_install "$SCRIPT_DIR/codex-provider-once.py" "$CODEX_LAUNCHER_TARGET" 755 &&
   NEED_CODEX_LAUNCHER=1
-needs_install "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644 &&
+needs_install "$SCRIPT_DIR/scripts/zsh-functions.sh" "$SHELL_TARGET" 644 &&
   NEED_SHELL=1
 if [ "$MANAGE_STICKY" -eq 1 ]; then
-  needs_install "$SCRIPT_DIR/zsh-sticky-integration.sh" "$STICKY_TARGET" 644 &&
+  needs_install "$SCRIPT_DIR/scripts/zsh-sticky-integration.sh" "$STICKY_TARGET" 644 &&
     NEED_STICKY=1
 fi
 zshrc_needs_update && NEED_ZSHRC=1
@@ -423,10 +423,10 @@ if [ "$NEED_CODEX_LAUNCHER" -eq 1 ]; then
   install_file "$SCRIPT_DIR/codex-provider-once.py" "$CODEX_LAUNCHER_TARGET" 755
 fi
 if [ "$NEED_SHELL" -eq 1 ]; then
-  install_file "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644
+  install_file "$SCRIPT_DIR/scripts/zsh-functions.sh" "$SHELL_TARGET" 644
 fi
 if [ "$NEED_STICKY" -eq 1 ]; then
-  install_file "$SCRIPT_DIR/zsh-sticky-integration.sh" "$STICKY_TARGET" 644
+  install_file "$SCRIPT_DIR/scripts/zsh-sticky-integration.sh" "$STICKY_TARGET" 644
 fi
 
 if [ "$NEED_ZSHRC" -eq 1 ]; then

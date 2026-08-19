@@ -110,7 +110,7 @@ test_first_install_is_safe() {
   command cmp -s "$REPO_ROOT/statusline-model.py" \
     "$home/install root/scripts/statusline-model.py" ||
     fail "statusline model resolver was not installed"
-  command cmp -s "$REPO_ROOT/zsh-functions.sh" \
+  command cmp -s "$REPO_ROOT/scripts/zsh-functions.sh" \
     "$home/install root/claude1/zsh-functions.sh" ||
     fail "safe shell integration was not installed"
   [[ "$(managed_line_count "$home/.zshrc")" == "1" ]] ||
@@ -172,7 +172,7 @@ test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall(
 
   run_install "$home" --enable-sticky >/dev/null 2>&1
 
-  command cmp -s "$REPO_ROOT/zsh-sticky-integration.sh" \
+  command cmp -s "$REPO_ROOT/scripts/zsh-sticky-integration.sh" \
     "$home/install root/claude1/zsh-sticky-integration.sh" ||
     fail "sticky integration was not installed after explicit opt-in"
   [[ "$(sticky_line_count "$home/.zshrc")" == "1" ]] ||
@@ -190,7 +190,7 @@ test_explicit_sticky_install_routes_ordinary_claude_and_survives_safe_reinstall(
   run_install "$home" >/dev/null 2>&1
   [[ "$(sticky_line_count "$home/.zshrc")" == "1" ]] ||
     fail "safe reinstall removed or duplicated an existing sticky opt-in"
-  command cmp -s "$REPO_ROOT/zsh-sticky-integration.sh" \
+  command cmp -s "$REPO_ROOT/scripts/zsh-sticky-integration.sh" \
     "$home/install root/claude1/zsh-sticky-integration.sh" ||
     fail "safe reinstall did not update an existing sticky opt-in"
 
