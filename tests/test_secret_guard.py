@@ -128,7 +128,7 @@ class SecretGuardTests(unittest.TestCase):
         self.assertEqual(findings[0].category, "generic-secret-assignment")
 
     def test_utf16_secret_assignment_is_scanned(self) -> None:
-        token = "***REMOVED***"  # secret-guard: allow generic-secret-assignment
+        token = "zyxwvutsrqponmlkjihgfedc"  # secret-guard: allow generic-secret-assignment
         for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
             with self.subTest(encoding=encoding):
                 findings = secret_guard.scan_bytes(
@@ -157,7 +157,7 @@ class SecretGuardTests(unittest.TestCase):
             root = Path(raw)
             secret = root / "outside"
             secret.write_text(
-                'TOKEN="***REMOVED***"'  # secret-guard: allow generic-secret-assignment
+                'TOKEN="zyxwvutsrqponmlkjihgfedc"'  # secret-guard: allow generic-secret-assignment
             )
             (root / "link").symlink_to(secret)
             if hasattr(os, "mkfifo"):
