@@ -42,7 +42,7 @@
 
 ## S1 · 让逐轮增长的内容不再进入缓存前缀
 
-**状态**：【代码已完成；运行态验证待完成】2026-08-19。原始 system-role
+**状态**：✅ 2026-08-19（代码已完成；真实运行态已验收）。原始 system-role
 direct probe 返回 `200`；Hub 渠道默认改为 `passthrough`，仅显式
 `native_system_role_mode: promote` 的严格上游保留提升。连续两轮 native 非流、
 native 流式（含真实 `message_stop`）的 HTTP 级回归均证明逐轮 system 不进入顶层
@@ -54,8 +54,18 @@ native 流式（含真实 `message_stop`）的 HTTP 级回归均证明逐轮 sys
 两轮控制请求出现 `cr=4099/cw=0`，因此该上游缓存可用。但手工构造的“顶层断点 +
 动态 system-role”两轮仍是 `cr=0/cw=3075`，而手工重放历史 message-level 断点被
 上游 `400` 拒绝，不能把它当 Claude Code 的真实 wire 形状。结论：不引入会改变角色
-语义的 `demote` 猜测性修复；仍须由真实 Claude Code 多轮会话观察 `claude1 usage` 中
-`cr` 回升、`cw` 趋近零后，才可将本卡标记完成。
+语义的 `demote` 猜测性修复。
+
+**真实 Claude Code 验收（Terra，22:40）**：复用安装后的默认 Hub
+`127.0.0.1:18787`，native Anthropic 槽位 `fable/k3-256k`，以真实 Claude CLI
+`-p` 首轮 + `-c -p` 同 session 续接第二轮（禁工具，短预算）。两轮均成功；首轮
+`input=4004, output=96, cr=0, cw=0`，第二轮 `input=4086, output=48,
+cr=3840, cw=0`；Hub usage ledger 对应第二回合为 `in=4086/out=48/cr=3840`，
+无 `HUB_DEGRADE_SYSTEM_ROLE_PROMOTED`。另有两条 count precheck 记录，不计入回合
+验收。S1 核心 DoD 闭环完成。
+
+历史旧 bridge 的 usage 中仍有旧版本产生的 promotion warning；它们是历史证据，
+不与本次新 Hub 运行态结论混合，也不做破坏性清理。
 
 **目的**：止住 token 漏损。08-19 一天 86.3% 输入按全价计费；命中率恢复到 80% 量级
 可省约 5,744 万全价 token/天。
