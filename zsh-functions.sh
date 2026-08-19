@@ -77,3 +77,30 @@ claude1-direct() {
 
   "$executable" "$@"
 }
+
+# Same shape as claude1, for the Codex CLI: pick a CC Switch codex channel for
+# this session only. It never aliases or replaces the ordinary `codex` command.
+codex1() {
+  local launcher="${CODEX1_SCRIPT:-$HOME/.codex/scripts/codex-provider-once.py}"
+  local python="${CODEX1_PYTHON:-python3}"
+  local python_path=""
+
+  if [[ ! -f "$launcher" || ! -r "$launcher" ]]; then
+    print -u2 -- "[codex1] launcher script not found or unreadable: $launcher"
+    print -u2 -- "[codex1] install codex-provider-once.py there or set CODEX1_SCRIPT."
+    return 127
+  fi
+
+  if [[ "$python" == */* ]]; then
+    python_path="$python"
+  else
+    python_path="$(whence -p "$python" 2>/dev/null)"
+  fi
+  if [[ -z "$python_path" || ! -x "$python_path" ]]; then
+    print -u2 -- "[codex1] Python executable not found: $python"
+    print -u2 -- "[codex1] install Python 3 or set CODEX1_PYTHON."
+    return 127
+  fi
+
+  "$python_path" "$launcher" "$@"
+}

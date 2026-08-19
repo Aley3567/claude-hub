@@ -34,6 +34,7 @@
 只列名字,不转述内容(转述会过期)。按文件名自取:
 
 - `claude1-refactor-design.md` — 重构设计
+- `codex1-design.md` — codex1 渠道启动器设计
 - `product-definition.md` — 产品定位
 - `cc-switch-implementation-research.md` — cc-switch 实现调研
 - `claude1-protocol-baseline-2026-08-16.md` — 协议层基线与薄弱点

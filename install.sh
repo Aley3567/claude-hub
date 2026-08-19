@@ -17,6 +17,7 @@ usage() {
 可用于隔离安装的环境变量：
   HOME                    用户目录
   CLAUDE1_INSTALL_ROOT    安装目录（默认: $HOME/.claude）
+  CODEX1_INSTALL_ROOT     codex1 安装目录（默认: $HOME/.codex）
 
 安装器不会读取或复制 CC Switch 配置、数据库内容或任何凭证，也不会启用
 zsh-sticky-integration.sh，除非显式传入 --enable-sticky。
@@ -58,6 +59,7 @@ fi
 
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
 INSTALL_ROOT=${CLAUDE1_INSTALL_ROOT:-"$HOME/.claude"}
+CODEX_INSTALL_ROOT=${CODEX1_INSTALL_ROOT:-"$HOME/.codex"}
 CC_SWITCH_DB="$HOME/.cc-switch/cc-switch.db"
 ZSHRC="$HOME/.zshrc"
 ZSHRC_TARGET="$ZSHRC"
@@ -105,6 +107,7 @@ for source_file in \
   "$SCRIPT_DIR/claude1_transport.py" \
   "$SCRIPT_DIR/claude1_usage_report.py" \
   "$SCRIPT_DIR/statusline-model.py" \
+  "$SCRIPT_DIR/codex-provider-once.py" \
   "$SCRIPT_DIR/zsh-functions.sh"
 do
   if [ ! -f "$source_file" ] || [ ! -r "$source_file" ]; then
@@ -131,6 +134,7 @@ if [ -L "$INSTALL_ROOT/scripts/claude-provider-once.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_transport.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/claude1_usage_report.py" ] ||
   [ -L "$INSTALL_ROOT/scripts/statusline-model.py" ] ||
+  [ -L "$CODEX_INSTALL_ROOT/scripts/codex-provider-once.py" ] ||
   [ -L "$INSTALL_ROOT/claude1/zsh-functions.sh" ] ||
   { [ "$MANAGE_STICKY" -eq 1 ] &&
     [ -L "$INSTALL_ROOT/claude1/zsh-sticky-integration.sh" ]; }; then
@@ -151,6 +155,7 @@ for target_path in \
   "$INSTALL_ROOT/scripts/claude1_transport.py" \
   "$INSTALL_ROOT/scripts/claude1_usage_report.py" \
   "$INSTALL_ROOT/scripts/statusline-model.py" \
+  "$CODEX_INSTALL_ROOT/scripts/codex-provider-once.py" \
   "$INSTALL_ROOT/claude1/zsh-functions.sh"
 do
   if [ -e "$target_path" ] && [ ! -f "$target_path" ]; then
@@ -182,6 +187,8 @@ fi
 
 mkdir -p "$INSTALL_ROOT/scripts" "$INSTALL_ROOT/claude1"
 INSTALL_ROOT=$(CDPATH= cd "$INSTALL_ROOT" && pwd -P)
+mkdir -p "$CODEX_INSTALL_ROOT/scripts"
+CODEX_INSTALL_ROOT=$(CDPATH= cd "$CODEX_INSTALL_ROOT" && pwd -P)
 
 LAUNCHER_TARGET="$INSTALL_ROOT/scripts/claude-provider-once.py"
 HUB_TARGET="$INSTALL_ROOT/scripts/claude-hub.py"
@@ -193,6 +200,7 @@ PROTOCOL_USAGE_TARGET="$INSTALL_ROOT/scripts/claude1_protocol_usage.py"
 TRANSPORT_TARGET="$INSTALL_ROOT/scripts/claude1_transport.py"
 USAGE_REPORT_TARGET="$INSTALL_ROOT/scripts/claude1_usage_report.py"
 STATUSLINE_MODEL_TARGET="$INSTALL_ROOT/scripts/statusline-model.py"
+CODEX_LAUNCHER_TARGET="$CODEX_INSTALL_ROOT/scripts/codex-provider-once.py"
 SHELL_TARGET="$INSTALL_ROOT/claude1/zsh-functions.sh"
 STICKY_TARGET="$INSTALL_ROOT/claude1/zsh-sticky-integration.sh"
 
@@ -265,6 +273,7 @@ NEED_PROTOCOL_USAGE=0
 NEED_TRANSPORT=0
 NEED_USAGE_REPORT=0
 NEED_STATUSLINE_MODEL=0
+NEED_CODEX_LAUNCHER=0
 NEED_SHELL=0
 NEED_STICKY=0
 NEED_ZSHRC=0
@@ -288,6 +297,8 @@ needs_install "$SCRIPT_DIR/claude1_usage_report.py" "$USAGE_REPORT_TARGET" 644 &
   NEED_USAGE_REPORT=1
 needs_install "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755 &&
   NEED_STATUSLINE_MODEL=1
+needs_install "$SCRIPT_DIR/codex-provider-once.py" "$CODEX_LAUNCHER_TARGET" 755 &&
+  NEED_CODEX_LAUNCHER=1
 needs_install "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644 &&
   NEED_SHELL=1
 if [ "$MANAGE_STICKY" -eq 1 ]; then
@@ -354,6 +365,9 @@ fi
 if [ "$NEED_STATUSLINE_MODEL" -eq 1 ]; then
   backup_existing "$STATUSLINE_MODEL_TARGET" "statusline-model.py"
 fi
+if [ "$NEED_CODEX_LAUNCHER" -eq 1 ]; then
+  backup_existing "$CODEX_LAUNCHER_TARGET" "codex-provider-once.py"
+fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   backup_existing "$SHELL_TARGET" "zsh-functions.sh"
 fi
@@ -405,6 +419,9 @@ fi
 if [ "$NEED_STATUSLINE_MODEL" -eq 1 ]; then
   install_file "$SCRIPT_DIR/statusline-model.py" "$STATUSLINE_MODEL_TARGET" 755
 fi
+if [ "$NEED_CODEX_LAUNCHER" -eq 1 ]; then
+  install_file "$SCRIPT_DIR/codex-provider-once.py" "$CODEX_LAUNCHER_TARGET" 755
+fi
 if [ "$NEED_SHELL" -eq 1 ]; then
   install_file "$SCRIPT_DIR/zsh-functions.sh" "$SHELL_TARGET" 644
 fi
@@ -442,6 +459,7 @@ fi
 printf '%s\n' \
   "[claude1] 已安装启动器：$LAUNCHER_TARGET" \
   "[claude1] 已安装可选 Hub：$HUB_TARGET" \
+  "[claude1] 已安装 codex1 启动器：$CODEX_LAUNCHER_TARGET" \
   "[claude1] 已接入 zsh：$ZSHRC"
 if [ "$MANAGE_STICKY" -eq 1 ]; then
   printf '%s\n' \
